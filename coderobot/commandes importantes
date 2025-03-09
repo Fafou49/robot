@@ -1,0 +1,23 @@
+récupérer le GPS:
+cat /dev/ttyACM0
+
+#https://github.com/semuconsulting/PyGPSClient
+
+
+/home/pi/my-venv/bin/python3.11 -m pip install --upgrade pygpsclient
+
+cd /home/pi/my-venv/my-venv/bin
+cd /home/robot/my-venv/bin
+./python3.11 pygpsclient
+
+#instaler le driver Bluetooth xbox
+sudo apt-get install xboxdrv
+
+#installation de pygame pour la manette xbox:
+cd /home/robot/my-venv/my-venv/bin
+sudo ./pip3 install pygame
+
+#prendre une photo par la caméra: 
+fswebcam --no-banner image.jpg
+
+
