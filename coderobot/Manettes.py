@@ -3,9 +3,9 @@ import os
 
 #import numpy as np
 import evdev
-#import pygame
+import pygame
 #from pygame.locals import *
-device_path = '/dev/input/js0'
+device_path = '/dev/input/event5'
 
 if not os.path.exists(device_path):
     print(f"Le périphérique {device_path} n'existe pas.")
@@ -22,15 +22,7 @@ state_joystick = False
 count = pygame.joystick.get_count()
 print ("nb manette: ", count)
 
-# Vérifier si une manette est connectée
-if count!=0:
-    # Utiliser la première manette trouvée
-    joystick = joysticks[0]
 
-#if count > 0:
-    #state_joystick = True
-    #joystick = pygame.joystick.Joystick(0)
-    joystick.init()
 
 speed_x = 120
 speed_y = 120
