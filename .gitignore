@@ -1,0 +1,25 @@
+# Environnements virtuels
+venv/
+.env/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Fichiers de configuration locaux
+.env
+*.ini
+*.cfg
+
+# Fichiers de dépendances générés
+*.egg-info/
+
+# Fichiers temporaires et logs
+*.log
+*.swp
+.DS_Store
+
+# Fichiers spécifiques aux IDE
+.idea/
+.vscode/
