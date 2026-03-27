@@ -2,3 +2,4 @@ evdev
 numpy
 pygame
 gpiod
+geopy
