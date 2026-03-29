@@ -3,3 +3,5 @@ numpy
 pygame
 gpiod
 geopy
+pynmea2
+pyserial

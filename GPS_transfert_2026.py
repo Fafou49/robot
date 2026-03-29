@@ -1,8 +1,10 @@
+import sys
 import math
 import serial
-import pynmea2
 import time
+import pynmea2
 from geopy.distance import geodesic
+import keyboard
 
 def calculer_distance_et_cap(lat1, lon1, lat2, lon2):
     # Convertir les degrés en radians
@@ -21,30 +23,35 @@ def calculer_distance_et_cap(lat1, lon1, lat2, lon2):
 
     # Normaliser le cap entre 0° et 360°
     cap = (cap + 360) % 360
-
     # Calcul de la distance
     distance = geodesic((lat1, lon1), (lat2, lon2)).meters
-
     return distance, cap
 
-port = "/dev/ttyACM0"  # À adapter selon ton port série
-ser = serial.Serial(port, baudrate=57600, timeout=1)
-
-def lire_coordonnees_gps():
+def lire_coordonnees_gps(ser):
     while True:
         try:
             data = ser.readline().decode('ascii', errors='replace')
-            if data.startswith('$GNGGA'):
+            if data.startswith('$GPGGA'):
                 msg = pynmea2.parse(data)
                 return msg.latitude, msg.longitude
         except:
             continue
-while True:
-    lat_actuel, lon_actuel = lire_coordonnees_gps()
 
-    lat_cible = 47.470026   # Latitude cible (ex: st Nicolas)
-    lon_cible = -0.561586    # Longitude cible
+#------------------------------MAIN-------------------------------
+
+ser = serial.Serial(port="/dev/ttyACM1", baudrate=57600, timeout=0.1)
+distance=0.0
+cap=0.0
+
+
+while True:
+    if keyboard.is_pressed("esc"):
+        print("\nBoucle arrètée par l'utilisateur.")
+        break
+
+    lat_actuel, lon_actuel = lire_coordonnees_gps(ser)
+    lat_cible = 47.391360   # Latitude cible (ex: Angers)
+    lon_cible = -0.739161    # Longitude cible
     distance, cap = calculer_distance_et_cap(lat_actuel, lon_actuel, lat_cible, lon_cible)
-    print(f"Distance : {distance:.2f} mètres, Cap : {cap:.2f}°")
-    print(f"Cap (angle) : {cap:.2f} degrés")
-    time.sleep(1/5)
+    print(f"{distance:.2f},{cap:.2f}",flush=True)
+    
