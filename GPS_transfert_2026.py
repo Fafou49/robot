@@ -39,10 +39,12 @@ def lire_coordonnees_gps(ser):
 
 #------------------------------MAIN-------------------------------
 
-ser = serial.Serial(port="/dev/ttyACM1", baudrate=57600, timeout=0.1)
+ser = serial.Serial(port="/dev/ttyACM0", baudrate=57600, timeout=0.1)
 distance=0.0
 cap=0.0
 
+lat_cible = 47.391360   # Latitude cible (ex: Angers)
+lon_cible = -0.739161    # Longitude cible
 
 while True:
     if keyboard.is_pressed("esc"):
@@ -50,8 +52,6 @@ while True:
         break
 
     lat_actuel, lon_actuel = lire_coordonnees_gps(ser)
-    lat_cible = 47.391360   # Latitude cible (ex: Angers)
-    lon_cible = -0.739161    # Longitude cible
     distance, cap = calculer_distance_et_cap(lat_actuel, lon_actuel, lat_cible, lon_cible)
     print(f"{distance:.2f},{cap:.2f}",flush=True)
     

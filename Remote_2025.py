@@ -40,11 +40,15 @@ def pwm(PWMdutyCycleLeft,PWMdutyCycleRight):
                 
                 
 # 0 - variables definition
-chip = gpiod.Chip('gpiochip4')
+       
+        
+        
+chip = gpiod.Chip('/dev/gpiochip4')
+
 MOTOR1_SENS1 = 14
 MOTOR1_SENS2 = 15
-MOTOR2_SENS1 = 2
-MOTOR2_SENS2 = 3
+MOTOR2_SENS1 = 17
+MOTOR2_SENS2 = 27
 dutyCycleLeft=0
 dutyCycleRight=0
 device =0
@@ -53,9 +57,11 @@ verrou = threading.Lock()
 # 1 - testing the remote connection 
 while device ==0:
     try:
+               
         device = evdev.InputDevice('/dev/input/event5')
-    except:
+    except BaseException as e:
         print("No device connected")
+        print(e)
     else:
         print(device, " connected")
         pygame.init()
@@ -71,20 +77,24 @@ while device ==0:
         # 2 - IF the remote is connected, THEN    
         if device !=0:
             # setting the OUTPUTS
-            M1_S1 = chip.get_line(MOTOR1_SENS1)
-            M1_S1.request(consumer="M1_S1", type=gpiod.LINE_REQ_DIR_OUT)
+                with gpiod.Chip('gpiochip4') as chip:  # ou 'gpiochip0'
+                        print(f"Chip ouvert : {chip}")
+                        M1_S1 = chip.get_line(MOTOR1_SENS1)
+                        M1_S1.request(consumer="M1_S1", type=gpiod.LINE_REQ_DIR_OUT)
 
-            M1_S2 = chip.get_line(MOTOR1_SENS2)
-            M1_S2.request(consumer="M1_S2", type=gpiod.LINE_REQ_DIR_OUT)
+                        M1_S2 = chip.get_line(MOTOR1_SENS2)
+                        M1_S2.request(consumer="M1_S2", type=gpiod.LINE_REQ_DIR_OUT)
 
-            M2_S1 = chip.get_line(MOTOR2_SENS1)
-            M2_S1.request(consumer="M2_S1", type=gpiod.LINE_REQ_DIR_OUT)
+                        M2_S1 = chip.get_line(MOTOR2_SENS1)
+                        M2_S1.request(consumer="M2_S1", type=gpiod.LINE_REQ_DIR_OUT)
 
-            M2_S2 = chip.get_line(MOTOR2_SENS2)
-            M2_S2.request(consumer="M2_S2", type=gpiod.LINE_REQ_DIR_OUT)
+                        M2_S2 = chip.get_line(MOTOR2_SENS2)
+                        M2_S2.request(consumer="M2_S2", type=gpiod.LINE_REQ_DIR_OUT)
+                print (chip)
+
     
-            pwm_tread = threading.Thread(target=pwm, args=(dutyCycleLeft, dutyCycleRight,))
-            pwm_tread.start()                                
+        pwm_tread = threading.Thread(target=pwm, args=(dutyCycleLeft, dutyCycleRight,))
+        pwm_tread.start()                                
                       
     try:
         while True:
