@@ -50,7 +50,7 @@ def move_to_target( current_distance, current_angle):
         
         
         print(f"{left_speed:.2f},{right_speed:.2f}",flush=True)
-        
+        sys.stdout.flush() 
         
         
 

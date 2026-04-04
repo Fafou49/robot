@@ -5,10 +5,15 @@ import keyboard
 import threading
 from gpiod.line import Direction, Value
 
-def pwm(PWMdutyCycleLeft,PWMdutyCycleRight):
+def pwm(dutyCycleLeft,dutyCycleRight):
         while True:  
-                # 5.1 - Counting from 0 to 255 all the time  
-                for PWM_Counter in range(255):
+            
+                if type(dutyCycleLeft) is not float:
+                    dutyCycleLeft=float(dutyCycleLeft)
+                if type(dutyCycleRight) is not float:
+                    dutyCycleRight=float(dutyCycleRight)
+                # 5.1 - Counting from 0 to 254 all the time  
+                for PWM_Counter in range(254):
                         print ("dutyCycleRight : " , dutyCycleRight," / " ,"dutyCycleLeft : ",dutyCycleLeft )
                         if dutyCycleLeft>20:
                                 if PWM_Counter>dutyCycleLeft:
@@ -37,6 +42,7 @@ def pwm(PWMdutyCycleLeft,PWMdutyCycleRight):
                         else:
                                 M2_S1.set_value(MOTOR2_SENS1, Value.INACTIVE)
                                 M2_S2.set_value(MOTOR2_SENS2, Value.INACTIVE)
+                        time.sleep(0.001)
 
 verrou = threading.Lock()
 dutyCycleLeft=0
@@ -60,29 +66,39 @@ M2_S1=chip.request_lines(consumer="MOTOR2_SENS1", config={
         
 M2_S2=chip.request_lines(consumer="MOTOR2_SENS2", config={
         MOTOR2_SENS2: gpiod.LineSettings(direction=Direction.OUTPUT)})
+        
+        
+
 
 try:
-    pwm_tread = threading.Thread(target=pwm, args=(dutyCycleLeft, dutyCycleRight,))
-    pwm_tread.start()
+    
+
     while True:
 
         
-        with verrou:
-            for DuttyCycles in sys.stdin:
-                print(DuttyCycles.strip().split(','))
+        for DuttyCycles in sys.stdin:
             
-                dutyCycleRight = DuttyCycles[0]
-                dutyCycleLeft = DuttyCycles[1]
-
+            with verrou:
+                dutyCycleLeft, dutyCycleRight =  DuttyCycles.strip().split(',')[0],DuttyCycles.strip().split(',')[0]
+                pwm_tread = threading.Thread(target=pwm, args=(dutyCycleLeft, dutyCycleRight,))
+                pwm_tread.start()
+        time.sleep(1/5)        
+        
+    
 except BrokenPipeError:
+    verrou = True
+    threading.join()
     M1_S1.set_value(MOTOR1_SENS1, Value.INACTIVE)
     M2_S1.set_value(MOTOR2_SENS1, Value.INACTIVE)
     M1_S2.set_value(MOTOR1_SENS2, Value.INACTIVE)
     M2_S2.set_value(MOTOR2_SENS2, Value.INACTIVE)
     chip.close()
+
     print("\nLe pipe a été fermé par le récepteur. Arrèt du programme.", file=sys.stderr)
     sys.exit(1)  # Quitte proprement
 except KeyboardInterrupt:
+    verrou = True
+    threading.join()
     M1_S1.set_value(MOTOR1_SENS1, Value.INACTIVE)
     M2_S1.set_value(MOTOR2_SENS1, Value.INACTIVE)
     M1_S2.set_value(MOTOR1_SENS2, Value.INACTIVE)
@@ -91,6 +107,8 @@ except KeyboardInterrupt:
     print("\nProgramme arrété par l'utilisateur.", file=sys.stderr)
     sys.exit(0)
 finally:
+    verrou = True
+    threading.join()
     M1_S1.set_value(MOTOR1_SENS1, Value.INACTIVE)
     M2_S1.set_value(MOTOR2_SENS1, Value.INACTIVE)
     M1_S2.set_value(MOTOR1_SENS2, Value.INACTIVE)

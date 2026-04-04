@@ -54,4 +54,4 @@ while True:
     lat_actuel, lon_actuel = lire_coordonnees_gps(ser)
     distance, cap = calculer_distance_et_cap(lat_actuel, lon_actuel, lat_cible, lon_cible)
     print(f"{distance:.2f},{cap:.2f}",flush=True)
-    
+    sys.stdout.flush() 
