@@ -14,7 +14,7 @@ def pwm(dutyCycleLeft,dutyCycleRight):
                     dutyCycleRight=float(dutyCycleRight)
                 # 5.1 - Counting from 0 to 254 all the time  
                 for PWM_Counter in range(254):
-                        print ("dutyCycleRight : " , dutyCycleRight," / " ,"dutyCycleLeft : ",dutyCycleLeft )
+                        
                         if dutyCycleLeft>20:
                                 if PWM_Counter>dutyCycleLeft:
                                         M1_S1.set_value(MOTOR1_SENS1, Value.INACTIVE)
@@ -42,14 +42,16 @@ def pwm(dutyCycleLeft,dutyCycleRight):
                         else:
                                 M2_S1.set_value(MOTOR2_SENS1, Value.INACTIVE)
                                 M2_S2.set_value(MOTOR2_SENS2, Value.INACTIVE)
-                        time.sleep(0.001)
+                        print ("TIME: ", now ," | Distance :",Distance, "| Angle :", Angle, "   |   dutyCycleLeft : ",dutyCycleLeft, "  |  dutyCycleRight : " , dutyCycleRight,
+                                 "  |   speed : ",speed, "|     angular velocity : " , angular_velocity)
+                        time.sleep(0.1)
 
 verrou = threading.Lock()
 dutyCycleLeft=0
 dutyCycleRight=0
 
-MOTOR1_SENS1 = 14
-MOTOR1_SENS2 = 15
+MOTOR1_SENS1 = 15
+MOTOR1_SENS2 = 14
 MOTOR2_SENS1 = 2
 MOTOR2_SENS2 = 3
 
@@ -73,16 +75,28 @@ M2_S2=chip.request_lines(consumer="MOTOR2_SENS2", config={
 try:
     
 
-    while True:
+#    while True:
 
         
-        for DuttyCycles in sys.stdin:
+        for values in sys.stdin:
             
             with verrou:
-                dutyCycleLeft, dutyCycleRight =  DuttyCycles.strip().split(',')[0],DuttyCycles.strip().split(',')[0]
-                pwm_tread = threading.Thread(target=pwm, args=(dutyCycleLeft, dutyCycleRight,))
-                pwm_tread.start()
-        time.sleep(1/5)        
+                line = values.strip()
+                try:
+                    now=line.split(',')[0]
+                    dutyCycleLeft=line.split(',')[1]
+                    dutyCycleRight=line.split(',')[2]
+                    Distance=line.split(',')[3]
+                    Angle=line.split(',')[4]
+                    speed=line.split(',')[5]
+                    angular_velocity =  line.split(',')[6]
+                    pwm_tread = threading.Thread(target=pwm, args=(dutyCycleLeft, dutyCycleRight,))
+                    pwm_tread.start()
+                except:
+                    print("NO DATA...")
+                
+                
+        time.sleep(0.1)        
         
     
 except BrokenPipeError:
@@ -94,8 +108,9 @@ except BrokenPipeError:
     M2_S2.set_value(MOTOR2_SENS2, Value.INACTIVE)
     chip.close()
 
-    print("\nLe pipe a été fermé par le récepteur. Arrèt du programme.", file=sys.stderr)
-    sys.exit(1)  # Quitte proprement
+    print("\nLe pipe a été fermé par le PID. Arrèt du programme.", file=sys.stderr)
+    chip.close()
+    sys.exit(0)  # Quitte proprement
 except KeyboardInterrupt:
     verrou = True
     threading.join()

@@ -4,88 +4,138 @@ import time
 import math
 
 
+
 class PIDController:
-    def __init__(self, kp, ki, kd, setpoint=0):
+    def __init__(self, setpoint : float , kp, ki, kd,):
         self.kp = kp  # Coefficient proportionnel
         self.ki = ki  # Coefficient intégral
         self.kd = kd  # Coefficient dérivé
         self.setpoint = setpoint  # Valeur cible (distance ou angle)
         self.integral = 0
         self.previous_error = 0
-
-    def update(self, measured_value, dt):
+        self.last_time = time.time()  # Stocke le temps ici
+        
+    def set_setpoint(self, setpoint : float):
+        self.setpoint=setpoint
+        
+    def update(self, measured_value):
+        
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+        if dt <= 0:
+            dt = 0.01  # Valeur par défaut pour éviter la division par zéro
+    
         error = self.setpoint - measured_value
         self.integral += error * dt
         derivative = (error - self.previous_error) / dt
         output = self.kp * error + self.ki * self.integral + self.kd * derivative
         self.previous_error = error
+        
         return output
-
-def move_to_target( current_distance, current_angle):
-    dt = 1/5  # Pas de temps (en secondes)
-    
-    while True:
-        # Mise à jour des PID
-        
-        speed = pid_distance.update(current_distance, dt)
-        angular_velocity = pid_angle.update(current_angle, dt)
-        
-        # Limiter les valeurs de sortie si nécessaire
-        speed = max(min(speed, 1.0), -1.0)*255
-        angular_velocity = max(min(angular_velocity, 360), -360)
-
-        # Simulation : mise à jour de la position (à remplacer par ton système rèel)
-        #current_distance += speed * dt
-        #current_angle += angular_velocity * dt
-        
-        # Conversion pour les moteurs (exemple pour roues différentielles)
-        wheel_base = 0.59  # Distance entre les roues (en mètres)
-        left_speed = speed - (angular_velocity * wheel_base / 2)
-        left_speed = max(min(left_speed, 255), -255)
-        right_speed = speed + (angular_velocity * wheel_base / 2)
-        right_speed = max(min(right_speed, 255), -255)
-        # Affichage (pour le débogage)
-        print(f"Distance: {current_distance:.2f}, Angle: {current_angle:.2f} / left_speed :{left_speed:.2f}, right_speed :{right_speed:.2f}")
-        
-        
-        
-        print(f"{left_speed:.2f},{right_speed:.2f}",flush=True)
-        sys.stdout.flush() 
-        
-        
-
-        # Condition d'arrêt
-        if abs(pid_distance.setpoint - current_distance) < 0.1 and abs(pid_angle.setpoint - current_angle) < 0.1:
-            print("Cible atteinte !")
-            break
-
-        time.sleep(dt)
         
 
 
-            
-time.sleep(1)
-pid_distance = PIDController(kp=1.0, ki=0.1, kd=0.01, setpoint=0)
-pid_angle = PIDController(kp=0.5, ki=0.01, kd=0.1, setpoint=0)
-    
-    
-    
-try:
-    while True:
-        if keyboard.is_pressed("esc"):
-            print("\nBoucle arrètée par l'utilisateur.")
-            break
-        for line in sys.stdin:
-            #print(line.strip().split(','))
-            Distance, Angle =line.strip().split(',')
-            #print(f"{type(Distance)}, valeur: {Distance} - {type(Angle)}, valeur: {Angle}")
-           
-            print(abs(float(Distance)) , Angle)
-            move_to_target(abs(float(Distance)),float(Angle))
+def move_to_target( current_distance : float, current_angle : float):
 
-except BrokenPipeError:
-    print("\nLe pipe a été fermé par le récepteur. Arrèt du programme.", file=sys.stderr)
-    sys.exit(1)  # Quitte proprement
-except KeyboardInterrupt:
-    print("\nProgramme arrété par l'utilisateur.", file=sys.stderr)
-    sys.exit(0)
+
+    # Mise à jour des PID
+        
+    speed = pid_distance.update(current_distance)
+    angular_velocity = pid_angle.update(current_angle)
+    # Limiter les valeurs de sortie si nécessaire
+    speed = max(min(speed, 2.0), -2.0) # m/s
+    angular_velocity = max(min(angular_velocity, 360), -360)# m/s
+
+    #current_distance = pid_distance.setpoint
+    #current_angle = pid_angle.setpoint
+    #current_angle = (current_angle + 180) % 360 - 180  # [-180, 180]      
+        
+        
+    # Conversion pour les moteurs (exemple pour roues différentielles)
+    wheel_base = 0.59  # Distance entre les roues (en mètres)
+        
+    # Convertir speed (m/s) en PWM (0-255)
+    max_speed = 2.0  # Vitesse max en m/s
+    speed_pwm = (speed / max_speed) * 255  # échelle de 0 à 255
+
+    # Convertir angular_velocity (°/s) en PWM
+    max_angular_velocity = 360  # Vitesse angulaire max en °/s
+    angular_pwm = (angular_velocity / max_angular_velocity) * 255
+
+    # Appliquer aux moteurs
+    left_speed = speed_pwm + angular_pwm
+    right_speed = speed_pwm - angular_pwm
+        
+        
+    print(f"{time.time()},{left_speed:.2f},{right_speed:.2f},{current_distance:.2f},{current_angle:.2f},{speed:.2f},{angular_velocity:.2f} ",flush=True)
+    sys.stdout.flush() 
+
+
+
+# Initialisation des cibles par défaut
+distance_target = 0.0
+angle_target = 0.0
+
+# Initialisation des PID avec des consignes par défaut
+pid_distance = PIDController(kp=1, ki=0, kd=0, setpoint=distance_target)
+pid_angle = PIDController(kp=0.5, ki=0, kd=0, setpoint=angle_target)
+#------------------------------MAIN-------------------------------        
+def main():
+
+
+    # Lire la première ligne pour initialiser les cibles
+    try:
+        
+        first_line = sys.stdin.readline().strip() 
+        seconde_line = sys.stdin.readline().strip()       
+        if seconde_line:
+            parts = seconde_line.split(',')
+            if len(parts) >= 2:
+                distance_target = float(parts[0].strip())
+                angle_target = float(parts[1].strip())
+                print(distance_target,",",angle_target)
+                # Mettre à jour les consignes des PID
+                pid_distance.set_setpoint(distance_target)                
+                pid_angle.set_setpoint(angle_target)
+            else:
+                print(f"[ERREUR] Ligne d'initialisation invalide : {seconde_line!r}", file=sys.stderr)
+    except Exception as e:
+        print(f"[ERREUR] Lecture de l'initialisation : {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Boucle principale pour traiter les entrées en temps réel
+    try:
+        while True:
+            line = sys.stdin.readline().strip()
+              
+            if not line:
+                continue  # Ignorer les lignes vides
+
+            parts = line.split(',')
+            if len(parts) < 2:
+                print(f"[IGNORE] Ligne invalide : {line!r}", file=sys.stderr)
+                continue
+
+            try:
+                current_distance = float(parts[0].strip())
+                current_angle = float(parts[1].strip())
+            except ValueError as e:
+                print(f"[ERREUR] Conversion impossible : {line!r} -> {e}", file=sys.stderr)
+                continue
+
+            # Appeler move_to_target avec les valeurs actuelles
+            move_to_target(current_distance,current_angle)
+
+    except BrokenPipeError:
+        print("\n[ERREUR] Le pipe a été fermé. Arrèt du programme.", file=sys.stderr)
+        sys.exit(0)
+    except KeyboardInterrupt:
+        print("\n[INFO] Arrèt demandé par l'utilisateur (CTRL+C).", file=sys.stderr)
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n[ERREUR] Erreur inattendue : {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

@@ -6,7 +6,39 @@ import pynmea2
 from geopy.distance import geodesic
 import keyboard
 from multiprocessing import Process
+from pygnssutils import GNSSNTRIPClient
 
+
+# 2. Configuration des identifiants Centipede
+caster = "crtk.net"
+port = 2101
+mountpoint = "NEAR"
+username = "centipede"
+password = "centipede"
+
+# 3. Fonction de rappel (Callback) appelée à chaque fois qu'un bloc RTCM est reçu
+def send_to_gps(data):
+    try:
+        # On écrit directement les octets RTCM reçus sur le port série du GPS
+        port_gps.write(data)
+        print(f"[{time.strftime('%H:%M:%S')}] {len(data)} octets de correction injectés.")
+    except Exception as e:
+        print(f"Erreur d'injection : {e}")
+
+# 4. Initialisation du client NTRIP
+client = GNSSNTRIPClient(None)
+
+print("Connexion au réseau Centipede...")
+# Lance le flux en tàche de fond (indiquez vos coordonnées approximatives si besoin initial)
+# Le client se charge de lire le GPS ou de générer les trames GGA requises pour le caster
+client.run(
+    server=caster,
+    port=port,
+    mountpoint=mountpoint,
+    user=username,
+    password=password,
+    callback=send_to_gps
+)
 def calculer_distance_et_cap(lat1, lon1, lat2, lon2):
     # Convertir les degrés en radians
     lat1_rad = math.radians(lat1)
@@ -34,6 +66,7 @@ def lire_coordonnees_gps(ser):
             data = ser.readline().decode('ascii', errors='replace')
             if data.startswith('$GPGGA'):
                 msg = pynmea2.parse(data)
+                #print(msg)
                 return msg.latitude, msg.longitude
         except KeyboardInterrupt:
             break
@@ -41,7 +74,7 @@ def lire_coordonnees_gps(ser):
 
 
 
-ser = serial.Serial(port="/dev/ttyACM0", baudrate=57600, timeout=0.1)
+ser = serial.Serial(port="/dev/ttyACM0", baudrate=57600, timeout=0.2)
 # Filtre passe bas sur les données distance et cap.
 #équivaut a une moyenne flottante
 
@@ -76,8 +109,9 @@ def my_loop():
         cap_moy = (math.degrees(math.atan2(sin_moy, cos_moy)) + 360) % 360
         
         #print(f"{distances},{caps}",flush=True)
-        print(f"{distance_moy:.2f},{cap_moy:.2f}",flush=True)
-        sys.stdout.flush()
+        if len(distances) == FENETRE & len(caps) == FENETRE :
+            print(f"{distance_moy:.2f},{cap_moy:.2f}",flush=True)
+            sys.stdout.flush()
 
             
 #------------------------------MAIN-------------------------------        
@@ -86,11 +120,10 @@ if __name__ == '__main__':
     process.start()
     try :
         while True:
-            time.sleep(0.5)
+            time.sleep(1)
     except KeyboardInterrupt:
         ser.close()
         process.join()
-        time.sleep(0.5)
         print("\nGPS TRANSFERT arrèté par l'utilisateur.")
         sys.exit(0)
         
