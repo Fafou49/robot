@@ -7,14 +7,19 @@ from geopy.distance import geodesic
 import keyboard
 from multiprocessing import Process
 from pygnssutils import GNSSNTRIPClient
+import os
+from dotenv import load_dotenv
 
+# Load NTRIP credentials from a local .env file (see .env.example at repo root).
+# Falls back to the public Centipede test account if no .env is provided.
+load_dotenv()
 
 # 2. Configuration des identifiants Centipede
-caster = "crtk.net"
-port = 2101
-mountpoint = "NEAR"
-username = "centipede"
-password = "centipede"
+caster = os.getenv("NTRIP_CASTER", "crtk.net")
+port = int(os.getenv("NTRIP_PORT", "2101"))
+mountpoint = os.getenv("NTRIP_MOUNTPOINT", "NEAR")
+username = os.getenv("NTRIP_USER", "centipede")
+password = os.getenv("NTRIP_PASSWORD", "centipede")
 
 # 3. Fonction de rappel (Callback) appelée à chaque fois qu'un bloc RTCM est reçu
 def send_to_gps(data):

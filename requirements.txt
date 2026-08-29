@@ -5,3 +5,9 @@ gpiod
 geopy
 pynmea2
 pyserial
+keyboard
+pygnssutils
+matplotlib
+scipy
+python-dotenv
+pytest
