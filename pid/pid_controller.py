@@ -1,5 +1,4 @@
 import sys
-import keyboard
 import time
 import math
 
@@ -12,7 +11,7 @@ class PIDController:
         self.kd = kd  # Coefficient dérivé
         self.setpoint = setpoint  # Valeur cible (distance ou angle)
         self.integral = 0
-        self.previous_error = 0
+        self.previous_error = None  # None = pas encore de mesure precedente (voir update())
         self.last_time = time.time()  # Stocke le temps ici
         
     def set_setpoint(self, setpoint : float):
@@ -27,6 +26,11 @@ class PIDController:
             dt = 0.01  # Valeur par défaut pour éviter la division par zéro
     
         error = self.setpoint - measured_value
+        if self.previous_error is None:
+            # Premier appel : pas de mesure precedente valable, donc pas de
+            # terme derive a calculer (sinon "derivative kick" enorme si
+            # l'erreur de depart est deja grande, ex: 5 m ou 45 degres).
+            self.previous_error = error
         self.integral += error * dt
         derivative = (error - self.previous_error) / dt
         output = self.kp * error + self.ki * self.integral + self.kd * derivative
@@ -66,8 +70,14 @@ def move_to_target( current_distance : float, current_angle : float):
     # Appliquer aux moteurs
     left_speed = speed_pwm + angular_pwm
     right_speed = speed_pwm - angular_pwm
-        
-        
+
+    # Rebornage : speed_pwm et angular_pwm peuvent chacun atteindre +/-255,
+    # donc leur somme/difference peut depasser +/-255 (jusqu'a +/-510) alors
+    # que motor_control/pwm.py attend une valeur physique dans +/-255.
+    left_speed = max(min(left_speed, 255), -255)
+    right_speed = max(min(right_speed, 255), -255)
+
+
     print(f"{time.time()},{left_speed:.2f},{right_speed:.2f},{current_distance:.2f},{current_angle:.2f},{speed:.2f},{angular_velocity:.2f} ",flush=True)
     sys.stdout.flush() 
 
@@ -78,8 +88,12 @@ distance_target = 0.0
 angle_target = 0.0
 
 # Initialisation des PID avec des consignes par défaut
-pid_distance = PIDController(kp=1, ki=0, kd=0, setpoint=distance_target)
-pid_angle = PIDController(kp=0.5, ki=0, kd=0, setpoint=angle_target)
+# Valeurs kp/ki/kd estimees par simulation (voir pid/simulate_motor_commands.py
+# et le README, section "Reglage des PID hors robot") : pas de depassement ni
+# de saturation moteur avec ces coefficients, sur le modele generique simule.
+# A valider ensuite sur le robot reel, a basse vitesse, avant usage complet.
+pid_distance = PIDController(kp=1, ki=0, kd=0.5, setpoint=distance_target)
+pid_angle = PIDController(kp=0.5, ki=0, kd=1, setpoint=angle_target)
 #------------------------------MAIN-------------------------------        
 def main():
 

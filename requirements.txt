@@ -11,3 +11,4 @@ matplotlib
 scipy
 python-dotenv
 pytest
+opencv-python-headless
