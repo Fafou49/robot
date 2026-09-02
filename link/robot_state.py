@@ -16,13 +16,29 @@ commands, validating them, and getting the right ACK/ERR back all work
 end to end, but the robot doesn't physically move yet.
 """
 
+import os
 import threading
 import time
+import urllib.error
+import urllib.request
 
 PWM_MIN, PWM_MAX = -255, 255
 VALID_MODES = ("AUTO", "MANUAL", "IDLE")
 VALID_PID_LOOPS = ("D", "A")
 VALID_CAM_COMMANDS = ("SNAP", "REC_START", "REC_STOP")
+
+# CAM,SNAP is handled by calling into camera/stream_server.py's own /snap
+# endpoint over plain HTTP rather than sharing a process with it (same
+# reasoning as robot-webserver's own camera proxy: simplest thing that
+# works over a stable local connection). Both processes run on this same
+# Pi, hence 127.0.0.1 by default -- override via env vars if the camera
+# script ever runs elsewhere. Read from os.environ at call time (not at
+# import time) so tests can monkeypatch them per-case, same pattern as
+# link.server's GPS_DEVICE/GPS_BAUDRATE.
+CAMERA_HOST_DEFAULT = "127.0.0.1"
+CAMERA_PORT_DEFAULT = 8000
+CAMERA_SNAP_PATH_DEFAULT = "/snap"
+CAMERA_SNAP_TIMEOUT = 3  # seconds -- how long to wait before giving up
 
 
 class CommandError(Exception):
@@ -47,6 +63,15 @@ class RobotState:
         self.pid_gains = {"D": None, "A": None}  # None until PID sets them
         self.nav_target = None  # (lat, lat_dir, lon, lon_dir) once NAV is used
         self.last_command_at = None
+        # Live GPS fix, set by link.gps_reader.GPSReader in the background.
+        # None until the first fix arrives -- STA reports the honest 0.0
+        # placeholder for as long as that's true (no GPS receiver attached,
+        # or no fix yet).
+        self.current_lat = None
+        self.current_lon = None
+        self.cap = 0.0          # course over ground, degrees -- from GPRMC
+        self.speed_kmh = 0.0    # from GPRMC's speed over ground
+        self.last_fix_at = None
 
     # -- STP: emergency stop, highest priority -------------------------
     def stop(self):
@@ -126,8 +151,52 @@ class RobotState:
         action = (action or "").upper()
         if action not in VALID_CAM_COMMANDS:
             raise CommandError("08", f"UNKNOWN_CAM_COMMAND:{action}")
-        # Not implemented: no camera capture code exists in this project yet.
+
+        if action == "SNAP":
+            self._request_snapshot()
+            with self._lock:
+                self.last_command_at = time.time()
+            return
+
+        # REC_START/REC_STOP: not implemented -- no video recording code
+        # exists in this project yet (camera/stream_server.py only ever
+        # provides the live preview and one-shot snapshots).
         raise CommandError("09", f"CAM_NOT_IMPLEMENTED:{action}")
+
+    def _request_snapshot(self):
+        """Asks camera/stream_server.py (a separate process, possibly not
+        even running) to save the current frame via its GET /snap
+        endpoint. Any failure -- camera script not running, no frame
+        grabbed yet, network hiccup -- becomes one CommandError so the
+        console shows a clear reason instead of a raw socket/HTTP
+        traceback; nothing here assumes the camera is actually available."""
+        host = os.environ.get("CAMERA_HOST", CAMERA_HOST_DEFAULT)
+        port = int(os.environ.get("CAMERA_PORT", CAMERA_PORT_DEFAULT))
+        path = os.environ.get("CAMERA_SNAP_PATH", CAMERA_SNAP_PATH_DEFAULT)
+        url = f"http://{host}:{port}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=CAMERA_SNAP_TIMEOUT) as resp:
+                if resp.status != 200:
+                    raise CommandError("12", f"CAMERA_SNAP_FAILED:HTTP_{resp.status}")
+        except urllib.error.HTTPError as exc:
+            # 503 from _handle_snap means "no frame yet" (grabber hasn't
+            # produced one, e.g. camera just starting up) -- still a clean,
+            # specific reason rather than a stack trace.
+            raise CommandError("12", f"CAMERA_SNAP_FAILED:HTTP_{exc.code}")
+        except urllib.error.URLError as exc:
+            raise CommandError("12", f"CAMERA_UNAVAILABLE:{exc.reason}")
+
+    # -- GPS: live fix from link.gps_reader.GPSReader, if a receiver is
+    #    attached -------------------------------------------------------
+    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None):
+        with self._lock:
+            self.current_lat = lat
+            self.current_lon = lon
+            if speed_kmh is not None:
+                self.speed_kmh = speed_kmh
+            if cap is not None:
+                self.cap = cap
+            self.last_fix_at = time.time()
 
     # -- STA: status snapshot for telemetry --------------------------------
     def status(self):
@@ -137,4 +206,8 @@ class RobotState:
                 "left_pwm": self.left_pwm,
                 "right_pwm": self.right_pwm,
                 "nav_target": self.nav_target,
+                "current_lat": self.current_lat,
+                "current_lon": self.current_lon,
+                "cap": self.cap,
+                "speed_kmh": self.speed_kmh,
             }

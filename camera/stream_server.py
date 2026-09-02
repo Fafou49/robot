@@ -6,10 +6,11 @@ that every browser already knows how to display through a plain <img> tag,
 no plugin and no WebRTC signaling needed.
 
 This is intentionally independent from the NMEA control link
-(link/server.py): the CAM sentence type in the control protocol
-(SNAP/REC_START/REC_STOP) is a separate, not-yet-implemented feature for
-triggering snapshots/recordings on demand. This module only provides a
-continuous live preview, always running as long as this script is up.
+(link/server.py): CAM,SNAP is handled there by making a plain HTTP request
+to this process's own /snap endpoint (below) rather than the two talking
+over the NMEA link itself -- see link/robot_state.py's camera_command().
+REC_START/REC_STOP remain unimplemented; this module only adds one-shot
+snapshots on top of the continuous live preview.
 
 The web server (Raspberry Pi #2, robot-webserver repo) does not load this
 stream directly in the browser -- it proxies it from its own /media/camera
@@ -25,17 +26,22 @@ Configuration (environment variables, all optional):
     CAMERA_FPS      target capture/stream rate (default: 15)
     CAMERA_HOST     interface to listen on (default: 0.0.0.0)
     CAMERA_PORT     port to listen on (default: 8000)
+    CAMERA_SNAPSHOT_DIR  where GET /snap saves files (default: camera/tmp/,
+                    see camera/snapshots.py -- never more than 5 at once)
 
 NOTE: written and reviewed against the OpenCV/http.server APIs, but not
 run against a real webcam in this environment -- test on the Pi with the
 actual camera plugged in before relying on it.
 """
+import json
 import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
+
+from camera.snapshots import SnapshotStore
 
 CAMERA_DEVICE = os.environ.get("CAMERA_DEVICE", "0")
 CAMERA_WIDTH = int(os.environ.get("CAMERA_WIDTH", "640"))
@@ -96,10 +102,14 @@ class FrameGrabber:
 
 
 grabber = None  # created in main()
+snapshot_store = None  # created in main()
 
 
 class StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/snap":
+            self._handle_snap()
+            return
         if self.path != "/stream.mjpg":
             self.send_error(404)
             return
@@ -129,17 +139,45 @@ class StreamHandler(BaseHTTPRequestHandler):
             # connection -- nothing to log, just stop this handler's loop.
             pass
 
+    def _handle_snap(self):
+        """GET /snap: saves the current frame into the capped snapshot
+        store (camera/snapshots.py, max 5 files, oldest deleted first) for
+        later processing, and reports which file was written. This is
+        what link/robot_state.py's camera_command("SNAP") calls over
+        plain HTTP -- see that module for why (CAM,SNAP arrives on the
+        NMEA link, a separate process from this one)."""
+        frame = grabber.latest_jpeg() if grabber else None
+        if frame is None:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": False, "error": "NO_FRAME_YET"}).encode("utf-8"))
+            return
+
+        filename = snapshot_store.save(frame)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({
+            "ok": True,
+            "file": filename,
+            "count": snapshot_store.count(),
+        }).encode("utf-8"))
+
     def log_message(self, format, *args):
         pass  # silence the default per-request stderr logging
 
 
 def main():
-    global grabber
+    global grabber, snapshot_store
     grabber = FrameGrabber(CAMERA_DEVICE, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
     grabber.start()
+    snapshot_dir = os.environ.get("CAMERA_SNAPSHOT_DIR")
+    snapshot_store = SnapshotStore(snapshot_dir) if snapshot_dir else SnapshotStore()
 
     server = ThreadingHTTPServer((CAMERA_HOST, CAMERA_PORT), StreamHandler)
     print(f"Camera stream: http://{CAMERA_HOST}:{CAMERA_PORT}/stream.mjpg")
+    print(f"Snapshots (max {snapshot_store.max_snapshots}): http://{CAMERA_HOST}:{CAMERA_PORT}/snap -> {snapshot_store.directory}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

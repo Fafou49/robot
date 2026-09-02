@@ -25,10 +25,12 @@ vit dans un dépôt séparé.
 │   └── gps_delta.py
 ├── link/               # Serveur TCP recevant les commandes du site web (voir plus bas)
 │   ├── nmea.py         # Construction/analyse des trames + checksum
-│   ├── robot_state.py  # Validation et état (PWM, mode, cible GPS, gains PID)
+│   ├── robot_state.py  # Validation et état (PWM, mode, cible GPS, gains PID, appelle camera/ en HTTP pour CAM,SNAP)
+│   ├── gps_reader.py   # Lecture GPS en tâche de fond (voir plus bas)
 │   └── server.py        # Serveur TCP (socketserver), aucune dépendance externe
-├── camera/             # Flux caméra en direct (voir plus bas), indépendant de link/
-│   └── stream_server.py
+├── camera/             # Flux caméra en direct + snapshots (voir plus bas) -- processus séparé de link/, relié par HTTP local
+│   ├── stream_server.py
+│   └── snapshots.py    # Stockage des snapshots, jamais plus de 5 fichiers
 ├── archive/            # Anciennes versions gardées pour référence (voir plus bas)
 ├── tests/              # Tests automatisés (pytest)
 ├── requirements.txt
@@ -112,11 +114,53 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
 - `MOD` et `NAV` et `PID` enregistrent la valeur reçue et répondent `ACK`,
   sans encore agir dessus (pas de lien avec le pipeline GPS/PID pour
   l'instant).
-- `CAM` répond systématiquement `ERR` (`CAM_NOT_IMPLEMENTED`) — pas de code
-  caméra dans le projet à ce jour.
-- `STA` (sans champ, en requête) répond avec l'état courant ; `lat`/`lon`/
-  `cap`/`batterie` restent à 0 tant qu'ils ne sont pas branchés sur une
-  vraie source.
+- `CAM,SNAP` appelle pour de vrai la route `GET /snap` de
+  `camera/stream_server.py` (processus séparé, en HTTP local — voir section
+  dédiée ci-dessous) et répond `ACK`/`ERR` selon que ça réussit ou non
+  (caméra éteinte, pas encore de trame disponible...). `CAM,REC_START` et
+  `CAM,REC_STOP` répondent toujours `ERR` (`CAM_NOT_IMPLEMENTED`) —
+  l'enregistrement vidéo n'existe pas dans le projet à ce jour.
+- `STA` (sans champ, en requête) répond avec l'état courant : position
+  *courante* (`lat`/`lat_dir`/`lon`/`lon_dir`), `cap` et `speed` sont lus
+  pour de vrai depuis un récepteur GPS série par `link/gps_reader.py` (voir
+  section dédiée ci-dessous) — `0.0` tant qu'aucun récepteur n'est branché
+  ou qu'aucune trame valide n'a été reçue. Position *cible*
+  (`target_lat`/`target_lat_dir`/`target_lon`/`target_lon_dir`, dernière
+  trame `NAV` reçue), `left_pwm`/`right_pwm` et `mode` sont réels dès
+  aujourd'hui. `batterie` reste à 0 (aucun capteur de batterie dans le
+  projet). Tout ça alimente le bandeau de statut et l'onglet "TCP" de
+  `/control` sur le site web.
+
+## Lecture GPS (`link/gps_reader.py`)
+
+Tourne automatiquement en arrière-plan dans `link/server.py` (désactivable
+avec `GPS_ENABLED=false`) : lit un récepteur GPS série (même matériel que
+`gps/gps_transfer.py`/`gps/gps_parse.py` — trames `GPRMC`/`GGA` via
+`pynmea2`) et met à jour la position courante, le cap et la vitesse
+utilisés par `STA`. Se dégrade proprement si aucun récepteur n'est
+branché (ou si `pynmea2`/`pyserial` ne sont pas installés) : un
+avertissement dans les logs, et le serveur de contrôle continue de
+fonctionner normalement avec la position courante à `0.0`.
+
+```bash
+python3 -m link                          # GPS sur /dev/ttyACM0 @ 57600 bauds par défaut
+GPS_DEVICE=/dev/ttyACM1 python3 -m link  # port série personnalisé
+GPS_ENABLED=false python3 -m link        # désactive la lecture GPS (utile si gps_transfer.py
+                                          # ou gps_parse.py utilise déjà le port série --
+                                          # un seul processus peut l'ouvrir à la fois)
+```
+
+**Non testé sur un vrai récepteur** : `pynmea2` et `pyserial` (déjà dans
+`requirements.txt`) n'ont pas pu être installés dans l'environnement où
+ce module a été écrit (pas d'accès PyPI, même limitation que pour
+`pytest`). Le calcul de conversion de coordonnées (`link/nmea.py`,
+`decimal_to_nmea`/`nmea_to_decimal`) est testé pour de vrai ; le parsing
+`GPRMC`/`GGA` (`tests/test_gps_reader.py`) est écrit contre l'API
+documentée de `pynmea2` mais n'a jamais tourné pour de vrai — lancer
+`pytest tests/test_gps_reader.py` sur la Pi avant de lui faire confiance.
+La dégradation propre (récepteur absent, bibliothèques absentes) a en
+revanche été vérifiée pour de vrai : le serveur démarre et répond
+normalement dans les deux cas.
 
 ## Flux caméra en direct (`camera/`)
 
@@ -139,19 +183,34 @@ CAMERA_DEVICE=/dev/video2 CAMERA_PORT=8000 python3 -m camera
 Variables d'environnement disponibles (toutes optionnelles) :
 `CAMERA_DEVICE` (index ou chemin du périphérique vidéo, défaut `0`),
 `CAMERA_WIDTH`/`CAMERA_HEIGHT`/`CAMERA_FPS` (résolution et cadence de
-capture), `CAMERA_HOST`/`CAMERA_PORT` (interface d'écoute).
+capture), `CAMERA_HOST`/`CAMERA_PORT` (interface d'écoute),
+`CAMERA_SNAPSHOT_DIR` (dossier des snapshots, voir juste en dessous).
 
-Ce module est volontairement indépendant du protocole NMEA de `link/` : le
-type de trame `CAM` (SNAP/REC_START/REC_STOP) reste une fonctionnalité
-séparée, non implémentée à ce jour — `camera/` fournit uniquement
-l'aperçu vidéo continu, tant que le script tourne.
+Ce module reste volontairement indépendant du protocole NMEA de `link/` en
+tant que processus (deux scripts séparés, lancés indépendamment), mais
+`link/robot_state.py` lui parle en HTTP pour `CAM,SNAP` (voir plus haut) :
+`camera/` gère à la fois l'aperçu vidéo continu et, depuis peu, les
+snapshots à la demande.
+
+### Snapshots (`camera/snapshots.py`)
+
+`GET /snap` sur ce même serveur (port `8000` par défaut) sauvegarde
+l'image actuelle dans un dossier tampon (`camera/tmp/` par défaut,
+personnalisable avec `CAMERA_SNAPSHOT_DIR`) destiné à un traitement
+ultérieur (pipeline de vision, export...), pas à un archivage permanent :
+`SnapshotStore` n'y garde jamais plus de **5 fichiers** — sauvegarder un
+6e supprime automatiquement le plus ancien. C'est ce que `CAM,SNAP`
+déclenche (voir plus haut) ; l'endpoint reste aussi appelable directement
+(`curl http://<IP Pi 1>:8000/snap`) pour du test ou un script externe.
 
 **Non testé sur du vrai matériel** : le code a été relu et vérifié
 syntaxiquement, et le flux MJPEG lui-même (encodage, multipart, relais par
 le site web, bascule automatique sur la page `/control`) a été testé de
-bout en bout avec une fausse webcam simulée. Mais il n'y a pas de vraie
-webcam ni de Raspberry Pi dans l'environnement où il a été écrit — à
-tester avec la caméra réellement branchée avant de s'y fier.
+bout en bout avec une fausse webcam simulée, tout comme `/snap` et le
+plafond à 5 fichiers de `SnapshotStore` (voir `tests/test_link_server.py`
+et `tests/test_snapshots.py`). Mais il n'y a pas de vraie webcam ni de
+Raspberry Pi dans l'environnement où il a été écrit — à tester avec la
+caméra réellement branchée avant de s'y fier.
 
 ## Tests
 

@@ -12,7 +12,7 @@ __pycache__/
 *.ini
 *.cfg
 
-# Fichiers de dépendances générés
+# Fichiers de dï¿½pendances gï¿½nï¿½rï¿½s
 *.egg-info/
 
 # Fichiers temporaires et logs
@@ -20,6 +20,11 @@ __pycache__/
 *.swp
 .DS_Store
 
-# Fichiers spécifiques aux IDE
+# Snapshots CAM,SNAP (camera/snapshots.py) -- fichiers temporaires
+# regeneres a l'usage, jamais plus de 5 a la fois, rien a versionner.
+camera/tmp/*
+!camera/tmp/.gitkeep
+
+# Fichiers spï¿½cifiques aux IDE
 .idea/
 .vscode/

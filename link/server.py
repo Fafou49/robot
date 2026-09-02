@@ -14,7 +14,8 @@ import logging
 import os
 import socketserver
 
-from link.nmea import SentenceError, build_sentence, parse_sentence
+from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
+from link.nmea import SentenceError, build_sentence, decimal_to_nmea, parse_sentence
 from link.robot_state import CommandError, RobotState
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -59,18 +60,44 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
     if sentence_type == "CAM":
         if len(fields) != 1:
             raise CommandError("10", "CAM_NEEDS_1_FIELD")
-        state.camera_command(*fields)  # always raises CommandError today
-        return build_sentence("ACK", "CAM")  # pragma: no cover (unreachable for now)
+        # SNAP calls out to camera/stream_server.py's /snap endpoint (see
+        # RobotState.camera_command) and can genuinely succeed; REC_START/
+        # REC_STOP still always raise (not implemented).
+        state.camera_command(*fields)
+        return build_sentence("ACK", "CAM")
 
     if sentence_type == "STA":
         s = state.status()
-        nav = s["nav_target"] or (0.0, "N", 0.0, "E")
-        # Fields kept in the exact order documented on the protocol page
-        # (lat, lon, cap, left_pwm, right_pwm, battery), with "mode"
-        # appended -- allowed by the "extend at the end only" rule so
-        # older clients that ignore the extra field still work.
+        target = s["nav_target"] or (0.0, "N", 0.0, "E")
+
+        # Current position: real once link.gps_reader.GPSReader has a fix
+        # (current_lat/current_lon are no longer None), the honest 0.0
+        # placeholder otherwise (no receiver attached, or no fix yet).
+        # Same ddmm.mmmm + direction format as NAV/target, built with
+        # decimal_to_nmea so lat/lon and their direction letters stay
+        # adjacent -- this used to be two separate, far-apart fields
+        # (a hardcoded "N"/"E" assumption that was actually wrong for
+        # this robot, which operates west of the meridian -- see
+        # gps/gps_transfer.py's lon_cible) and has been consolidated here.
+        if s["current_lat"] is not None and s["current_lon"] is not None:
+            lat_str, lat_dir = decimal_to_nmea(s["current_lat"], is_longitude=False)
+            lon_str, lon_dir = decimal_to_nmea(s["current_lon"], is_longitude=True)
+        else:
+            lat_str, lat_dir, lon_str, lon_dir = "0.0", "N", "0.0", "E"
+
+        # Fields, in order: current position (lat, lat_dir, lon, lon_dir --
+        # matching NAV's own field order), cap (course over ground) and
+        # speed (km/h, both from GPRMC once a fix is available, 0.0
+        # otherwise), left_pwm, right_pwm, battery (still a placeholder --
+        # no battery sensor in this project), mode, then target position
+        # (target_lat, target_lat_dir, target_lon, target_lon_dir -- last
+        # waypoint received via NAV, if any).
         return build_sentence(
-            "STA", nav[0], nav[2], 0.0, s["left_pwm"], s["right_pwm"], 0, s["mode"]
+            "STA",
+            lat_str, lat_dir, lon_str, lon_dir,
+            round(s["cap"], 1), round(s["speed_kmh"], 2),
+            s["left_pwm"], s["right_pwm"], 0, s["mode"],
+            target[0], target[1], target[2], target[3],
         )
 
     raise CommandError("11", f"UNKNOWN_SENTENCE_TYPE:{sentence_type}")
@@ -110,9 +137,21 @@ class ControlServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, host, port, state: RobotState = None):
+    def __init__(self, host, port, state: RobotState = None, start_gps: bool = True):
         super().__init__((host, port), ControlHandler)
         self.state = state or RobotState()
+        self.gps_reader = None
+        if start_gps:
+            # GPS_ENABLED=false disables this entirely -- useful if
+            # gps/gps_transfer.py or gps/gps_parse.py is already holding
+            # the serial port (only one process can own it at a time).
+            if os.environ.get("GPS_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.gps_reader = GPSReader(
+                    self.state,
+                    device=os.environ.get("GPS_DEVICE", DEFAULT_DEVICE),
+                    baudrate=int(os.environ.get("GPS_BAUDRATE", DEFAULT_BAUDRATE)),
+                )
+                self.gps_reader.start()
 
 
 def main():

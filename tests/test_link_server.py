@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from link.nmea import build_sentence, parse_sentence
+from link.nmea import build_sentence, nmea_to_decimal, parse_sentence
 from link.robot_state import CommandError, RobotState
 from link.server import ControlServer
 
@@ -47,18 +47,72 @@ def test_set_mode_rejects_unknown_mode():
         state.set_mode("FLY")
 
 
-def test_camera_command_not_implemented_yet():
+def test_camera_command_rejects_unknown_action():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.camera_command("FLY")
+    assert exc_info.value.code == "08"
+
+
+def test_camera_command_rec_not_implemented_yet():
+    # REC_START/REC_STOP: no video recording code exists in this project
+    # yet -- only SNAP (below) actually does something now.
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.camera_command("REC_START")
+    assert "NOT_IMPLEMENTED" in exc_info.value.message
+
+
+def test_camera_command_snap_fails_cleanly_when_camera_unreachable(monkeypatch):
+    # No camera/stream_server.py running at this port in tests -- SNAP
+    # must turn that into a clean CommandError, not a raw exception.
+    monkeypatch.setenv("CAMERA_PORT", "1")  # nothing listens on port 1
     state = RobotState()
     with pytest.raises(CommandError) as exc_info:
         state.camera_command("SNAP")
-    assert "NOT_IMPLEMENTED" in exc_info.value.message
+    assert exc_info.value.code == "12"
+
+
+def test_camera_command_snap_succeeds_against_a_real_snap_endpoint(monkeypatch):
+    # Minimal stand-in for camera/stream_server.py's GET /snap: no OpenCV
+    # dependency needed here, just something answering 200 on that path,
+    # to check the HTTP round trip and ACK path for real.
+    import http.server
+    import json
+    import threading
+
+    class SnapHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "file": "snap_test.jpg", "count": 1}).encode())
+
+        def log_message(self, format, *args):
+            pass
+
+    mock_camera = http.server.HTTPServer(("127.0.0.1", 0), SnapHandler)
+    thread = threading.Thread(target=mock_camera.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("CAMERA_HOST", "127.0.0.1")
+        monkeypatch.setenv("CAMERA_PORT", str(mock_camera.server_address[1]))
+        state = RobotState()
+        state.camera_command("SNAP")  # must not raise
+    finally:
+        mock_camera.shutdown()
+        mock_camera.server_close()
 
 
 # --- End-to-end socket tests ------------------------------------------------
 
 @pytest.fixture()
 def running_server():
-    server = ControlServer("127.0.0.1", 0)  # port 0 = pick a free port
+    # start_gps=False: tests don't need a real (or attempted) GPS fix, and
+    # this avoids every test run trying to open a real serial device --
+    # see test_control_server_starts_fine_without_gps_hardware below for a
+    # dedicated check that start_gps=True doesn't crash when it can't.
+    server = ControlServer("127.0.0.1", 0, start_gps=False)  # port 0 = pick a free port
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -111,3 +165,61 @@ def test_state_is_shared_across_connections(running_server):
     time.sleep(0.05)
     assert running_server.state.left_pwm == 80
     assert running_server.state.right_pwm == 80
+
+
+def test_sta_without_nav_target_or_gps_fix_reports_placeholders(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("STA"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "STA"
+    # lat, lat_dir, lon, lon_dir, cap, speed, left_pwm, right_pwm, battery,
+    # mode, target_lat, target_lat_dir, target_lon, target_lon_dir
+    assert fields[:4] == ["0.0", "N", "0.0", "E"]  # no real GPS fix yet
+    assert fields[4:6] == ["0.0", "0.0"]  # cap, speed
+    assert fields[10:] == ["0.0", "N", "0.0", "E"]  # no NAV received yet
+
+
+def test_sta_after_nav_reports_that_target(running_server):
+    port = running_server.server_address[1]
+    _send_and_receive(port, build_sentence("NAV", 4807.038, "N", 1131.000, "E"))
+    response = _send_and_receive(port, build_sentence("STA"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "STA"
+    assert fields[10:] == ["4807.038", "N", "1131.0", "E"]
+
+
+def test_sta_reports_a_real_gps_fix_once_one_arrives(running_server):
+    # Simulates what link.gps_reader.GPSReader would do once a receiver is
+    # attached and gets a fix -- this project's robot operates just west
+    # of the meridian, so the negative longitude sign is the interesting
+    # part to check (a hardcoded "assume East" bug shipped here once).
+    running_server.state.update_gps_fix(47.391033, -0.738500, speed_kmh=3.7, cap=284.5)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("STA"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "STA"
+    lat = nmea_to_decimal(fields[0], fields[1])
+    lon = nmea_to_decimal(fields[2], fields[3])
+    assert lat == pytest.approx(47.391033, abs=1e-4)
+    assert lon == pytest.approx(-0.738500, abs=1e-4)
+    assert fields[4] == "284.5"  # cap
+    assert fields[5] == "3.7"    # speed_kmh
+
+
+def test_control_server_starts_fine_without_gps_hardware(monkeypatch):
+    # start_gps=True (the default), but pointed at a device path that
+    # cannot possibly exist -- the point is confirming this never crashes
+    # server startup, on this dev machine or on the Pi without a receiver
+    # plugged in.
+    monkeypatch.setenv("GPS_DEVICE", "/dev/definitely-not-a-real-device")
+    server = ControlServer("127.0.0.1", 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        response = _send_and_receive(
+            server.server_address[1], build_sentence("STA")
+        )
+        assert parse_sentence(response)[0] == "STA"
+    finally:
+        server.shutdown()
+        server.server_close()
