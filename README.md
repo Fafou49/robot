@@ -12,7 +12,10 @@ vit dans un dépôt séparé.
 .
 ├── motor_control/      # Pilotage moteurs (GPIO/PWM) et entrée manette
 │   ├── pwm.py
-│   └── remote_control.py
+│   ├── remote_control.py
+│   ├── gps_condition_logger.py      # Moteur commun aux 2 scripts ci-dessous (logique de journalisation GPS conditionnelle)
+│   ├── gps_log_on_full_throttle.py  # Variante de remote_control.py : journalise le GPS en ligne droite a fond (reponse a l'echelon, translation)
+│   └── gps_log_on_full_rotation.py  # Variante de remote_control.py : journalise le GPS en rotation sur place a fond (reponse a l'echelon, rotation)
 ├── pid/                # Asservissement PID (distance / cap)
 │   ├── pid_controller.py
 │   ├── pid_plot.py               # Simulation/visualisation hors robot (ancien)
@@ -161,6 +164,52 @@ documentée de `pynmea2` mais n'a jamais tourné pour de vrai — lancer
 La dégradation propre (récepteur absent, bibliothèques absentes) a en
 revanche été vérifiée pour de vrai : le serveur démarre et répond
 normalement dans les deux cas.
+
+## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
+
+Deux variantes de `motor_control/remote_control.py` (même manette, mêmes
+moteurs, code de `Remote` inchangé), pensées pour définir les courbes de
+réponse à l'échelon du robot — une en translation, une en rotation —
+sans avoir à trier tout le reste du trajet dans les données GPS :
+chacune ajoute une tâche de fond (`motor_control/gps_condition_logger.py`,
+moteur commun aux deux) qui lit en continu le GPS série (même
+matériel/port que `gps/gps_parse.py` et `link/gps_reader.py`) et n'écrit
+dans un fichier de log que lorsque les deux moteurs remplissent une
+condition précise :
+
+- **`gps_log_on_full_throttle.py`** — ligne droite à fond :
+  `dutyCycleLeft` ET `dutyCycleRight` == 255 (même sens, pleine
+  puissance) → `motor_control/full_throttle_gps.log`, marqueurs
+  `FULL_THROTTLE_START`/`FULL_THROTTLE_END`. Utile pour la vitesse de
+  pointe et la dérive en ligne droite.
+- **`gps_log_on_full_rotation.py`** — rotation sur place à fond :
+  `dutyCycleLeft`/`dutyCycleRight` == +255/-255 ou -255/+255 (sens
+  opposés, pleine puissance) → `motor_control/full_rotation_gps.log`,
+  marqueurs `FULL_ROTATION_START`/`FULL_ROTATION_END`. Ici c'est le
+  **cap** GPS qui est le signal intéressant, pas la position — le robot
+  pivote quasiment sur place, sa position GPS ne bouge quasiment pas.
+
+```bash
+python3 -m motor_control.gps_log_on_full_throttle   # translation
+python3 -m motor_control.gps_log_on_full_rotation   # rotation
+```
+
+Dans les deux cas, les trames NMEA brutes sont horodatées et le fichier
+de log (déjà ignoré par git, comme tout `*.log`) reste vide (ou ne
+contient que des marqueurs) tant que la condition exacte n'a jamais été
+atteinte pendant la session — ce n'est pas un bug.
+
+**Non testé sur le robot réel** : comme pour `link/gps_reader.py`,
+`pyserial`, `evdev`, `pygame` et `gpiod` n'ont pas pu être installés dans
+l'environnement où ces scripts ont été écrits (pas d'accès PyPI). Seules
+les deux détections pures et sans matériel (`is_full_throttle()` et
+`is_full_rotation()`) sont réellement testées
+(`tests/test_gps_log_on_full_throttle.py`,
+`tests/test_gps_log_on_full_rotation.py`) ; le reste (lecture série,
+intégration avec `Remote`, dans `gps_condition_logger.py`) est écrit
+contre les API documentées mais n'a jamais tourné pour de vrai — à
+vérifier sur la Pi, manette et récepteur GPS branchés, avant de leur
+faire confiance.
 
 ## Flux caméra en direct (`camera/`)
 
