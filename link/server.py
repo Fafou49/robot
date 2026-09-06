@@ -51,6 +51,16 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         state.set_nav_target(*fields)
         return build_sentence("ACK", "NAV")
 
+    if sentence_type == "RTE":
+        # Field count isn't fixed here (depends on how many waypoints the
+        # route has) -- state.set_route() validates the leading count field
+        # against the rest and raises CommandError("13", ...) for anything
+        # inconsistent, so there's nothing more to check before calling it.
+        if len(fields) < 1:
+            raise CommandError("10", "RTE_NEEDS_COUNT_AND_POINTS")
+        state.set_route(fields)
+        return build_sentence("ACK", "RTE")
+
     if sentence_type == "PID":
         if len(fields) != 4:
             raise CommandError("10", "PID_NEEDS_4_FIELDS")

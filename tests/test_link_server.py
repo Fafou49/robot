@@ -47,6 +47,73 @@ def test_set_mode_rejects_unknown_mode():
         state.set_mode("FLY")
 
 
+def test_set_route_stores_points_and_arms_first_as_nav_target():
+    state = RobotState()
+    p1 = ("4723.492", "N", "00044.340", "W")
+    p2 = ("4724.010", "N", "00044.500", "W")
+    state.set_route(["2", *p1, *p2])
+    assert state.route == [p1, p2]
+    assert state.route_index == 0
+    assert state.nav_target == p1
+
+
+def test_set_route_rejects_field_count_mismatch():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.set_route(["2", "4723.492", "N", "00044.340", "W"])  # only 1 point, count says 2
+    assert exc_info.value.code == "13"
+
+
+def test_set_route_rejects_too_many_points():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.set_route(["201"] + ["4723.492", "N", "00044.340", "W"] * 201)
+    assert exc_info.value.code == "13"
+
+
+def test_set_route_rejects_bad_direction_letter():
+    state = RobotState()
+    with pytest.raises(CommandError):
+        state.set_route(["1", "4723.492", "X", "00044.340", "W"])
+
+
+def test_route_advances_to_next_waypoint_on_arrival():
+    state = RobotState()
+    p1 = ("4723.492", "N", "00044.340", "W")   # ~ 47.391533, -0.739
+    p2 = ("4723.532", "N", "00044.292", "W")   # ~ 95m away
+    state.set_route(["2", *p1, *p2])
+
+    # Far from p1 -- must not advance.
+    state.update_gps_fix(47.0, -1.0)
+    assert state.route_index == 0
+
+    # On top of p1 -- advances to p2.
+    state.update_gps_fix(47.391533, -0.739)
+    assert state.route_index == 1
+    assert state.nav_target == p2
+
+    # On top of p2 -- route completes; nav_target stays on the last point.
+    state.update_gps_fix(47.392200, -0.738200)
+    assert state.route_index == 2  # == len(route): done
+    assert state.nav_target == p2
+
+
+def test_nav_cancels_an_active_route():
+    state = RobotState()
+    state.set_route(["1", "4723.492", "N", "00044.340", "W"])
+    state.set_nav_target("4724.010", "N", "00044.500", "W")
+    assert state.route == []
+    assert state.route_index == 0
+
+
+def test_stop_cancels_an_active_route():
+    state = RobotState()
+    state.set_route(["1", "4723.492", "N", "00044.340", "W"])
+    state.stop()
+    assert state.route == []
+    assert state.route_index == 0
+
+
 def test_camera_command_rejects_unknown_action():
     state = RobotState()
     with pytest.raises(CommandError) as exc_info:
@@ -204,6 +271,35 @@ def test_sta_reports_a_real_gps_fix_once_one_arrives(running_server):
     assert lon == pytest.approx(-0.738500, abs=1e-4)
     assert fields[4] == "284.5"  # cap
     assert fields[5] == "3.7"    # speed_kmh
+
+
+def test_rte_over_real_socket_returns_ack(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(
+        port,
+        build_sentence("RTE", "2", "4723.492", "N", "00044.340", "W", "4724.010", "N", "00044.500", "W"),
+    )
+    assert response == build_sentence("ACK", "RTE")
+
+
+def test_rte_bad_count_over_real_socket_returns_err(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("RTE", "not-a-number"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "ERR"
+    assert fields[0] == "13"
+
+
+def test_sta_target_reflects_route_first_waypoint(running_server):
+    port = running_server.server_address[1]
+    _send_and_receive(
+        port,
+        build_sentence("RTE", "1", "4723.492", "N", "00044.340", "W"),
+    )
+    response = _send_and_receive(port, build_sentence("STA"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "STA"
+    assert fields[10:] == ["4723.492", "N", "00044.340", "W"]
 
 
 def test_control_server_starts_fine_without_gps_hardware(monkeypatch):

@@ -1,7 +1,7 @@
 evdev
 numpy
 pygame
-gpiod
+gpiod>=2  # v2 API required -- motor_control/remote_control.py and pwm.py both use it (chip.request_lines(), Value/Direction enums), v1's chip.get_line()/type=LINE_REQ_DIR_OUT no longer exists
 geopy
 pynmea2
 pyserial

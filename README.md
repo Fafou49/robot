@@ -13,9 +13,10 @@ vit dans un dépôt séparé.
 ├── motor_control/      # Pilotage moteurs (GPIO/PWM) et entrée manette
 │   ├── pwm.py
 │   ├── remote_control.py
-│   ├── gps_condition_logger.py      # Moteur commun aux 2 scripts ci-dessous (logique de journalisation GPS conditionnelle)
-│   ├── gps_log_on_full_throttle.py  # Variante de remote_control.py : journalise le GPS en ligne droite a fond (reponse a l'echelon, translation)
-│   └── gps_log_on_full_rotation.py  # Variante de remote_control.py : journalise le GPS en rotation sur place a fond (reponse a l'echelon, rotation)
+│   ├── gps_condition_logger.py       # Moteur commun aux 3 scripts ci-dessous (logique de journalisation GPS conditionnelle)
+│   ├── gps_log_on_full_throttle.py   # Variante de remote_control.py : journalise le GPS en ligne droite a fond (reponse a l'echelon, translation)
+│   ├── gps_log_on_full_rotation.py   # Variante de remote_control.py : journalise le GPS en rotation sur place a fond (reponse a l'echelon, rotation)
+│   └── gps_log_on_full_maneuvers.py  # Variante de remote_control.py : les 2 ci-dessus a la fois, en un seul script/une seule lecture GPS
 ├── pid/                # Asservissement PID (distance / cap)
 │   ├── pid_controller.py
 │   ├── pid_plot.py               # Simulation/visualisation hors robot (ancien)
@@ -36,8 +37,9 @@ vit dans un dépôt séparé.
 │   └── snapshots.py    # Stockage des snapshots, jamais plus de 5 fichiers
 ├── archive/            # Anciennes versions gardées pour référence (voir plus bas)
 ├── tests/              # Tests automatisés (pytest)
+├── run_robot.sh        # Lance link/server.py + camera/stream_server.py ensemble, arrêt propre des deux au Ctrl+C (voir plus bas)
 ├── requirements.txt
-└── .env.example        # Modèle pour les identifiants NTRIP (voir plus bas)
+└── .env.example        # Modèle pour les identifiants NTRIP et de la caméra (voir plus bas)
 ```
 
 ## Installation
@@ -116,7 +118,26 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
   continuer sur ce point precis.
 - `MOD` et `NAV` et `PID` enregistrent la valeur reçue et répondent `ACK`,
   sans encore agir dessus (pas de lien avec le pipeline GPS/PID pour
-  l'instant).
+  l'instant). Une `NAV` annule une éventuelle route `RTE` en cours (voir
+  ci-dessous) — l'opérateur reprend la main.
+- `RTE` (nouvelle trame, un champ `count` suivi de `count` points
+  lat/lat_dir/lon/lon_dir, même format que `NAV`) enregistre une liste de
+  points de passage ordonnée dans `link/robot_state.py`
+  (`RobotState.route`/`route_index`) et arme le premier comme cible
+  (`nav_target`). À chaque nouvelle position GPS (`update_gps_fix`), si la
+  distance (haversine, calculée dans `link/robot_state.py` — volontairement
+  pas de réutilisation de `gps/gps_delta.py`, dont
+  `distance_to_target_meter`/`angle_to_target_radius` référencent des
+  variables non définies) entre la position courante et le point visé passe
+  sous `ROUTE_ARRIVAL_RADIUS_M` (5 m par défaut, `float` réglable par
+  variable d'environnement), la cible avance automatiquement au point
+  suivant, jusqu'au dernier. `STP` et `NAV` annulent une route en cours.
+  Comme pour `NAV`, rien ne pilote encore les moteurs pour suivre
+  effectivement la route : seule `nav_target` (et donc le champ `target_*`
+  de `STA`) avance réellement. Limite : 200 points par route
+  (`ROUTE_MAX_POINTS`). Voir `pages/protocole_controle.html` (dépôt
+  `robot-webserver`) pour le format exact de la trame et le bouton
+  "GPS route" de `/control` qui la génère depuis un fichier texte.
 - `CAM,SNAP` appelle pour de vrai la route `GET /snap` de
   `camera/stream_server.py` (processus séparé, en HTTP local — voir section
   dédiée ci-dessous) et répond `ACK`/`ERR` selon que ça réussit ou non
@@ -167,15 +188,15 @@ normalement dans les deux cas.
 
 ## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
 
-Deux variantes de `motor_control/remote_control.py` (même manette, mêmes
+Trois variantes de `motor_control/remote_control.py` (même manette, mêmes
 moteurs, code de `Remote` inchangé), pensées pour définir les courbes de
-réponse à l'échelon du robot — une en translation, une en rotation —
-sans avoir à trier tout le reste du trajet dans les données GPS :
-chacune ajoute une tâche de fond (`motor_control/gps_condition_logger.py`,
-moteur commun aux deux) qui lit en continu le GPS série (même
-matériel/port que `gps/gps_parse.py` et `link/gps_reader.py`) et n'écrit
-dans un fichier de log que lorsque les deux moteurs remplissent une
-condition précise :
+réponse à l'échelon du robot — une en translation, une en rotation, une
+troisième qui fait les deux à la fois — sans avoir à trier tout le reste
+du trajet dans les données GPS. Chacune s'appuie sur
+`motor_control/gps_condition_logger.py` (moteur commun aux trois), qui
+lit en continu le GPS série (même matériel/port que `gps/gps_parse.py`
+et `link/gps_reader.py`) et n'écrit dans un fichier de log que lorsque
+les deux moteurs remplissent une condition précise :
 
 - **`gps_log_on_full_throttle.py`** — ligne droite à fond :
   `dutyCycleLeft` ET `dutyCycleRight` == 255 (même sens, pleine
@@ -188,28 +209,42 @@ condition précise :
   marqueurs `FULL_ROTATION_START`/`FULL_ROTATION_END`. Ici c'est le
   **cap** GPS qui est le signal intéressant, pas la position — le robot
   pivote quasiment sur place, sa position GPS ne bouge quasiment pas.
+- **`gps_log_on_full_maneuvers.py`** — les deux conditions ci-dessus
+  surveillées **en même temps**, dans un seul script : plus besoin de
+  savoir à l'avance quelle manœuvre tu vas faire, chaque fichier de log
+  se remplit tout seul dès que sa condition se produit. Techniquement,
+  ce script ouvre le port série GPS **une seule fois** et teste les deux
+  conditions sur chaque trame reçue (via
+  `gps_condition_logger.MultiConditionGPSLogger`) — c'est important : le
+  port série ne supporte pas d'être lu par deux processus en même temps
+  (les trames se répartiraient au hasard entre les deux lecteurs), donc
+  ne lance jamais ce script en même temps que les deux précédents, ni les
+  deux précédents ensemble.
 
 ```bash
-python3 -m motor_control.gps_log_on_full_throttle   # translation
-python3 -m motor_control.gps_log_on_full_rotation   # rotation
+python3 -m motor_control.gps_log_on_full_throttle    # translation seule
+python3 -m motor_control.gps_log_on_full_rotation    # rotation seule
+python3 -m motor_control.gps_log_on_full_maneuvers   # les deux a la fois (1 seul a la fois !)
 ```
 
-Dans les deux cas, les trames NMEA brutes sont horodatées et le fichier
-de log (déjà ignoré par git, comme tout `*.log`) reste vide (ou ne
-contient que des marqueurs) tant que la condition exacte n'a jamais été
-atteinte pendant la session — ce n'est pas un bug.
+Dans tous les cas, les trames NMEA brutes sont horodatées et chaque
+fichier de log (déjà ignoré par git, comme tout `*.log`) reste vide (ou
+ne contient que des marqueurs) tant que sa condition exacte n'a jamais
+été atteinte pendant la session — ce n'est pas un bug.
 
 **Non testé sur le robot réel** : comme pour `link/gps_reader.py`,
 `pyserial`, `evdev`, `pygame` et `gpiod` n'ont pas pu être installés dans
 l'environnement où ces scripts ont été écrits (pas d'accès PyPI). Seules
-les deux détections pures et sans matériel (`is_full_throttle()` et
-`is_full_rotation()`) sont réellement testées
+les parties pures et sans matériel sont réellement testées :
+`is_full_throttle()`/`is_full_rotation()`
 (`tests/test_gps_log_on_full_throttle.py`,
-`tests/test_gps_log_on_full_rotation.py`) ; le reste (lecture série,
-intégration avec `Remote`, dans `gps_condition_logger.py`) est écrit
-contre les API documentées mais n'a jamais tourné pour de vrai — à
-vérifier sur la Pi, manette et récepteur GPS branchés, avant de leur
-faire confiance.
+`tests/test_gps_log_on_full_rotation.py`) et la logique de répartition
+d'une trame entre plusieurs conditions
+(`MultiConditionGPSLogger._writes_for_line()`, dans
+`tests/test_gps_condition_logger.py`) ; le reste (lecture série,
+intégration avec `Remote`) est écrit contre les API documentées mais n'a
+jamais tourné pour de vrai — à vérifier sur la Pi, manette et récepteur
+GPS branchés, avant de leur faire confiance.
 
 ## Flux caméra en direct (`camera/`)
 
@@ -233,13 +268,57 @@ Variables d'environnement disponibles (toutes optionnelles) :
 `CAMERA_DEVICE` (index ou chemin du périphérique vidéo, défaut `0`),
 `CAMERA_WIDTH`/`CAMERA_HEIGHT`/`CAMERA_FPS` (résolution et cadence de
 capture), `CAMERA_HOST`/`CAMERA_PORT` (interface d'écoute),
-`CAMERA_SNAPSHOT_DIR` (dossier des snapshots, voir juste en dessous).
+`CAMERA_SNAPSHOT_DIR` (dossier des snapshots, voir juste en dessous). Elles
+peuvent aussi être définies une fois pour toutes dans le `.env` du dépôt
+(voir `.env.example`) au lieu d'être retapées à chaque lancement — une
+variable passée explicitement sur la ligne de commande garde la priorité
+sur le `.env`.
+
+Pour trouver le bon `CAMERA_DEVICE` : `ls /dev/video*` (une webcam USB est
+un périphérique vidéo, complètement indépendant des ports série comme
+`ttyACM0` utilisé par le GPS — aucun risque de conflit entre les deux).
+S'il y a plusieurs entrées `/dev/videoN` pour une même webcam (fréquent
+avec les webcams UVC : un noeud capture + un noeud métadonnées),
+`v4l2-ctl --list-devices` et `v4l2-ctl --list-formats-ext -d /dev/videoN`
+(paquet `v4l-utils`) permettent d'identifier lequel accepte réellement la
+capture (formats MJPG/YUYV listés) plutôt que de deviner.
+
+**Si le flux n'apparaît pas sur `/control`** : regarder ce que `python3 -m
+camera` affiche dans son propre terminal, il distingue maintenant
+clairement les trois cas possibles — le device refuse carrément de s'ouvrir
+(erreur immédiate au démarrage), le device s'ouvre normalement mais ne
+livre jamais d'image (message répété toutes les 5s citant les causes
+probables : résolution/FPS non supportés, mauvais noeud `/dev/videoN`,
+device déjà utilisé par un autre processus), ou tout fonctionne (message
+"Camera OK: first frame captured" une seule fois, dès la première image
+reçue). Avant cette journalisation, ces trois situations étaient
+indiscernables depuis `/control`, qui retombe silencieusement sur la
+playlist vidéo dans les trois cas.
 
 Ce module reste volontairement indépendant du protocole NMEA de `link/` en
 tant que processus (deux scripts séparés, lancés indépendamment), mais
 `link/robot_state.py` lui parle en HTTP pour `CAM,SNAP` (voir plus haut) :
 `camera/` gère à la fois l'aperçu vidéo continu et, depuis peu, les
 snapshots à la demande.
+
+### Lancer `link/` et `camera/` en même temps (`run_robot.sh`)
+
+`python3 -m link && python3 -m camera` ne fonctionne pas pour ça : `&&`
+n'exécute la seconde commande qu'après la sortie de la première, or
+`link/server.py` tourne indéfiniment (il sert des connexions jusqu'à
+interruption) — `camera/stream_server.py` ne démarre donc jamais.
+`run_robot.sh`, à la racine du dépôt, lance les deux en parallèle et les
+arrête tous les deux proprement sur un seul Ctrl+C (y compris si l'un des
+deux plante tout seul, pour éviter de laisser l'autre tourner seul sans
+s'en rendre compte) :
+
+```bash
+./run_robot.sh
+```
+
+Les variables d'environnement des deux scripts (`CAMERA_DEVICE`,
+`GPS_DEVICE`, `CONTROL_PORT`, etc.) restent utilisables normalement,
+exportées avant l'appel ou via `.env`.
 
 ### Snapshots (`camera/snapshots.py`)
 
@@ -309,6 +388,71 @@ puis corrigés dans `pid_controller.py` :
   intervalle très court, créant un pic artificiel énorme (jusqu'à saturer les
   deux moteurs simultanément dès t≈0, avant même le bug ci-dessus). Corrigé en
   initialisant `previous_error` avec la première erreur mesurée au lieu de 0.
+
+## Corrections apportées (2026-09-06) — `motor_control/remote_control.py`
+
+Suite à un signalement ("le PWM ne fonctionne pas") :
+
+- **Vrai bug trouvé, indépendant du gpiochip utilisé** : le thread PWM
+  était démarré avec `threading.Thread(target=self.pwm, args=(self.dutyCycleLeft,
+  self.dutyCycleRight,))`, alors que `pwm(self)` ne prend aucun paramètre
+  (il relit `self.dutyCycleLeft`/`self.dutyCycleRight` en direct à chaque
+  tour de boucle). Résultat : le thread plantait immédiatement avec un
+  `TypeError` dès son lancement — silencieusement, puisqu'un thread qui
+  lève une exception affiche juste une trace dans le terminal au lieu
+  d'arrêter le programme, facile à manquer au milieu des autres logs. La
+  boucle PWM ne tournait donc jamais, quel que soit le gpiochip choisi.
+  Corrigé en retirant `args=(...)` de l'appel `Thread(...)`. Reproduit et
+  vérifié en isolant l'appel du thread (voir historique de conversation) ;
+  non testable de bout en bout ici faute de GPIO/manette réels.
+- **Numéro de gpiochip codé en dur (`gpiochip4`)** : sur Raspberry Pi 5, la
+  puce qui porte les GPIO du connecteur 40 broches (RP1) n'a pas un numéro
+  fixe — les premières images Pi OS pour le Pi 5 l'exposaient en
+  `gpiochip4`, une mise à jour du noyau/device-tree (mi-2024) l'a ramenée
+  en `gpiochip0` (comme sur les Pi plus anciens) en déplaçant les anciennes
+  puces internes vers `gpiochip10+`. Un numéro codé en dur casse donc à la
+  prochaine mise à jour du système. Remplacé par `detect_rp1_gpiochip()` :
+  identifie la puce par son label pilote `pinctrl-rp1` via la commande
+  `gpiodetect`, avec repli sur `/dev/gpiochip0` (la valeur qui fonctionne
+  aujourd'hui sur ce robot) si `gpiodetect` est absent ou ne trouve rien,
+  et surchargeable à tout moment avec la variable d'environnement
+  `ROBOT_GPIOCHIP`. Testé pour de vrai ici (logique pure, `gpiodetect`
+  simulé) : `tests/test_remote_control_gpiochip.py`.
+
+Pour vérifier sur la Pi que la bonne puce est bien détectée :
+```bash
+gpiodetect   # doit montrer une ligne "gpiochipN [pinctrl-rp1] (54 lines)"
+```
+
+## Corrections apportées (2026-09-06, suite) — passage à l'API libgpiod v2
+
+Après le premier correctif ci-dessus, un test réel sur la Pi a révélé un
+troisième problème, plus profond : `FileNotFoundError` sur
+`gpiod.Chip(...)`. Cause : la bibliothèque `gpiod` installée sur le
+robot (`.venv`, Python 3.13) est en réalité la **version 2** de
+`libgpiod`, dont l'API Python a été entièrement redessinée par rapport à
+la version 1 que `remote_control.py` utilisait jusqu'ici
+(`chip.get_line(offset).request(consumer=..., type=gpiod.LINE_REQ_DIR_OUT)`,
+`.set_value(0)`/`.set_value(1)`) — cette ancienne API n'existe plus en v2.
+Deux conséquences corrigées :
+
+- `gpiod.Chip(path)` (v2) exige un **chemin complet** (`/dev/gpiochip0`)
+  et ne résout plus un nom nu (`"gpiochip0"`) tout seul, contrairement à
+  la v1 — d'où le `FileNotFoundError` (Python cherchait littéralement un
+  fichier nommé `gpiochip0` dans le dossier courant). `detect_rp1_gpiochip()`
+  renvoie maintenant directement le chemin complet.
+- Toute l'interaction GPIO de `remote_control.py` a été réécrite avec
+  l'API v2 (confirmée via la documentation officielle de libgpiod et déjà
+  utilisée, elle, dans `motor_control/pwm.py` du même dépôt) :
+  `chip.request_lines(consumer=..., config={offset: gpiod.LineSettings(direction=Direction.OUTPUT)})`
+  à la place de `get_line().request(...)`, et
+  `.set_value(offset, Value.ACTIVE/INACTIVE)` (avec le numéro de ligne et
+  l'énumération `Value`) à la place de `.set_value(0)`/`.set_value(1)`.
+
+Vérifié ici avec une simulation fidèle de l'API v2 (construction du chip
+avec chemin complet, requête des 4 lignes moteur, appels `set_value` sur
+plusieurs cycles PWM) — non testable de bout en bout faute de GPIO/manette
+réels dans cet environnement de développement, à confirmer sur la Pi.
 
 ## Documentation réseau et architecture
 

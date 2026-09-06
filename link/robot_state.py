@@ -16,16 +16,49 @@ commands, validating them, and getting the right ACK/ERR back all work
 end to end, but the robot doesn't physically move yet.
 """
 
+import math
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
 
+from link.nmea import nmea_to_decimal
+
 PWM_MIN, PWM_MAX = -255, 255
 VALID_MODES = ("AUTO", "MANUAL", "IDLE")
 VALID_PID_LOOPS = ("D", "A")
 VALID_CAM_COMMANDS = ("SNAP", "REC_START", "REC_STOP")
+
+# RTE: an ordered list of GPS waypoints the robot chases one at a time (see
+# set_route()/_advance_route_if_arrived() below). A hard cap keeps a
+# malformed or oversized upload (wrong file picked in the browser) from
+# producing a sentence with thousands of fields -- 200 is far more than a
+# manually curated route would ever realistically need.
+ROUTE_MAX_POINTS = 200
+# How close (meters) the live GPS fix must get to the current waypoint
+# before automatically advancing to the next one. Consumer GPS without
+# DGPS correction is typically only accurate to a few meters, so this is
+# deliberately generous rather than tight -- override via the environment
+# if a particular receiver/route needs something stricter or looser.
+ROUTE_ARRIVAL_RADIUS_M = float(os.environ.get("ROUTE_ARRIVAL_RADIUS_M", "5.0"))
+
+
+def _haversine_distance_m(lat1, lon1, lat2, lon2):
+    """Great-circle distance in meters between two decimal-degree points.
+    Written from scratch here rather than reusing gps/gps_delta.py's
+    distance_to_target_meter(), which has a pre-existing bug (references
+    undefined A/B instead of its own parameters, flagged in this repo's
+    README) -- same reasoning as robot-webserver's own independent
+    client-side haversine in /control's status bar."""
+    R = 6371000.0  # Earth radius, meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = (math.sin(d_phi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 
 # CAM,SNAP is handled by calling into camera/stream_server.py's own /snap
 # endpoint over plain HTTP rather than sharing a process with it (same
@@ -61,7 +94,14 @@ class RobotState:
         self.left_pwm = 0
         self.right_pwm = 0
         self.pid_gains = {"D": None, "A": None}  # None until PID sets them
-        self.nav_target = None  # (lat, lat_dir, lon, lon_dir) once NAV is used
+        self.nav_target = None  # (lat, lat_dir, lon, lon_dir) once NAV/RTE is used
+        # RTE: the full ordered waypoint list (empty = no active route) and
+        # the index of the one currently in nav_target. route_index reaches
+        # len(route) once the last waypoint has been reached -- that's the
+        # "route complete" state, distinct from "route index still moving
+        # through the list" (see _advance_route_if_arrived below).
+        self.route = []
+        self.route_index = 0
         self.last_command_at = None
         # Live GPS fix, set by link.gps_reader.GPSReader in the background.
         # None until the first fix arrives -- STA reports the honest 0.0
@@ -79,6 +119,11 @@ class RobotState:
             self.left_pwm = 0
             self.right_pwm = 0
             self.mode = "IDLE"
+            # An emergency stop also cancels any route in progress -- the
+            # whole point of STP is "stop and wait for a person", not
+            # "stop, then quietly resume chasing waypoints on the next fix".
+            self.route = []
+            self.route_index = 0
             self.last_command_at = time.time()
             # TODO: once pwm.py exposes a callable, call it here with
             # (0, 0) instead of/in addition to updating this state.
@@ -116,7 +161,7 @@ class RobotState:
                 self.right_pwm = 0
             self.last_command_at = time.time()
 
-    # -- NAV: set a GPS waypoint -----------------------------------------
+    # -- NAV: set a single GPS waypoint ----------------------------------
     def set_nav_target(self, lat, lat_dir, lon, lon_dir):
         if lat_dir not in ("N", "S") or lon_dir not in ("E", "W"):
             raise CommandError("04", f"BAD_LAT_LON_DIRECTION:{lat_dir}{lon_dir}")
@@ -127,9 +172,61 @@ class RobotState:
             raise CommandError("05", f"BAD_LAT_LON_VALUE:{lat},{lon}")
         with self._lock:
             self.nav_target = (lat, lat_dir, lon, lon_dir)
+            # A manual NAV takes back control from an active route -- without
+            # this, the very next GPS fix's arrival check (see
+            # _advance_route_if_arrived) could silently overwrite the
+            # operator's manual target with whatever the route was pursuing.
+            self.route = []
+            self.route_index = 0
             self.last_command_at = time.time()
             # TODO: hook this into the GPS/PID pipeline (gps/dgps_transfer.py
             # and pid/pid_controller.py) so AUTO mode actually steers here.
+
+    # -- RTE: set an ordered list of GPS waypoints to chase automatically --
+    def set_route(self, fields):
+        """fields = [count, lat1, lat_dir1, lon1, lon_dir1, lat2, ...] --
+        same per-point encoding as NAV, just repeated `count` times.
+        Replaces any previous route and re-arms automatic advancement from
+        the first waypoint. The robot doesn't drive itself yet (same
+        scaffolding caveat as NAV, see module docstring), but nav_target is
+        kept in sync with "the waypoint currently being pursued" so
+        everything already reading it (STA, /control's status bar) shows
+        route progress with no further changes needed on their end."""
+        if not fields:
+            raise CommandError("13", "RTE_NEEDS_COUNT_AND_POINTS")
+        try:
+            count = int(fields[0])
+        except (TypeError, ValueError):
+            raise CommandError("13", f"RTE_BAD_COUNT:{fields[0]}")
+        if count < 1:
+            raise CommandError("13", f"RTE_EMPTY_ROUTE:{count}")
+        if count > ROUTE_MAX_POINTS:
+            raise CommandError("13", f"RTE_TOO_MANY_POINTS:{count}>{ROUTE_MAX_POINTS}")
+
+        point_fields = fields[1:]
+        if len(point_fields) != count * 4:
+            raise CommandError(
+                "13",
+                f"RTE_FIELD_COUNT_MISMATCH:expected_{count * 4}_fields_got_{len(point_fields)}",
+            )
+
+        points = []
+        for i in range(count):
+            lat, lat_dir, lon, lon_dir = point_fields[i * 4:(i + 1) * 4]
+            if lat_dir not in ("N", "S") or lon_dir not in ("E", "W"):
+                raise CommandError("13", f"RTE_BAD_LAT_LON_DIRECTION:point_{i}:{lat_dir}{lon_dir}")
+            try:
+                float(lat)
+                float(lon)
+            except (TypeError, ValueError):
+                raise CommandError("13", f"RTE_BAD_LAT_LON_VALUE:point_{i}:{lat},{lon}")
+            points.append((lat, lat_dir, lon, lon_dir))
+
+        with self._lock:
+            self.route = points
+            self.route_index = 0
+            self.nav_target = points[0]
+            self.last_command_at = time.time()
 
     # -- PID: live gain update --------------------------------------------
     def set_pid_gains(self, loop, kp, ki, kd):
@@ -197,6 +294,37 @@ class RobotState:
             if cap is not None:
                 self.cap = cap
             self.last_fix_at = time.time()
+            self._advance_route_if_arrived()
+
+    def _advance_route_if_arrived(self):
+        """Called with self._lock already held, on every new GPS fix. This
+        is what makes RTE "chase the whole list" rather than just remember
+        it: once the fix is within ROUTE_ARRIVAL_RADIUS_M of the waypoint
+        currently in nav_target, moves on to the next one in self.route --
+        same one-at-a-time semantics as sending a fresh NAV yourself, just
+        automatic. No-op once the route is exhausted (route_index ==
+        len(route)) or if there's no active route at all."""
+        if not self.route or self.route_index >= len(self.route):
+            return
+        if self.current_lat is None or self.current_lon is None:
+            return
+
+        target_lat, target_lat_dir, target_lon, target_lon_dir = self.route[self.route_index]
+        target_lat_decimal = nmea_to_decimal(target_lat, target_lat_dir)
+        target_lon_decimal = nmea_to_decimal(target_lon, target_lon_dir)
+        if target_lat_decimal is None or target_lon_decimal is None:
+            return
+
+        distance_m = _haversine_distance_m(
+            self.current_lat, self.current_lon, target_lat_decimal, target_lon_decimal
+        )
+        if distance_m <= ROUTE_ARRIVAL_RADIUS_M:
+            self.route_index += 1
+            if self.route_index < len(self.route):
+                self.nav_target = self.route[self.route_index]
+            # else: route complete -- nav_target is left on the last
+            # waypoint and route_index stays at len(self.route) as the
+            # "done" marker (see status() below).
 
     # -- STA: status snapshot for telemetry --------------------------------
     def status(self):
@@ -210,4 +338,12 @@ class RobotState:
                 "current_lon": self.current_lon,
                 "cap": self.cap,
                 "speed_kmh": self.speed_kmh,
+                # Not (yet) part of the STA wire sentence -- nav_target
+                # above already reflects route progress for anything
+                # reading it today. Exposed here for tests and for a
+                # future STA extension (extend-only, see
+                # pages/protocole_controle.html) without needing another
+                # change to this method's shape.
+                "route_total": len(self.route),
+                "route_index": self.route_index,
             }

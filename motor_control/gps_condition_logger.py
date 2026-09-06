@@ -5,10 +5,24 @@ remote_control.py (same Remote class, unchanged), and wants to log raw
 NMEA sentences from the GPS receiver only while the two motors' duty
 cycles satisfy some specific condition -- full throttle in a straight
 line (gps_log_on_full_throttle.py), full-speed rotation in place
-(gps_log_on_full_rotation.py), and potentially others later (step
-response on other maneuvers). Rather than duplicating the GPS-reading/
-logging loop in every one of those scripts, it lives once here,
-parameterized by the trigger predicate and the log file to use.
+(gps_log_on_full_rotation.py), or both at once in a single run
+(gps_log_on_full_maneuvers.py). Rather than duplicating the GPS-reading/
+logging loop in every one of those scripts, it lives once here.
+
+MultiConditionGPSLogger is the general case: it reads the GPS serial
+port ONCE and checks every condition against each line, writing each
+condition's matching lines to its own log file. This single-reader
+design matters because a serial port can't reliably be read by two
+independent processes/threads at once -- each would only see an
+unpredictable share of the incoming lines, splitting the NMEA stream
+between them instead of each seeing it whole. So gps_log_on_full_
+maneuvers.py uses MultiConditionGPSLogger with two conditions instead of
+running the two single-condition scripts side by side.
+
+ConditionGPSLogger (single condition, kept for gps_log_on_full_throttle.py
+and gps_log_on_full_rotation.py) is just MultiConditionGPSLogger with a
+list of exactly one condition -- same public interface as before this
+was generalized, no changes needed in either of those two scripts.
 
 Same serial device/baud rate as gps/gps_parse.py and link/gps_reader.py
 (the project's other two NMEA readers), so all stay in sync should the
@@ -35,26 +49,31 @@ def _timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
-class ConditionGPSLogger:
+class MultiConditionGPSLogger:
     """Watches a Remote instance's motor duty cycles (dutyCycleLeft/
-    dutyCycleRight, guarded by Remote's own `verrou` lock) and appends
-    every raw NMEA line read from the GPS receiver to `log_path`, for as
-    long as `trigger(left, right)` returns True. Runs in its own
+    dutyCycleRight, guarded by Remote's own `verrou` lock) against
+    several independent conditions at once, off a SINGLE shared GPS
+    serial connection, and appends every raw NMEA line to whichever
+    condition(s) are currently true -- each to its own log file.
+
+    `conditions` is a list of (trigger, log_path, trigger_name) tuples:
+    - trigger(left, right) -> bool: pure predicate, no hardware involved
+      (e.g. is_full_throttle, is_full_rotation).
+    - log_path: file that condition's matching lines are appended to.
+    - trigger_name: used only for that condition's START/END marker
+      lines, so each log stays self-describing even if several are
+      later grepped together.
+
+    Every condition is evaluated independently on every line -- one can
+    be active while another isn't, and each gets its own marker
+    transitions regardless of what the others are doing. Runs in its own
     background thread, entirely independent from Remote's own
     pwm()/fonction1() threads -- it only ever *reads* the duty cycles,
-    never writes them.
+    never writes them."""
 
-    `trigger_name` is used only for the START/END marker lines written
-    to the log whenever `trigger` flips, so each maneuver's log stays
-    self-describing (e.g. "FULL_THROTTLE_START"/"FULL_ROTATION_START")
-    even if several logs are later grepped together."""
-
-    def __init__(self, remote, trigger, log_path, trigger_name="TRIGGER",
-                 device=GPS_DEVICE, baudrate=GPS_BAUDRATE):
+    def __init__(self, remote, conditions, device=GPS_DEVICE, baudrate=GPS_BAUDRATE):
         self.remote = remote
-        self.trigger = trigger
-        self.log_path = log_path
-        self.trigger_name = trigger_name
+        self.conditions = list(conditions)
         self.device = device
         self.baudrate = baudrate
         self._running = False
@@ -72,6 +91,30 @@ class ConditionGPSLogger:
     def stop(self):
         self._running = False
 
+    def _writes_for_line(self, line, left, right, was_triggered):
+        """Pure step of the dispatch loop, no I/O of its own: given one
+        already-read+stripped NMEA line, the current motor duty cycles,
+        and the previous per-condition triggered state (a list, updated
+        in place), returns the list of (condition_index, text) pairs to
+        append to that condition's log file. Kept separate from the
+        actual file/serial I/O in _loop() so it can be unit-tested
+        without mocking a serial port or real files."""
+        writes = []
+        for i, (trigger, _log_path, trigger_name) in enumerate(self.conditions):
+            triggered = trigger(left, right)
+
+            if triggered != was_triggered[i]:
+                # Log the transition itself too, so the file clearly
+                # shows when each triggered period starts/stops, not
+                # just an undifferentiated block of NMEA lines.
+                marker = f"{trigger_name}_START" if triggered else f"{trigger_name}_END"
+                writes.append((i, f"{_timestamp()} # {marker}\n"))
+            was_triggered[i] = triggered
+
+            if triggered and line:
+                writes.append((i, f"{_timestamp()} {line}\n"))
+        return writes
+
     def _loop(self):
         if not _SERIAL_AVAILABLE:
             print("pyserial not installed -- GPS logging disabled. "
@@ -84,11 +127,15 @@ class ConditionGPSLogger:
             print(f"GPS device {self.device} unavailable ({exc}) -- GPS logging disabled.")
             return
 
-        print(f"GPS logger ready on {self.device} @ {self.baudrate} baud -- "
-              f"logging to {self.log_path} whenever {self.trigger_name} is true.")
+        names = ", ".join(trigger_name for _, _, trigger_name in self.conditions)
+        print(f"GPS logger ready on {self.device} @ {self.baudrate} baud -- watching: {names}.")
 
-        was_triggered = False
-        with open(self.log_path, "a", encoding="ascii", errors="replace") as log_file:
+        was_triggered = [False] * len(self.conditions)
+        log_files = [
+            open(log_path, "a", encoding="ascii", errors="replace")
+            for _, log_path, _ in self.conditions
+        ]
+        try:
             while self._running:
                 try:
                     raw = ser.readline()
@@ -99,17 +146,25 @@ class ConditionGPSLogger:
                     continue
 
                 left, right = self._read_duty_cycles()
-                triggered = self.trigger(left, right)
+                for i, text in self._writes_for_line(line, left, right, was_triggered):
+                    log_files[i].write(text)
+                    log_files[i].flush()
+        finally:
+            for f in log_files:
+                f.close()
 
-                if triggered != was_triggered:
-                    # Log the transition itself too, so the file clearly
-                    # shows when each triggered period starts/stops, not
-                    # just an undifferentiated block of NMEA lines.
-                    marker = f"{self.trigger_name}_START" if triggered else f"{self.trigger_name}_END"
-                    log_file.write(f"{_timestamp()} # {marker}\n")
-                    log_file.flush()
-                was_triggered = triggered
 
-                if triggered and line:
-                    log_file.write(f"{_timestamp()} {line}\n")
-                    log_file.flush()
+class ConditionGPSLogger(MultiConditionGPSLogger):
+    """Single-condition convenience wrapper around
+    MultiConditionGPSLogger, for scripts that only ever watch one
+    maneuver (gps_log_on_full_throttle.py, gps_log_on_full_rotation.py).
+    Same public interface (`trigger`/`log_path`/`trigger_name` attributes,
+    `start()`/`stop()`) as before this class was generalized -- neither
+    of those two scripts needed to change."""
+
+    def __init__(self, remote, trigger, log_path, trigger_name="TRIGGER",
+                 device=GPS_DEVICE, baudrate=GPS_BAUDRATE):
+        super().__init__(remote, [(trigger, log_path, trigger_name)], device=device, baudrate=baudrate)
+        self.trigger = trigger
+        self.log_path = log_path
+        self.trigger_name = trigger_name
