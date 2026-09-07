@@ -39,3 +39,30 @@ def test_integral_accumulates_over_successive_calls():
     second_output = pid.update(measured_value=0.0)
     # With constant positive error and ki>0, the integral term keeps growing.
     assert second_output > 0.0
+
+
+# --- reset() (added 2026-09-07 for link/autopilot.py) -----------------------
+
+def test_reset_clears_integral_and_previous_error():
+    pid = PIDController(setpoint=1.0, kp=0.0, ki=1.0, kd=1.0)
+    pid.update(measured_value=0.0)
+    time.sleep(0.01)
+    pid.update(measured_value=0.0)  # integral and previous_error now nonzero/set
+    assert pid.integral != 0
+    assert pid.previous_error is not None
+
+    pid.reset()
+    assert pid.integral == 0
+    assert pid.previous_error is None
+
+
+def test_reset_avoids_a_derivative_kick_on_the_next_update():
+    # Same reasoning as the existing "no derivative kick on first call"
+    # behavior (previous_error starts as None, not 0) -- reset() should
+    # put the controller back in that exact state, not just zero the
+    # integral.
+    pid = PIDController(setpoint=0.0, kp=0.0, ki=0.0, kd=10.0)
+    pid.update(measured_value=100.0)  # large first error, no kick (previous_error was None)
+    pid.reset()
+    output = pid.update(measured_value=-100.0)  # large jump right after reset
+    assert output == 0.0  # derivative term must not fire off a stale previous_error

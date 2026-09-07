@@ -26,28 +26,24 @@ position barely moves during a pure pivot (the robot spins near a fixed
 point) -- it's the GPS *course/heading* field that is the interesting
 signal here, not position, unlike gps_log_on_full_throttle.py.
 
-Honesty note (same caveat as link/gps_reader.py): pyserial, evdev, pygame
-and gpiod (Remote's own dependencies) could not be installed in the
-sandbox this was written in (no PyPI access there), so the serial-reading
-loop (in gps_condition_logger.py) and the Remote integration below were
+Honesty note (same caveat as link/gps_reader.py): pyserial, evdev and
+gpiod (Remote's own dependencies) could not be installed in the sandbox
+this was written in (no PyPI access there), so the serial-reading loop
+(in gps_condition_logger.py) and the Remote integration below were
 written carefully against their documented APIs but have NOT been run
-against real hardware. Both imports are wrapped in try/except (same
-pattern as link/gps_reader.py) precisely so this module can still be
-*imported* -- and its one piece of pure logic, is_full_rotation(),
-actually unit-tested -- on a machine without that hardware/those
-libraries. Run this for real on the Pi, with a gamepad and GPS receiver
-connected, before relying on it.
+against real hardware. motor_control.remote_control.Remote guards its own
+hardware imports internally (so importing it here always succeeds, even
+without evdev/gpiod) -- REMOTE_HARDWARE_AVAILABLE (checked in main()
+below) is the accurate signal for whether it can actually do anything,
+letting this module still be *imported* -- and its one piece of pure
+logic, is_full_rotation(), actually unit-tested -- on a machine without
+that hardware/those libraries. Run this for real on the Pi, with a
+gamepad and GPS receiver connected, before relying on it.
 """
 import os
 
 from motor_control.gps_condition_logger import ConditionGPSLogger
-
-try:
-    from motor_control.remote_control import Remote
-    _REMOTE_AVAILABLE = True
-except ImportError:  # pragma: no cover -- evdev/pygame/gpiod missing.
-    Remote = None
-    _REMOTE_AVAILABLE = False
+from motor_control.remote_control import REMOTE_HARDWARE_AVAILABLE, Remote
 
 # Both motors must be at exactly this magnitude -- not just close to it
 # -- and in opposite directions, to count as "full-speed rotation". 255
@@ -73,9 +69,9 @@ def is_full_rotation(left, right, speed=FULL_SPEED):
 
 
 def main():
-    if not _REMOTE_AVAILABLE:
+    if not REMOTE_HARDWARE_AVAILABLE:
         raise SystemExit(
-            "evdev/pygame/gpiod not installed -- this script needs the same "
+            "evdev/gpiod not installed -- this script needs the same "
             "gamepad/GPIO dependencies as motor_control/remote_control.py. "
             "Run `pip install -r requirements.txt` on the robot (Pi #1)."
         )

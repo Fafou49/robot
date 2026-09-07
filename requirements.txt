@@ -1,11 +1,11 @@
-evdev
+evdev  # gamepad reading -- link/gamepad_handler.py (shared by link/server.py and motor_control/remote_control.py)
 numpy
-pygame
-gpiod>=2  # v2 API required -- motor_control/remote_control.py and pwm.py both use it (chip.request_lines(), Value/Direction enums), v1's chip.get_line()/type=LINE_REQ_DIR_OUT no longer exists
+pygame  # no longer imported by anything in this repo since the 2026-09-07 gamepad refactor (link/gamepad_handler.py uses evdev instead) -- left in case future code wants it
+gpiod>=2  # v2 API required -- motor_control/motor_driver.py uses it (chip.request_lines(), Value/Direction enums), v1's chip.get_line()/type=LINE_REQ_DIR_OUT no longer exists
 geopy
 pynmea2
 pyserial
-keyboard
+keyboard  # no longer imported by anything in this repo (was only ever an unused import in the old motor_control/pwm.py, now archived)
 pygnssutils
 matplotlib
 scipy

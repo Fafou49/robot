@@ -2,27 +2,46 @@
 plumbing (link.server) so they can be unit-tested without opening a real
 TCP connection.
 
-IMPORTANT -- current scope: this updates an in-memory state and validates
-inputs (ranges, allowed values), but does NOT yet drive real hardware.
-motor_control/pwm.py today is a blocking script that opens the GPIO chip
-and loops reading stdin -- it isn't an importable function, and there is
-no safe way to call it from here without either refactoring it into a
-function the way pid_controller.py already is, or having this server take
-over stdin/GPIO ownership from the existing dgps_transfer.py | pid_controller.py
-| pwm.py pipeline. Both are real design decisions -- see the "STP"/"DRV"
-handlers below for the exact spot to wire in real motor control once
-that's decided. Until then, this is honest, testable scaffolding: sending
-commands, validating them, and getting the right ACK/ERR back all work
-end to end, but the robot doesn't physically move yet.
+UPDATE (2026-09-07, part 1) -- STP/DRV/MOD now really drive the motors:
+RobotState can be constructed with a `motor_driver` (a motor_control.
+motor_driver.MotorDriver -- see link/server.py, which wires one in), and
+drive()/stop()/set_mode() call into it whenever left_pwm/right_pwm
+actually change. This resolves the design decision this docstring used
+to flag as open (whether to refactor motor_control/pwm.py into a
+callable, or have this server take over the existing dgps_transfer.py |
+pid_controller.py | pwm.py pipeline -- the former is what happened:
+pwm.py's logic now lives in motor_control/motor_driver.py, an
+importable, reusable class).
+
+UPDATE (2026-09-07, part 2) -- AUTO mode now really drives too: RobotState
+also owns a `link.autopilot.Autopilot` (see that module for the full
+heading/distance-to-PWM math and its honesty notes on untested gains and
+the no-compass limitation). update_gps_fix() -- called on every new GPS
+fix by link/gps_reader.py's GPSReader -- runs one autopilot tick whenever
+mode == "AUTO" and there's a target (nav_target, set by NAV or RTE):
+computes distance + heading error to that target, feeds them through the
+autopilot, and drives the motors with the result, exactly like an
+operator sending DRV would. The gamepad's BTN_A (link/gamepad_handler.py)
+arms this by calling set_mode("AUTO"); BTN_B calls stop() (full stop,
+same as STP) rather than just handing back to MANUAL, and touching the
+joystick always overrides back to MANUAL immediately (see
+link.gamepad_handler.robot_state_drive_handler) -- a physical operator
+can always take back control mid-route.
+
+`motor_driver` and `autopilot` are both optional constructor params
+(motor_driver defaults to None, autopilot defaults to a fresh
+link.autopilot.Autopilot() -- cheap, pure Python, no hardware) so every
+existing test that constructs a bare RobotState() keeps working exactly
+as before.
 """
 
-import math
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
 
+from link.autopilot import Autopilot, bearing_deg, haversine_distance_m, heading_error_for_pid
 from link.nmea import nmea_to_decimal
 
 PWM_MIN, PWM_MAX = -255, 255
@@ -42,22 +61,6 @@ ROUTE_MAX_POINTS = 200
 # deliberately generous rather than tight -- override via the environment
 # if a particular receiver/route needs something stricter or looser.
 ROUTE_ARRIVAL_RADIUS_M = float(os.environ.get("ROUTE_ARRIVAL_RADIUS_M", "5.0"))
-
-
-def _haversine_distance_m(lat1, lon1, lat2, lon2):
-    """Great-circle distance in meters between two decimal-degree points.
-    Written from scratch here rather than reusing gps/gps_delta.py's
-    distance_to_target_meter(), which has a pre-existing bug (references
-    undefined A/B instead of its own parameters, flagged in this repo's
-    README) -- same reasoning as robot-webserver's own independent
-    client-side haversine in /control's status bar."""
-    R = 6371000.0  # Earth radius, meters
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
-    a = (math.sin(d_phi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 # CAM,SNAP is handled by calling into camera/stream_server.py's own /snap
@@ -88,8 +91,19 @@ class RobotState:
     single lock since the TCP server is multi-threaded (one thread per
     connection)."""
 
-    def __init__(self):
+    def __init__(self, motor_driver=None, autopilot=None):
         self._lock = threading.Lock()
+        # Optional motor_control.motor_driver.MotorDriver -- see drive()/
+        # stop()/set_mode() below. None (the default) keeps this class
+        # fully hardware-free, which is what every pure-logic test in
+        # tests/test_link_server.py relies on; link/server.py's
+        # ControlServer is the one place that actually passes one in.
+        self.motor_driver = motor_driver
+        # link.autopilot.Autopilot -- pure Python, no hardware/IO, so
+        # (unlike motor_driver) there's no reason not to default to a
+        # real one; tests that want to inspect/replace it can still pass
+        # their own. See update_gps_fix()/_autonomous_pwm_locked() below.
+        self.autopilot = autopilot if autopilot is not None else Autopilot()
         self.mode = "IDLE"
         self.left_pwm = 0
         self.right_pwm = 0
@@ -125,8 +139,8 @@ class RobotState:
             self.route = []
             self.route_index = 0
             self.last_command_at = time.time()
-            # TODO: once pwm.py exposes a callable, call it here with
-            # (0, 0) instead of/in addition to updating this state.
+        if self.motor_driver is not None:
+            self.motor_driver.drive(0, 0)
 
     # -- DRV: direct manual drive ---------------------------------------
     def drive(self, left_pwm, right_pwm):
@@ -135,8 +149,8 @@ class RobotState:
             self.left_pwm = left_pwm
             self.right_pwm = right_pwm
             self.last_command_at = time.time()
-            # TODO: call into motor_control once it exposes a function
-            # instead of being a blocking stdin-reading script.
+        if self.motor_driver is not None:
+            self.motor_driver.drive(left_pwm, right_pwm)
         return left_pwm, right_pwm
 
     @staticmethod
@@ -156,10 +170,27 @@ class RobotState:
             raise CommandError("03", f"UNKNOWN_MODE:{mode}")
         with self._lock:
             self.mode = mode
-            if mode != "MANUAL":
+            zero_pwm = mode != "MANUAL"
+            if zero_pwm:
                 self.left_pwm = 0
                 self.right_pwm = 0
+            if mode == "AUTO":
+                # Fresh PID state every time AUTO is (re-)armed -- e.g.
+                # the gamepad's BTN_A, see link/gamepad_handler.py's
+                # robot_state_button_handler() -- so a stale integral/
+                # derivative from a previous, unrelated driving session
+                # doesn't produce a derivative-kick-style jolt on the
+                # first tick of this one.
+                self.autopilot.reset()
             self.last_command_at = time.time()
+        # Leaving MANUAL always stops the motors first -- driving only
+        # resumes once update_gps_fix()'s autonomous tick has a fresh GPS
+        # fix to compute a real correction from (typically within one GPS
+        # update period), so there's a brief, deliberate pause rather
+        # than the motors keeping whatever duty cycle they had a moment
+        # ago.
+        if zero_pwm and self.motor_driver is not None:
+            self.motor_driver.drive(0, 0)
 
     # -- NAV: set a single GPS waypoint ----------------------------------
     def set_nav_target(self, lat, lat_dir, lon, lon_dir):
@@ -239,9 +270,14 @@ class RobotState:
             raise CommandError("07", f"BAD_PID_VALUE:{kp},{ki},{kd}")
         with self._lock:
             self.pid_gains[loop] = (kp, ki, kd)
+            # Applied to the live loop link/autopilot.py's Autopilot runs
+            # during AUTO-mode driving (see update_gps_fix()) -- this used
+            # to be a TODO ("once this server shares a process with the
+            # control pipeline"), which is exactly what happened
+            # 2026-09-07: PID (D=distance, A=angle) now tunes AUTO mode
+            # live, from the console or the web UI, while it's driving.
+            self.autopilot.set_gains(loop, kp, ki, kd)
             self.last_command_at = time.time()
-            # TODO: apply to the live pid.PIDController instances once this
-            # server shares a process with the control pipeline.
 
     # -- CAM: snapshot / recording ----------------------------------------
     def camera_command(self, action):
@@ -286,6 +322,7 @@ class RobotState:
     # -- GPS: live fix from link.gps_reader.GPSReader, if a receiver is
     #    attached -------------------------------------------------------
     def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None):
+        motor_output = None
         with self._lock:
             self.current_lat = lat
             self.current_lon = lon
@@ -295,6 +332,16 @@ class RobotState:
                 self.cap = cap
             self.last_fix_at = time.time()
             self._advance_route_if_arrived()
+            if self.mode == "AUTO":
+                motor_output = self._autonomous_pwm_locked()
+                if motor_output is not None:
+                    self.left_pwm, self.right_pwm = motor_output
+        # motor_driver.drive() is called outside the lock, same pattern
+        # as drive()/stop()/set_mode() above -- this class's own lock
+        # never needs to be held while calling into MotorDriver (which
+        # takes its own, separate lock).
+        if motor_output is not None and self.motor_driver is not None:
+            self.motor_driver.drive(*motor_output)
 
     def _advance_route_if_arrived(self):
         """Called with self._lock already held, on every new GPS fix. This
@@ -315,16 +362,54 @@ class RobotState:
         if target_lat_decimal is None or target_lon_decimal is None:
             return
 
-        distance_m = _haversine_distance_m(
+        distance_m = haversine_distance_m(
             self.current_lat, self.current_lon, target_lat_decimal, target_lon_decimal
         )
         if distance_m <= ROUTE_ARRIVAL_RADIUS_M:
             self.route_index += 1
+            # New leg (or route just completed): start the PID loops
+            # fresh so a stale integral/derivative from the leg that
+            # just ended doesn't produce a jolt on the first tick of the
+            # next one (or linger pointlessly once the route is done).
+            self.autopilot.reset()
             if self.route_index < len(self.route):
                 self.nav_target = self.route[self.route_index]
             # else: route complete -- nav_target is left on the last
             # waypoint and route_index stays at len(self.route) as the
             # "done" marker (see status() below).
+
+    def _autonomous_pwm_locked(self):
+        """Called with self._lock already held, only while mode == "AUTO".
+        Returns (left_pwm, right_pwm) computed by self.autopilot from the
+        live distance/heading to self.nav_target, or None if there's
+        nothing to compute yet (no GPS fix, or no target at all -- AUTO
+        armed with neither NAV nor RTE ever having been sent). Arrival at
+        a lone NAV target (no route to advance into, see
+        _advance_route_if_arrived above) is handled here rather than
+        there, since a single NAV target has no "next waypoint" to
+        advance to -- once within ROUTE_ARRIVAL_RADIUS_M with nothing
+        left to chase, this holds position (0, 0) instead of letting the
+        PID loops hunt around a target they've already reached."""
+        if self.current_lat is None or self.current_lon is None or self.nav_target is None:
+            return None
+
+        target_lat, target_lat_dir, target_lon, target_lon_dir = self.nav_target
+        target_lat_decimal = nmea_to_decimal(target_lat, target_lat_dir)
+        target_lon_decimal = nmea_to_decimal(target_lon, target_lon_dir)
+        if target_lat_decimal is None or target_lon_decimal is None:
+            return None
+
+        distance_m = haversine_distance_m(
+            self.current_lat, self.current_lon, target_lat_decimal, target_lon_decimal
+        )
+        route_exhausted = not self.route or self.route_index >= len(self.route)
+        if distance_m <= ROUTE_ARRIVAL_RADIUS_M and route_exhausted:
+            self.autopilot.reset()
+            return (0, 0)
+
+        bearing = bearing_deg(self.current_lat, self.current_lon, target_lat_decimal, target_lon_decimal)
+        heading_error = heading_error_for_pid(self.cap, bearing)
+        return self.autopilot.compute(distance_m, heading_error)
 
     # -- STA: status snapshot for telemetry --------------------------------
     def status(self):

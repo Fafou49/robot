@@ -14,9 +14,11 @@ import logging
 import os
 import socketserver
 
+from link.gamepad_handler import GamepadReader, robot_state_button_handler, robot_state_drive_handler
 from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
 from link.nmea import SentenceError, build_sentence, decimal_to_nmea, parse_sentence
 from link.robot_state import CommandError, RobotState
+from motor_control.motor_driver import MotorDriver
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("link.server")
@@ -36,6 +38,13 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
     if sentence_type == "DRV":
         if len(fields) != 2:
             raise CommandError("10", "DRV_NEEDS_2_FIELDS")
+        # A manual DRV always asserts direct control -- same "manual
+        # override always wins" convention NAV/STP already use for the
+        # route (see link/robot_state.py). Set BEFORE drive() so an
+        # autonomous tick racing on another thread (link.gps_reader's
+        # background thread, see RobotState.update_gps_fix) can't slot in
+        # between the mode switch and the requested pwm actually landing.
+        state.set_mode("MANUAL")
         state.drive(*fields)
         return build_sentence("ACK", "DRV")
 
@@ -147,9 +156,21 @@ class ControlServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, host, port, state: RobotState = None, start_gps: bool = True):
+    def __init__(self, host, port, state: RobotState = None, start_gps: bool = True,
+                 start_motor: bool = True, start_gamepad: bool = True):
         super().__init__((host, port), ControlHandler)
-        self.state = state or RobotState()
+
+        # MotorDriver is always constructed (cheap -- no hardware is
+        # touched until .start()) so it can be wired into RobotState right
+        # away; whether it actually opens the GPIO chip is controlled by
+        # start_motor/MOTOR_ENABLED below. If an existing `state` is
+        # passed in (not done anywhere in this repo today, but the
+        # parameter has always allowed it) it's used as-is and this
+        # MotorDriver is simply never linked to it -- same "caller owns
+        # what they passed in" behavior as before this change.
+        self.motor_driver = MotorDriver()
+        self.state = state or RobotState(motor_driver=self.motor_driver)
+
         self.gps_reader = None
         if start_gps:
             # GPS_ENABLED=false disables this entirely -- useful if
@@ -162,6 +183,33 @@ class ControlServer(socketserver.ThreadingTCPServer):
                     baudrate=int(os.environ.get("GPS_BAUDRATE", DEFAULT_BAUDRATE)),
                 )
                 self.gps_reader.start()
+
+        if start_motor:
+            # MOTOR_ENABLED=false skips opening the GPIO chip entirely --
+            # useful on a dev machine, or if some other process
+            # (motor_control/remote_control.py, run standalone) already
+            # owns the motor lines. drive()/stop()/set_mode() stay safe
+            # to call either way (see RobotState's motor_driver docs);
+            # they just have no physical effect when this is off.
+            if os.environ.get("MOTOR_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.motor_driver.start()
+
+        # The gamepad is a second input source feeding the SAME
+        # RobotState as the TCP commands above (see link/gamepad_handler.
+        # py's module docstring) -- a physical operator's joystick/button
+        # presses and the website's STP/DRV/MOD/NAV/RTE commands are
+        # peers, both just calling RobotState methods.
+        self.gamepad_reader = None
+        if start_gamepad:
+            # GAMEPAD_ENABLED=false disables this entirely -- useful on a
+            # dev machine with no controller plugged in (though this
+            # degrades gracefully even when left on, see GamepadReader).
+            if os.environ.get("GAMEPAD_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.gamepad_reader = GamepadReader(
+                    on_drive=robot_state_drive_handler(self.state),
+                    on_button=robot_state_button_handler(self.state),
+                )
+                self.gamepad_reader.start()
 
 
 def main():

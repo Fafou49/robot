@@ -37,31 +37,29 @@ two single-maneuver scripts are kept as-is (unchanged) for recording
 just one maneuver in isolation, if that's ever preferred over this one.
 
 Honesty note (same caveat as the rest of this project's hardware-facing
-code): pyserial, evdev, pygame and gpiod could not be installed in the
-sandbox this was written in (no PyPI access there), so the serial-reading
-loop (in gps_condition_logger.py) and the Remote integration below were
+code): pyserial, evdev and gpiod could not be installed in the sandbox
+this was written in (no PyPI access there), so the serial-reading loop
+(in gps_condition_logger.py) and the Remote integration below were
 written carefully against their documented APIs but have NOT been run
-against real hardware. Run this for real on the Pi, with a gamepad and
-GPS receiver connected, before relying on it.
+against real hardware. motor_control.remote_control.Remote guards its own
+hardware imports internally (so importing it here always succeeds, even
+without evdev/gpiod) -- REMOTE_HARDWARE_AVAILABLE (checked in main()
+below) is the accurate signal for whether it can actually do anything.
+Run this for real on the Pi, with a gamepad and GPS receiver connected,
+before relying on it.
 """
 from motor_control.gps_condition_logger import MultiConditionGPSLogger
 from motor_control.gps_log_on_full_rotation import is_full_rotation
 from motor_control.gps_log_on_full_rotation import LOG_PATH as ROTATION_LOG_PATH
 from motor_control.gps_log_on_full_throttle import is_full_throttle
 from motor_control.gps_log_on_full_throttle import LOG_PATH as THROTTLE_LOG_PATH
-
-try:
-    from motor_control.remote_control import Remote
-    _REMOTE_AVAILABLE = True
-except ImportError:  # pragma: no cover -- evdev/pygame/gpiod missing.
-    Remote = None
-    _REMOTE_AVAILABLE = False
+from motor_control.remote_control import REMOTE_HARDWARE_AVAILABLE, Remote
 
 
 def main():
-    if not _REMOTE_AVAILABLE:
+    if not REMOTE_HARDWARE_AVAILABLE:
         raise SystemExit(
-            "evdev/pygame/gpiod not installed -- this script needs the same "
+            "evdev/gpiod not installed -- this script needs the same "
             "gamepad/GPIO dependencies as motor_control/remote_control.py. "
             "Run `pip install -r requirements.txt` on the robot (Pi #1)."
         )

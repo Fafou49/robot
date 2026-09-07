@@ -11,8 +11,9 @@ vit dans un dépôt séparé.
 ```
 .
 ├── motor_control/      # Pilotage moteurs (GPIO/PWM) et entrée manette
-│   ├── pwm.py
-│   ├── remote_control.py
+│   ├── gpiochip.py             # Détection du gpiochip RP1 (partagée par motor_driver.py)
+│   ├── motor_driver.py         # PWM logiciel + GPIO -- unique propriétaire des moteurs (voir plus bas)
+│   ├── remote_control.py       # Pilotage manuel autonome (manette -> moteurs), utilisé par les 3 scripts ci-dessous
 │   ├── gps_condition_logger.py       # Moteur commun aux 3 scripts ci-dessous (logique de journalisation GPS conditionnelle)
 │   ├── gps_log_on_full_throttle.py   # Variante de remote_control.py : journalise le GPS en ligne droite a fond (reponse a l'echelon, translation)
 │   ├── gps_log_on_full_rotation.py   # Variante de remote_control.py : journalise le GPS en rotation sur place a fond (reponse a l'echelon, rotation)
@@ -29,13 +30,15 @@ vit dans un dépôt séparé.
 │   └── gps_delta.py
 ├── link/               # Serveur TCP recevant les commandes du site web (voir plus bas)
 │   ├── nmea.py         # Construction/analyse des trames + checksum
-│   ├── robot_state.py  # Validation et état (PWM, mode, cible GPS, gains PID, appelle camera/ en HTTP pour CAM,SNAP)
+│   ├── robot_state.py  # Validation et état (PWM, mode, cible GPS, gains PID, appelle camera/ en HTTP pour CAM,SNAP, pilote motor_control/motor_driver.py et link/autopilot.py)
+│   ├── autopilot.py    # Maths pures de navigation (distance, cap) + PID -> PWM pour le mode AUTO (voir plus bas)
 │   ├── gps_reader.py   # Lecture GPS en tâche de fond (voir plus bas)
-│   └── server.py        # Serveur TCP (socketserver), aucune dépendance externe
+│   ├── gamepad_handler.py # Lecture manette (evdev), tâche de fond -- alimente le même RobotState que le TCP (voir plus bas)
+│   └── server.py        # Serveur TCP (socketserver), démarre aussi motor_driver + gamepad_handler
 ├── camera/             # Flux caméra en direct + snapshots (voir plus bas) -- processus séparé de link/, relié par HTTP local
 │   ├── stream_server.py
 │   └── snapshots.py    # Stockage des snapshots, jamais plus de 5 fichiers
-├── archive/            # Anciennes versions gardées pour référence (voir plus bas)
+├── archive/            # Anciennes versions gardées pour référence (voir plus bas), dont pwm_2026.py (ancien motor_control/pwm.py, remplacé par motor_control/motor_driver.py)
 ├── tests/              # Tests automatisés (pytest)
 ├── run_robot.sh        # Lance link/server.py + camera/stream_server.py ensemble, arrêt propre des deux au Ctrl+C (voir plus bas)
 ├── requirements.txt
@@ -106,38 +109,44 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
 
 État actuel de l'implémentation :
 
-- `STP` (arrêt d'urgence) et `DRV` (pilotage direct) valident les entrées et
-  mettent à jour un état en mémoire (`link/robot_state.py`), avec la bonne
-  réponse `ACK`/`ERR` — mais ne pilotent pas encore les moteurs réels.
-  `motor_control/pwm.py` est aujourd'hui un script bloquant qui ouvre le GPIO
-  dès son import et boucle sur `stdin` : ce n'est pas une fonction qu'on peut
-  appeler depuis `link/`. Le brancher pour de vrai demande soit de le
-  refactoriser en fonction (comme `pid_controller.py` l'a déjà été), soit de
-  faire cohabiter ce serveur avec le pipeline existant
-  (`dgps_transfer.py | pid_controller.py | pwm.py`) — à décider avant de
-  continuer sur ce point precis.
-- `MOD` et `NAV` et `PID` enregistrent la valeur reçue et répondent `ACK`,
-  sans encore agir dessus (pas de lien avec le pipeline GPS/PID pour
-  l'instant). Une `NAV` annule une éventuelle route `RTE` en cours (voir
+- `STP` (arrêt d'urgence) et `DRV` (pilotage direct) valident les entrées,
+  mettent à jour un état en mémoire (`link/robot_state.py`) et pilotent
+  pour de vrai les moteurs depuis le 2026-09-07, via
+  `motor_control/motor_driver.py` (voir la section dédiée plus bas) —
+  c'était le point explicitement laissé "à décider" dans une version
+  précédente de ce README (refactoriser `pwm.py` en fonction appelable,
+  ou faire cohabiter ce serveur avec l'ancien pipeline
+  `dgps_transfer.py | pid_controller.py | pwm.py`) : c'est la première
+  option qui a été retenue. L'ancien `motor_control/pwm.py` (script
+  bloquant, GPIO ouvert dès l'import, boucle sur `stdin`) est archivé
+  dans `archive/pwm_2026.py`.
+- `MOD` (changement de mode -- `IDLE`/`MANUAL`/`AUTO`) a un effet réel
+  immédiat sur les moteurs (voir plus bas) ; `PID` (gains `D`=distance ou
+  `A`=angle) règle en direct les deux boucles PID que `link/autopilot.py`
+  fait tourner pendant le pilotage `AUTO` -- utile pour ajuster les gains
+  depuis la console pendant un test, sans redémarrer le serveur. `NAV`
+  enregistre la cible et annule une éventuelle route `RTE` en cours (voir
   ci-dessous) — l'opérateur reprend la main.
 - `RTE` (nouvelle trame, un champ `count` suivi de `count` points
   lat/lat_dir/lon/lon_dir, même format que `NAV`) enregistre une liste de
   points de passage ordonnée dans `link/robot_state.py`
   (`RobotState.route`/`route_index`) et arme le premier comme cible
   (`nav_target`). À chaque nouvelle position GPS (`update_gps_fix`), si la
-  distance (haversine, calculée dans `link/robot_state.py` — volontairement
-  pas de réutilisation de `gps/gps_delta.py`, dont
+  distance (haversine, `link/autopilot.py` — volontairement pas de
+  réutilisation de `gps/gps_delta.py`, dont
   `distance_to_target_meter`/`angle_to_target_radius` référencent des
   variables non définies) entre la position courante et le point visé passe
   sous `ROUTE_ARRIVAL_RADIUS_M` (5 m par défaut, `float` réglable par
   variable d'environnement), la cible avance automatiquement au point
   suivant, jusqu'au dernier. `STP` et `NAV` annulent une route en cours.
-  Comme pour `NAV`, rien ne pilote encore les moteurs pour suivre
-  effectivement la route : seule `nav_target` (et donc le champ `target_*`
-  de `STA`) avance réellement. Limite : 200 points par route
-  (`ROUTE_MAX_POINTS`). Voir `pages/protocole_controle.html` (dépôt
-  `robot-webserver`) pour le format exact de la trame et le bouton
-  "GPS route" de `/control` qui la génère depuis un fichier texte.
+  Depuis le 2026-09-07, en mode `AUTO`, le robot pilote vraiment vers
+  `nav_target` à chaque fix GPS (voir la section "Pilotage moteur et
+  manette" plus bas pour le détail et les limites) -- avant cette date,
+  seul `nav_target`/le champ `target_*` de `STA` avançait, sans que les
+  moteurs suivent. Limite : 200 points par route (`ROUTE_MAX_POINTS`).
+  Voir `pages/protocole_controle.html` (dépôt `robot-webserver`) pour le
+  format exact de la trame et le bouton "GPS route" de `/control` qui la
+  génère depuis un fichier texte.
 - `CAM,SNAP` appelle pour de vrai la route `GET /snap` de
   `camera/stream_server.py` (processus séparé, en HTTP local — voir section
   dédiée ci-dessous) et répond `ACK`/`ERR` selon que ça réussit ou non
@@ -154,6 +163,95 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
   aujourd'hui. `batterie` reste à 0 (aucun capteur de batterie dans le
   projet). Tout ça alimente le bandeau de statut et l'onglet "TCP" de
   `/control` sur le site web.
+
+## Pilotage moteur et manette (`motor_control/motor_driver.py`, `link/gamepad_handler.py`)
+
+Depuis le 2026-09-07, `link/server.py` démarre trois tâches de fond en plus
+du serveur TCP lui-même, toutes alimentant/lisant le même `RobotState` (voir
+schéma ci-dessous) :
+
+- `motor_control/motor_driver.py` (`MotorDriver`) : unique propriétaire de
+  la puce GPIO et du PWM logiciel des deux moteurs. Refactor de l'ancien
+  `motor_control/pwm.py` (archivé, voir `archive/pwm_2026.py`) en classe
+  réellement importable/réutilisable — c'était le point que ce README
+  laissait explicitement "à décider" avant le 2026-09-07. `drive(left,
+  right)` est un simple setter protégé par verrou (sûr à appeler depuis
+  n'importe quel thread), la boucle PWM elle-même tourne dans un thread
+  dédié.
+- `link/gamepad_handler.py` (`GamepadReader`) : lit une manette Xbox via
+  `evdev` (remplace `pygame`, plus fiable en headless -- voir le
+  docstring du module) et appelle directement `RobotState.drive()` (stick
+  gauche/droit) et `RobotState.set_mode()` (boutons) -- la manette et les
+  trames TCP du site web sont deux entrées symétriques du même état, ni
+  l'une ni l'autre ne touche au GPIO directement.
+- Boutons de la manette (voir `robot_state_button_handler()`) : `A` arme
+  le mode `AUTO` (c'est le bouton "vas-y jusqu'au point suivant" physique
+  -- voir plus bas, il pilote vraiment le robot depuis le 2026-09-07),
+  `B` déclenche un arrêt complet (`state.stop()`, même effet que `STP` :
+  moteurs coupés, mode remis à `IDLE`, route en cours annulée), `START`
+  fait la même chose -- deux boutons d'arrêt redondants exprès, plus sûr
+  qu'un seul. Toucher un stick reprend toujours la main en `MANUAL`,
+  même en pleine conduite `AUTO` (voir `robot_state_drive_handler()`) --
+  un opérateur physique peut toujours reprendre le contrôle.
+
+```mermaid
+flowchart TB
+    WEB["Site web (Pi #2)<br/>TCP :5050"] --> TCP["ControlServer<br/>(link/server.py)"]
+    XBOX["Manette Xbox"] --> GAMEPAD["GamepadReader<br/>(link/gamepad_handler.py)"]
+    GPSDEV["Récepteur GPS"] --> GPS["GPSReader<br/>(link/gps_reader.py)"]
+    TCP --> STATE[("RobotState (partagé)")]
+    GAMEPAD --> STATE
+    GPS --> STATE
+    STATE --> AUTOPILOT["Autopilot<br/>(link/autopilot.py)"]
+    AUTOPILOT --> STATE
+    STATE --> DRIVER["MotorDriver<br/>(motor_control/motor_driver.py)"]
+    DRIVER --> GPIO["GPIO moteurs"]
+```
+
+**IMPORTANT — ce qui est réel et ce qui ne l'est pas encore** : `DRV`
+manuel (TCP ou joysticks de la manette) pilote vraiment les moteurs, et
+depuis le 2026-09-07 le mode `AUTO` aussi : `link/autopilot.py` calcule,
+à chaque nouvelle position GPS, la distance et l'écart de cap vers
+`nav_target` (posé par `NAV` ou `RTE`), les passe dans deux
+`PIDController` (distance, cap) et envoie le résultat aux moteurs --
+exactement ce que faisait un `DRV` manuel, mais calculé automatiquement.
+`RTE` avance donc vraiment de point en point tout seul une fois `A`
+appuyé. **Limite réelle, pas cachée** : il n'y a pas de boussole/IMU sur
+ce robot -- le seul cap disponible est le cap sur le fond (`cap`, trame
+GPRMC du GPS), qui n'a de sens que si le robot est déjà en mouvement ;
+à l'arrêt ou juste après un départ, il peut être bruité/périmé et faire
+temporairement corriger le PID dans le mauvais sens. Et les gains PID
+(`kp=1/ki=0/kd=0.5` distance, `kp=0.5/ki=0/kd=1` cap) ne sont validés
+qu'en simulation hors-ligne (voir "Réglage des PID hors robot" plus bas)
+-- à retester en vrai, à faible vitesse, sous surveillance, avant de
+laisser le robot livré à lui-même.
+
+**Note matérielle, confirmée le 2026-09-07** : les deux moteurs sont
+montés en miroir (un de chaque côté du châssis) et câblés en polarité
+inversée l'un par rapport à l'autre, exprès, pour pouvoir utiliser le
+même modèle de moteur des deux côtés. Cette compensation est entièrement
+gérée par le câblage physique (quel fil moteur va sur quelle borne du
+pont en H) -- confirmé par le test de terrain "full throttle"
+(2026-09-05/06, les deux moteurs à +255/+255) : le robot avançait déjà
+tout droit, pas en cercle. `motor_control/motor_driver.py` n'applique
+donc volontairement **aucune** inversion logicielle supplémentaire entre
+`left_pwm`/`right_pwm` -- en ajouter une annulerait cette compensation
+déjà correcte et ferait tourner le robot sur lui-même au lieu d'avancer
+droit. Les numéros de broches `MOTOR1_SENS1`/`MOTOR1_SENS2` (14/15,
+valeurs de `remote_control.py`, déjà validées sur le robot réel) restent
+donc tels quels ; l'ancien `pwm.py` (archivé, jamais câblé à rien de réel)
+avait ces deux broches inversées (15/14), mais c'était un résidu d'un
+fichier jamais testé, pas un indice d'inversion à reproduire.
+
+**Honnêteté** : `evdev` et `gpiod` n'ont pas pu être installés dans le bac
+à sable où ce refactor a été écrit (pas d'accès PyPI). La logique pure
+(calcul PWM, normalisation d'axes, détection d'appui bouton) est testée
+pour de vrai (`tests/test_motor_driver.py`, `tests/test_gamepad_handler.py`).
+Le reste (ouverture réelle de la puce GPIO, lecture réelle d'une manette)
+est écrit contre l'API documentée de ces bibliothèques mais n'a pas tourné
+sur la Pi -- à vérifier avant de s'y fier plus loin que "la dégradation
+propre en cas d'absence de matériel fonctionne" (elle, testée pour de
+vrai).
 
 ## Lecture GPS (`link/gps_reader.py`)
 
@@ -189,8 +287,10 @@ normalement dans les deux cas.
 ## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
 
 Trois variantes de `motor_control/remote_control.py` (même manette, mêmes
-moteurs, code de `Remote` inchangé), pensées pour définir les courbes de
-réponse à l'échelon du robot — une en translation, une en rotation, une
+moteurs -- interface publique de `Remote` inchangée depuis le refactor du
+2026-09-07, voir la section "Pilotage moteur et manette" ci-dessus),
+pensées pour définir les courbes de réponse à l'échelon du robot — une en
+translation, une en rotation, une
 troisième qui fait les deux à la fois — sans avoir à trier tout le reste
 du trajet dans les données GPS. Chacune s'appuie sur
 `motor_control/gps_condition_logger.py` (moteur commun aux trois), qui
@@ -417,7 +517,10 @@ Suite à un signalement ("le PWM ne fonctionne pas") :
   aujourd'hui sur ce robot) si `gpiodetect` est absent ou ne trouve rien,
   et surchargeable à tout moment avec la variable d'environnement
   `ROBOT_GPIOCHIP`. Testé pour de vrai ici (logique pure, `gpiodetect`
-  simulé) : `tests/test_remote_control_gpiochip.py`.
+  simulé) : `tests/test_gpiochip.py` (`detect_rp1_gpiochip()` a depuis
+  déménagé dans `motor_control/gpiochip.py`, voir la section "Pilotage
+  moteur et manette" plus haut -- le test a été renommé en conséquence,
+  son contenu est inchangé).
 
 Pour vérifier sur la Pi que la bonne puce est bien détectée :
 ```bash

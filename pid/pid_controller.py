@@ -16,7 +16,21 @@ class PIDController:
         
     def set_setpoint(self, setpoint : float):
         self.setpoint=setpoint
-        
+
+    def reset(self):
+        """Clears accumulated integral and derivative history -- added
+        2026-09-07 for link/autopilot.py's live AUTO-mode driving loop,
+        which creates long-lived PIDController instances and needs to
+        wipe their state whenever a driving session (re)starts from a
+        fresh context (mode just switched to AUTO, arrived at a
+        waypoint, route just replaced) so a stale integral/derivative
+        from a previous, unrelated period doesn't leak into the next
+        one. Does not touch kp/ki/kd/setpoint. Purely additive -- no
+        existing caller of this class needs to know it exists."""
+        self.integral = 0
+        self.previous_error = None
+        self.last_time = time.time()
+
     def update(self, measured_value):
         
         now = time.time()

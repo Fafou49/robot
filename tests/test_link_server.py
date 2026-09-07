@@ -47,6 +47,62 @@ def test_set_mode_rejects_unknown_mode():
         state.set_mode("FLY")
 
 
+# --- RobotState <-> motor_driver wiring (2026-09-07) ------------------------
+# RobotState itself stays hardware-free (motor_driver=None, the default,
+# used by every other test in this file) -- these few tests specifically
+# check the *wiring*: that drive()/stop()/set_mode() call into an injected
+# motor_driver at exactly the right moments, using a fake standing in for
+# motor_control.motor_driver.MotorDriver so no gpiod/hardware is involved.
+
+class _FakeMotorDriver:
+    def __init__(self):
+        self.calls = []
+
+    def drive(self, left, right):
+        self.calls.append((left, right))
+
+
+def test_drive_forwards_to_motor_driver():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.drive(120, -120)
+    assert fake.calls == [(120, -120)]
+
+
+def test_stop_forwards_zero_to_motor_driver():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.drive(200, 200)
+    state.stop()
+    assert fake.calls[-1] == (0, 0)
+
+
+def test_set_mode_away_from_manual_zeroes_motor_driver():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.set_mode("MANUAL")
+    state.drive(100, 100)
+    fake.calls.clear()
+    state.set_mode("AUTO")  # leaving MANUAL -- must stop the motors
+    assert fake.calls == [(0, 0)]
+
+
+def test_set_mode_staying_manual_does_not_touch_motor_driver():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.set_mode("MANUAL")
+    assert fake.calls == []  # already zero, no driver call needed
+
+
+def test_bare_robot_state_has_no_motor_driver_by_default():
+    # Every other test in this file constructs RobotState() with no
+    # motor_driver -- confirms that stays fully inert (None), matching
+    # this module's docstring.
+    state = RobotState()
+    assert state.motor_driver is None
+    state.drive(50, 50)  # must not raise just because there's no driver
+
+
 def test_set_route_stores_points_and_arms_first_as_nav_target():
     state = RobotState()
     p1 = ("4723.492", "N", "00044.340", "W")
@@ -98,6 +154,63 @@ def test_route_advances_to_next_waypoint_on_arrival():
     assert state.nav_target == p2
 
 
+# --- AUTO-mode autonomous driving (2026-09-07) ------------------------------
+# update_gps_fix() now actually drives the motors while mode == "AUTO" (see
+# link/autopilot.py) -- these use a _FakeMotorDriver (defined above) to
+# check the wiring without any real PID tuning/GPS math assertions (that
+# belongs in tests/test_autopilot.py).
+
+def test_auto_mode_drives_toward_nav_target_on_gps_fix():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.set_nav_target("4723.532", "N", "00044.292", "W")  # far from the fix below
+    state.set_mode("AUTO")
+    fake.calls.clear()  # drop the zero-pwm call set_mode("AUTO") itself makes
+
+    state.update_gps_fix(47.0, -1.0)  # far from the target
+
+    assert len(fake.calls) == 1
+    left, right = fake.calls[0]
+    assert (left, right) == (state.left_pwm, state.right_pwm)
+    assert left != 0 or right != 0  # far away -- must actually be driving
+
+
+def test_manual_mode_does_not_autonomously_drive_on_gps_fix():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.set_nav_target("4723.532", "N", "00044.292", "W")
+    state.set_mode("MANUAL")
+    fake.calls.clear()
+
+    state.update_gps_fix(47.0, -1.0)
+
+    assert fake.calls == []  # not in AUTO -- update_gps_fix must not drive
+
+
+def test_auto_mode_with_no_target_does_not_drive():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.set_mode("AUTO")
+    fake.calls.clear()
+
+    state.update_gps_fix(47.0, -1.0)  # AUTO armed, but neither NAV nor RTE ever sent
+
+    assert fake.calls == []
+
+
+def test_auto_mode_stops_once_arrived_at_a_lone_nav_target():
+    fake = _FakeMotorDriver()
+    state = RobotState(motor_driver=fake)
+    state.set_nav_target("4723.492", "N", "00044.340", "W")  # ~47.391533, -0.739
+    state.set_mode("AUTO")
+    fake.calls.clear()
+
+    state.update_gps_fix(47.391533, -0.739)  # right on top of the target
+
+    assert fake.calls[-1] == (0, 0)
+    assert (state.left_pwm, state.right_pwm) == (0, 0)
+
+
 def test_nav_cancels_an_active_route():
     state = RobotState()
     state.set_route(["1", "4723.492", "N", "00044.340", "W"])
@@ -112,6 +225,34 @@ def test_stop_cancels_an_active_route():
     state.stop()
     assert state.route == []
     assert state.route_index == 0
+
+
+# --- PID: live gain update (2026-09-07 -- now really tunes link.autopilot) --
+
+def test_set_pid_gains_rejects_unknown_loop():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.set_pid_gains("Z", 1.0, 0.0, 0.0)
+    assert exc_info.value.code == "06"
+
+
+def test_set_pid_gains_rejects_non_numeric_value():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.set_pid_gains("D", "oops", 0.0, 0.0)
+    assert exc_info.value.code == "07"
+
+
+def test_set_pid_gains_updates_the_live_autopilot():
+    state = RobotState()
+    state.set_pid_gains("D", 2.0, 0.1, 0.3)
+    state.set_pid_gains("A", 0.7, 0.0, 0.9)
+    assert state.pid_gains["D"] == (2.0, 0.1, 0.3)
+    assert state.pid_gains["A"] == (0.7, 0.0, 0.9)
+    assert (state.autopilot._pid_distance.kp, state.autopilot._pid_distance.ki,
+            state.autopilot._pid_distance.kd) == (2.0, 0.1, 0.3)
+    assert (state.autopilot._pid_angle.kp, state.autopilot._pid_angle.ki,
+            state.autopilot._pid_angle.kd) == (0.7, 0.0, 0.9)
 
 
 def test_camera_command_rejects_unknown_action():
@@ -175,11 +316,17 @@ def test_camera_command_snap_succeeds_against_a_real_snap_endpoint(monkeypatch):
 
 @pytest.fixture()
 def running_server():
-    # start_gps=False: tests don't need a real (or attempted) GPS fix, and
-    # this avoids every test run trying to open a real serial device --
-    # see test_control_server_starts_fine_without_gps_hardware below for a
-    # dedicated check that start_gps=True doesn't crash when it can't.
-    server = ControlServer("127.0.0.1", 0, start_gps=False)  # port 0 = pick a free port
+    # start_gps/start_motor/start_gamepad=False: tests don't need a real
+    # (or attempted) GPS fix, GPIO chip, or gamepad, and this avoids every
+    # test run making real subprocess/device-scan calls (gpiodetect,
+    # evdev.list_devices) -- see
+    # test_control_server_starts_fine_without_gps_hardware below for a
+    # dedicated check that leaving all three at their True default doesn't
+    # crash when the hardware behind them isn't there.
+    server = ControlServer(
+        "127.0.0.1", 0,  # port 0 = pick a free port
+        start_gps=False, start_motor=False, start_gamepad=False,
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -232,6 +379,19 @@ def test_state_is_shared_across_connections(running_server):
     time.sleep(0.05)
     assert running_server.state.left_pwm == 80
     assert running_server.state.right_pwm == 80
+
+
+def test_drv_asserts_manual_mode(running_server):
+    # A manual DRV always takes back control -- same "manual override
+    # always wins" convention NAV/STP already use for the route (see
+    # link/robot_state.py's set_mode()/docstring). Confirmed via a real
+    # AUTO->DRV transition, not just a bare mode check.
+    running_server.state.set_mode("AUTO")
+    port = running_server.server_address[1]
+    _send_and_receive(port, build_sentence("DRV", 80, 80))
+    time.sleep(0.05)
+    assert running_server.state.mode == "MANUAL"
+    assert running_server.state.left_pwm == 80
 
 
 def test_sta_without_nav_target_or_gps_fix_reports_placeholders(running_server):
@@ -303,10 +463,13 @@ def test_sta_target_reflects_route_first_waypoint(running_server):
 
 
 def test_control_server_starts_fine_without_gps_hardware(monkeypatch):
-    # start_gps=True (the default), but pointed at a device path that
-    # cannot possibly exist -- the point is confirming this never crashes
-    # server startup, on this dev machine or on the Pi without a receiver
-    # plugged in.
+    # start_gps/start_motor/start_gamepad all default to True here, with
+    # GPS pointed at a device path that cannot possibly exist -- and, in
+    # this sandbox, gpiod/evdev not installed at all for the motor
+    # driver/gamepad. The point is confirming none of the three ever
+    # crashes server startup, whether on this dev machine or on a Pi
+    # missing one piece of hardware (no receiver plugged in, no
+    # controller connected, motor driver board unplugged...).
     monkeypatch.setenv("GPS_DEVICE", "/dev/definitely-not-a-real-device")
     server = ControlServer("127.0.0.1", 0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
