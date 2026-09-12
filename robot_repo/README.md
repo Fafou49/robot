@@ -184,15 +184,37 @@ schéma ci-dessous) :
   gauche/droit) et `RobotState.set_mode()` (boutons) -- la manette et les
   trames TCP du site web sont deux entrées symétriques du même état, ni
   l'une ni l'autre ne touche au GPIO directement.
-- Boutons de la manette (voir `robot_state_button_handler()`) : `A` arme
-  le mode `AUTO` (c'est le bouton "vas-y jusqu'au point suivant" physique
-  -- voir plus bas, il pilote vraiment le robot depuis le 2026-09-07),
-  `B` déclenche un arrêt complet (`state.stop()`, même effet que `STP` :
-  moteurs coupés, mode remis à `IDLE`, route en cours annulée), `START`
-  fait la même chose -- deux boutons d'arrêt redondants exprès, plus sûr
-  qu'un seul. Toucher un stick reprend toujours la main en `MANUAL`,
-  même en pleine conduite `AUTO` (voir `robot_state_drive_handler()`) --
-  un opérateur physique peut toujours reprendre le contrôle.
+- Boutons de la manette (voir `robot_state_button_handler()`) -- **mis à
+  jour le 2026-09-12**, en même temps que la refonte des boutons de
+  `/control` sur le site web : la manette est écoutée en permanence et le
+  mode `MANUAL` reprend toujours la main dès qu'un stick est réellement
+  bougé, même en pleine conduite `AUTO` (voir `robot_state_drive_handler()`)
+  -- il n'y a donc plus de bouton `MOD` sur le site, un opérateur physique
+  n'en a jamais besoin pour reprendre le contrôle. `Y` (déplacé depuis `A`
+  ce même jour -- `A` n'est plus utilisé) réarme le mode `AUTO`, mais
+  seulement s'il y a déjà une cible (`NAV` envoyé depuis le site, ou une
+  route GPS importée) -- appuyer dessus sans cible ne fait rien
+  (`RobotState.has_nav_target()`), plutôt que d'armer un mode qui ne
+  calculerait rien à chaque trame GPS. `B` déclenche un arrêt complet
+  (`state.stop()`, même effet que `STP` : moteurs coupés, mode remis à
+  `IDLE`, route en cours annulée). `START` fait la même chose, **et**
+  éteint en plus complètement la Raspberry Pi (`ControlServer._shutdown_pi()`
+  dans `link/server.py`, exécute `sudo poweroff` par défaut, personnalisable
+  via `SHUTDOWN_CMD`) -- ce n'est plus un simple arrêt d'urgence redondant
+  avec `B` comme avant cette date, voir la note sudo ci-dessous.
+
+  **Configuration requise pour `START` (`sudo poweroff` sans mot de
+  passe)** : l'utilisateur qui lance `run_robot.sh` doit pouvoir exécuter
+  la commande de `SHUTDOWN_CMD` (par défaut `sudo poweroff`) sans qu'un
+  mot de passe soit demandé, sinon `_shutdown_pi()` échoue silencieusement
+  côté extinction (elle logue une erreur, et arrête quand même les
+  scripts Python de ce robot). Sur Raspberry Pi OS, ça se configure avec
+  `sudo visudo -f /etc/sudoers.d/robot-shutdown` et une ligne comme :
+  ```
+  robot ALL=(ALL) NOPASSWD: /usr/sbin/poweroff
+  ```
+  (remplacer `robot` par le nom d'utilisateur réel, et adapter le chemin
+  si `SHUTDOWN_CMD` est personnalisé -- `which poweroff` pour le vérifier).
 
 ```mermaid
 flowchart TB
@@ -215,8 +237,9 @@ depuis le 2026-09-07 le mode `AUTO` aussi : `link/autopilot.py` calcule,
 `nav_target` (posé par `NAV` ou `RTE`), les passe dans deux
 `PIDController` (distance, cap) et envoie le résultat aux moteurs --
 exactement ce que faisait un `DRV` manuel, mais calculé automatiquement.
-`RTE` avance donc vraiment de point en point tout seul une fois `A`
-appuyé. **Limite réelle, pas cachée** : il n'y a pas de boussole/IMU sur
+`RTE` avance donc vraiment de point en point tout seul une fois `Y`
+appuyé (`A` avant le 2026-09-12, voir la section "Pilotage moteur et
+manette" plus haut). **Limite réelle, pas cachée** : il n'y a pas de boussole/IMU sur
 ce robot -- le seul cap disponible est le cap sur le fond (`cap`, trame
 GPRMC du GPS), qui n'a de sens que si le robot est déjà en mouvement ;
 à l'arrêt ou juste après un départ, il peut être bruité/périmé et faire
@@ -267,6 +290,43 @@ autre récepteur est utilisé un jour et suit le mapping standard après
 tout, ne pas revenir en arrière à l'aveugle -- relancer
 `dump_gamepad_axes.py` sur ce matériel précis d'abord.
 
+**Deux bugs corrigés suite à un retour terrain (2026-09-12) : "`Y` et
+`START` ne fonctionnent pas comme prévu" et "le mode `AUTO` ne s'enclenche
+jamais".**
+
+1. **`AUTO` s'armait (le mode passait bien à `AUTO`) mais le robot ne
+   bougeait jamais.** Cause réelle : `robot_state_drive_handler()`
+   (appelée à *chaque* évènement d'axe, y compris le bruit analogique
+   d'un stick immobile/centré -- `_pwm_from_axis` ramène ça à `(0, 0)`)
+   appelait `state.drive(0, 0)` sans condition, quel que soit le mode
+   actif. Or `RobotState.drive()` remet toujours `left_pwm`/`right_pwm`
+   à zéro et coupe les moteurs, sans regarder le mode -- en `AUTO`, ce
+   `(0, 0)` du stick immobile (qui arrive plusieurs fois par seconde)
+   écrasait donc systématiquement le PWM que l'autopilote venait de
+   calculer à la dernière trame GPS, juste après. Corrigé en ajoutant
+   `RobotState.is_manual()` : un stick centré ne touche plus du tout aux
+   moteurs tant que le mode n'est pas déjà `MANUAL` (relâcher le stick
+   pendant une conduite manuelle continue de couper les moteurs
+   normalement, c'est uniquement l'idle en `AUTO`/`IDLE` qui est
+   maintenant ignoré).
+2. **`Y` et `START` "ne répondent pas comme prévu"** : même famille de bug
+   que le stick droit ci-dessus (une manette/un récepteur qui ne suit pas
+   le mapping "standard" xpad), mais côté boutons cette fois --
+   `robot_state_button_handler()` comparait les codes évdev reçus à des
+   constantes figées (`ecodes.BTN_Y`/`ecodes.BTN_START`) sans aucun moyen
+   de les corriger sans modifier le code. Elle accepte maintenant les
+   noms des boutons en paramètres (`arm_auto_btn`/`stop_btn`/
+   `shutdown_btn`, résolus dynamiquement sur `evdev.ecodes`), et
+   `link/server.py` les lit depuis `GAMEPAD_ARM_AUTO_BTN`/
+   `GAMEPAD_STOP_BTN`/`GAMEPAD_SHUTDOWN_BTN` (voir `.env.example`) --
+   valeurs par défaut inchangées (`BTN_Y`/`BTN_B`/`BTN_START`). Reste à
+   confirmer sur le vrai matériel : lancer
+   `python3 -m motor_control.dump_gamepad_buttons` (voir section
+   suivante), appuyer sur `Y` et `Start`, et si le code affiché n'est pas
+   `BTN_Y`/`BTN_START`, régler la variable d'environnement correspondante
+   sur le nom réel (sans toucher au code, même principe que
+   `DEFAULT_RIGHT_Y_CODE` pour l'axe droit).
+
 ### Vérifier rapidement une manette (`motor_control/check_gamepad.py`)
 
 Petit script de diagnostic autonome (pas de moteurs, pas de GPS) pour
@@ -295,6 +355,20 @@ au lieu de deviner :
 ```bash
 python3 -m motor_control.dump_gamepad_axes
 ```
+
+De la même façon, si `Y` ou `START` ne déclenchent pas le comportement
+attendu (voir le point 2 juste au-dessus), `motor_control/
+dump_gamepad_buttons.py` affiche le code évdev brut de **chaque** bouton
+appuyé/relâché, sans le filtrage de `robot_state_button_handler()` :
+
+```bash
+python3 -m motor_control.dump_gamepad_buttons
+```
+
+Appuyer sur `Y` et `Start` (et si besoin les autres boutons, pour
+comparer) ; si le nom affiché n'est pas `BTN_Y`/`BTN_START`, régler
+`GAMEPAD_ARM_AUTO_BTN`/`GAMEPAD_SHUTDOWN_BTN` (voir `.env.example`) sur
+le nom réel plutôt que de deviner.
 
 ## Lecture GPS (`link/gps_reader.py`)
 
@@ -511,12 +585,22 @@ n'exécute la seconde commande qu'après la sortie de la première, or
 `link/server.py` tourne indéfiniment (il sert des connexions jusqu'à
 interruption) — `camera/stream_server.py` ne démarre donc jamais.
 `run_robot.sh`, à la racine du dépôt, lance les deux en parallèle et les
-arrête tous les deux proprement sur un seul Ctrl+C (y compris si l'un des
-deux plante tout seul, pour éviter de laisser l'autre tourner seul sans
-s'en rendre compte) :
+arrête proprement sur un seul Ctrl+C :
 
 ```bash
 ./run_robot.sh
+```
+
+La caméra est **optionnelle** : `link/server.py` (pilotage/GPS/protocole de
+contrôle) est le seul processus critique. Si la caméra ne démarre pas (pas
+de webcam branchée, `CAMERA_DEVICE` invalide, device déjà utilisé...) ou
+plante en cours de route, `run_robot.sh` affiche un avertissement et
+continue à faire tourner `link/server.py` seul plutôt que de tout arrêter.
+Un plantage de `link/server.py`, lui, reste fatal et arrête aussi la
+caméra avec lui. Pour ne même pas essayer de démarrer la caméra :
+
+```bash
+CAMERA_ENABLED=0 ./run_robot.sh
 ```
 
 Les variables d'environnement des deux scripts (`CAMERA_DEVICE`,

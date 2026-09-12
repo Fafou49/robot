@@ -206,13 +206,23 @@ def test_read_events_dispatches_left_and_right_stick_and_button_events(monkeypat
 # --- robot_state_button_handler ---------------------------------------------
 
 class _FakeState:
-    def __init__(self):
+    def __init__(self, nav_target=None, mode="IDLE"):
         self.modes = []
         self.stop_count = 0
         self.drives = []
+        # has_nav_target() reads this -- set it in a test to simulate a
+        # NAV point or GPS route already having been sent.
+        self.nav_target = nav_target
+        # is_manual() reads this -- set it in a test to simulate the
+        # robot already being in a given mode (e.g. "MANUAL" or "AUTO").
+        # set_mode() below also updates it, same as the real RobotState,
+        # so a test that arms AUTO via set_mode and then checks is_manual
+        # sees a consistent picture.
+        self.mode = mode
 
     def set_mode(self, mode):
         self.modes.append(mode)
+        self.mode = mode
 
     def stop(self):
         self.stop_count += 1
@@ -220,28 +230,78 @@ class _FakeState:
     def drive(self, left_pwm, right_pwm):
         self.drives.append((left_pwm, right_pwm))
 
+    def has_nav_target(self):
+        return self.nav_target is not None
+
+    def is_manual(self):
+        return self.mode == "MANUAL"
+
 
 def test_button_handler_maps_buttons_to_state_calls():
-    # BTN_A arms AUTO (the "go to the next point" button, see
-    # link/robot_state.py); BTN_B and BTN_START are both a full stop
-    # (state.stop(), same as STP) -- redundant on purpose, see
-    # robot_state_button_handler()'s docstring.
-    state = _FakeState()
-    handler = robot_state_button_handler(state)
+    # BTN_Y re-arms AUTO (2026-09-12: moved from BTN_A, see
+    # robot_state_button_handler()'s docstring) when a target is already
+    # set; BTN_B is a full stop (state.stop(), same as STP); BTN_START
+    # also stops, then additionally calls on_shutdown() -- link/server.py
+    # wires this to actually power off the Raspberry Pi.
+    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
+    shutdown_calls = []
+    handler = robot_state_button_handler(state, on_shutdown=lambda: shutdown_calls.append(True))
 
-    handler(ecodes.BTN_A, True)
+    handler(ecodes.BTN_Y, True)
     handler(ecodes.BTN_B, True)
     handler(ecodes.BTN_START, True)
     assert state.modes == ["AUTO"]
     assert state.stop_count == 2
+    assert shutdown_calls == [True]
+
+
+def test_button_handler_refuses_to_arm_auto_with_no_target():
+    # Pressing Y with neither a NAV point nor a GPS route sent yet must
+    # not switch into AUTO -- see has_nav_target()'s own docstring for why
+    # (nothing to drive toward -- it would just sit there every GPS fix).
+    state = _FakeState(nav_target=None)
+    handler = robot_state_button_handler(state)
+
+    handler(ecodes.BTN_Y, True)
+    assert state.modes == []
+
+
+def test_button_handler_shutdown_is_optional():
+    # link/server.py always passes on_shutdown, but nothing requires
+    # every caller to: BTN_START must still stop the robot even with none
+    # given, and must not raise trying to call it.
+    state = _FakeState()
+    handler = robot_state_button_handler(state)  # no on_shutdown
+
+    handler(ecodes.BTN_START, True)
+    assert state.stop_count == 1
 
 
 def test_button_handler_ignores_release_events():
-    state = _FakeState()
+    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
     handler = robot_state_button_handler(state)
-    handler(ecodes.BTN_A, False)
+    handler(ecodes.BTN_Y, False)
     assert state.modes == []
     assert state.stop_count == 0
+
+
+def test_button_handler_button_codes_are_configurable():
+    # 2026-09-12: if this project's actual controller/receiver reports Y
+    # or Start under a different evdev code than assumed (the same class
+    # of quirk already hit for the right stick's axis -- see
+    # DEFAULT_RIGHT_Y_CODE), arm_auto_btn/stop_btn/shutdown_btn (or the
+    # matching GAMEPAD_*_BTN env vars link/server.py reads) let it be
+    # fixed without touching this module. Here BTN_X stands in for
+    # whatever the real "arm AUTO" button turns out to be.
+    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
+    handler = robot_state_button_handler(state, arm_auto_btn="BTN_X")
+
+    handler(ecodes.BTN_X, True)
+    assert state.modes == ["AUTO"]
+
+    # The old default (BTN_Y) must NOT still trigger it once reassigned.
+    handler(ecodes.BTN_Y, True)
+    assert state.modes == ["AUTO"]
 
 
 # --- robot_state_drive_handler -----------------------------------------------
@@ -261,6 +321,31 @@ def test_drive_handler_does_not_force_manual_on_idle_zero_output():
     # must NOT cancel an active AUTO drive (see this function's
     # docstring for why).
     state = _FakeState()
+    handler = robot_state_drive_handler(state)
+
+    handler(0, 0)
+    assert state.modes == []
+    assert state.drives == []
+
+
+def test_drive_handler_idle_zero_output_does_not_touch_the_motors_outside_manual():
+    # 2026-09-12 bug fix: outside MANUAL (AUTO here), an idle stick's
+    # (0, 0) must not reach state.drive() at all -- it used to, and that
+    # silently zeroed whatever PWM the autopilot had just computed on the
+    # last GPS fix, which looked exactly like "AUTO mode never engages".
+    state = _FakeState(mode="AUTO")
+    handler = robot_state_drive_handler(state)
+
+    handler(0, 0)
+    assert state.modes == []
+    assert state.drives == []
+
+
+def test_drive_handler_still_zeroes_motors_on_release_during_manual_drive():
+    # Releasing the stick after a genuine MANUAL drive must still stop
+    # the motors normally -- only AUTO/IDLE are protected from idle
+    # (0, 0) noise, not an actual ongoing manual drive.
+    state = _FakeState(mode="MANUAL")
     handler = robot_state_drive_handler(state)
 
     handler(0, 0)

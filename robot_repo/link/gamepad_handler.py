@@ -495,60 +495,143 @@ class GamepadReader:
                     pass
 
 
-def robot_state_button_handler(state):
+def robot_state_button_handler(state, on_shutdown=None,
+                                arm_auto_btn="BTN_Y", stop_btn="BTN_B",
+                                shutdown_btn="BTN_START"):
     """Returns an on_button callback wiring the gamepad's buttons to a
     link.robot_state.RobotState -- used by link/server.py.
 
-    BTN_A arms AUTO mode -- this is the controller's "go to the next
-    point" button: as of 2026-09-07 this really drives the robot toward
-    whatever NAV/RTE last set as nav_target (see link/robot_state.py's
-    module docstring and link/autopilot.py for the heading/distance PID
-    loop this now runs on every GPS fix), not just an armed-but-inert
-    mode. BTN_B stops the robot -- same as the STP sentence (full stop:
-    motors zeroed, mode back to IDLE, any in-progress route cleared),
-    not just a hand-back to MANUAL, since a plain mode switch on its own
-    doesn't cancel whatever nav_target/route is still armed. BTN_START is
-    a second, always-available physical emergency stop, same as STP --
-    kept alongside BTN_B (redundant on purpose: two ways to stop is safer
-    than one) mirroring remote_control.py's previous convention where the
-    Start button ended the program.
+    arm_auto_btn/stop_btn/shutdown_btn (2026-09-12, added after a report
+    that BTN_Y and BTN_START "don't work as expected" on this project's
+    actual controller/receiver): names of attributes on evdev.ecodes,
+    resolved once here rather than hardcoded, in case this specific
+    hardware reports those two buttons under different codes -- the
+    exact same class of real-world quirk this project already hit once
+    for the right stick's axis (see this module's DEFAULT_RIGHT_Y_CODE
+    and its docstring). Run `python3 -m motor_control.dump_gamepad_buttons`
+    on the Pi to find out empirically what the real names are, then
+    either pass them here or, without touching code, set the
+    GAMEPAD_ARM_AUTO_BTN / GAMEPAD_STOP_BTN / GAMEPAD_SHUTDOWN_BTN
+    environment variables link/server.py reads for exactly this purpose.
+    Defaults match this function's previous hardcoded behavior exactly,
+    so nothing changes for a controller that does report BTN_Y/BTN_B/
+    BTN_START normally.
+
+    The gamepad is always listened to and MANUAL always wins by default
+    (see robot_state_drive_handler() below: any genuine stick push
+    switches back to MANUAL immediately, even mid-AUTO-drive) -- there is
+    no MOD button on the website anymore, since a physical operator
+    should never need one to take control back.
+
+    BTN_Y re-arms AUTO mode -- this is the controller's "go to the
+    target" button (moved here from BTN_A on 2026-09-12, alongside the
+    /control website's redesign; BTN_A is unbound as of that change).
+    It only actually arms AUTO if there is something to drive toward
+    (state.has_nav_target(): a NAV point from the website, or an
+    uploaded GPS route) -- pressing it with neither set is a silent
+    no-op rather than switching into a mode that would just sit there
+    computing nothing on every GPS fix (see link/robot_state.py's
+    _autonomous_pwm_locked()). Once armed, link/autopilot.py really
+    drives the robot toward nav_target on every GPS fix.
+
+    BTN_B stops the robot -- same as the STP sentence (full stop: motors
+    zeroed, mode back to IDLE, any in-progress route cleared), not just a
+    hand-back to MANUAL, since a plain mode switch on its own doesn't
+    cancel whatever nav_target/route is still armed.
+
+    BTN_START (2026-09-12: repurposed from "a second emergency stop,
+    redundant with BTN_B" -- see git history for the previous behavior)
+    now stops the robot the same way BTN_B does, AND additionally calls
+    `on_shutdown` (if given): link/server.py wires this to cleanly stop
+    this robot's own control scripts and power off the Raspberry Pi
+    itself -- see ControlServer._shutdown_pi() there, and this project's
+    README ("Pilotage moteur et manette") for the sudoers setup that
+    requires. `on_shutdown` is optional (None by default) so every other
+    caller of this function (there are none today, but this keeps the
+    bar low for one later, e.g. a test) doesn't need to care about it.
 
     Taking the joystick back over from an active AUTO drive is handled
     separately, in robot_state_drive_handler() below -- not here, since
     that needs to distinguish an actual stick push from the idle/centered
     stick's own analog noise, which button presses don't have."""
+    # Resolved once here (not on every call) -- guarded by _EVDEV_AVAILABLE
+    # since ecodes is None when evdev isn't installed at all (see the
+    # top of this module); _on_button below already short-circuits on
+    # that same flag before ever touching these, so None here is a safe
+    # placeholder rather than a real getattr(None, ...) crash risk.
+    arm_auto_code = getattr(ecodes, arm_auto_btn, None) if _EVDEV_AVAILABLE else None
+    stop_code = getattr(ecodes, stop_btn, None) if _EVDEV_AVAILABLE else None
+    shutdown_code = getattr(ecodes, shutdown_btn, None) if _EVDEV_AVAILABLE else None
+    if _EVDEV_AVAILABLE:
+        for name, resolved in ((arm_auto_btn, arm_auto_code),
+                                (stop_btn, stop_code),
+                                (shutdown_btn, shutdown_code)):
+            if resolved is None:
+                log.warning(
+                    "gamepad button name %r is not a known evdev code -- "
+                    "that action will never trigger. Check "
+                    "GAMEPAD_ARM_AUTO_BTN/GAMEPAD_STOP_BTN/"
+                    "GAMEPAD_SHUTDOWN_BTN (or this call's arm_auto_btn/"
+                    "stop_btn/shutdown_btn) against `python3 -m "
+                    "motor_control.dump_gamepad_buttons`'s output.",
+                    name,
+                )
+
     def _on_button(code, pressed):
         if not pressed or not _EVDEV_AVAILABLE:
             return
-        if code == ecodes.BTN_A:
-            state.set_mode("AUTO")
-        elif code == ecodes.BTN_B:
+        if code == arm_auto_code:
+            if state.has_nav_target():
+                state.set_mode("AUTO")
+            else:
+                log.info(
+                    "%s pressed but no nav target/route is set (send NAV "
+                    "from the website or upload a GPS route first) -- "
+                    "staying in the current mode.",
+                    arm_auto_btn,
+                )
+        elif code == stop_code:
             state.stop()
-        elif code == ecodes.BTN_START:
+        elif code == shutdown_code:
             state.stop()
+            if on_shutdown is not None:
+                on_shutdown()
     return _on_button
 
 
 def robot_state_drive_handler(state):
     """Returns an on_drive callback wiring the gamepad's sticks to a
-    link.robot_state.RobotState -- used by link/server.py. Forwards every
-    axis change to state.drive(), same as before, but ALSO switches back
-    to MANUAL mode first, and only when the stick is actually pushed away
-    from center (nonzero PWM on either side) -- a physical operator can
-    always take back control from an active AUTO drive by touching a
-    stick, same "manual override always wins" convention this project
-    already uses for NAV/STP clearing an in-progress route.
+    link.robot_state.RobotState -- used by link/server.py. A genuine
+    stick push (nonzero PWM on either side) switches back to MANUAL mode
+    first, then always drives -- a physical operator can always take
+    back control from an active AUTO drive by touching a stick, same
+    "manual override always wins" convention this project already uses
+    for NAV/STP clearing an in-progress route.
 
-    The nonzero gate matters: GamepadReader calls on_drive on every ABS
-    event, including the analog noise/jitter a centered, untouched stick
-    can still produce -- _pwm_from_axis maps those to (0, 0), but if
-    EVERY such call forced MANUAL, an idle stick's own noise would
-    silently cancel AUTO-mode driving moments after BTN_A armed it,
-    defeating the whole point of that button. A genuine push doesn't have
-    this problem (an idle controller doesn't produce one by definition),
-    so only a nonzero result triggers the mode switch."""
+    2026-09-12 bug fix -- an idle/centered stick no longer reaches
+    drive() at all UNLESS the robot is already in MANUAL mode: GamepadReader
+    calls on_drive on every ABS event, including the analog noise/jitter
+    a centered, untouched stick can still produce -- _pwm_from_axis maps
+    those to (0, 0). The nonzero gate below (unchanged since introduction)
+    already stopped that idle noise from FORCING MANUAL mode, but it used
+    to still call state.drive(0, 0) unconditionally regardless of mode --
+    and RobotState.drive() always zeroes left_pwm/right_pwm and tells the
+    motor driver to stop, with no regard for which mode is active. In
+    AUTO mode, that meant nearly every idle-stick event (they fire
+    continuously, several times a second, from ordinary stick noise) was
+    silently overwriting whatever PWM update_gps_fix()'s autopilot tick
+    had just computed a moment before -- the robot would arm AUTO (mode
+    really did become "AUTO") but never actually move, which is exactly
+    what got reported as "AUTO mode never engages". Routing idle (0, 0)
+    through state.is_manual() first means it's now a no-op in AUTO/IDLE
+    (autopilot's own PWM output is left alone) while still zeroing the
+    motors normally when a stick is released after a genuine MANUAL
+    drive."""
     def _on_drive(left_pwm, right_pwm):
-        if left_pwm != 0 or right_pwm != 0:
+        is_push = left_pwm != 0 or right_pwm != 0
+        if is_push:
             state.set_mode("MANUAL")
-        state.drive(left_pwm, right_pwm)
+            state.drive(left_pwm, right_pwm)
+        elif state.is_manual():
+            state.drive(left_pwm, right_pwm)
     return _on_drive
