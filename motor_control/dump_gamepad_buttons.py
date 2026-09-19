@@ -79,6 +79,19 @@ KNOWN_BUTTON_NAMES = [
     "BTN_THUMBL", "BTN_THUMBR",
     "BTN_DPAD_UP", "BTN_DPAD_DOWN", "BTN_DPAD_LEFT", "BTN_DPAD_RIGHT",
     "BTN_C", "BTN_Z",
+    # Older, pre-"gamepad" Linux joystick event set (2026-09-18, added
+    # alongside link/gamepad_handler.py's GAMEPAD_IDENTIFYING_BUTTONS fix)
+    # -- some cheap third-party controllers/receivers report every button
+    # under THIS set instead of the modern BTN_A/B/X/Y one, which used to
+    # mean this project's device-discovery code (_find_controller() below,
+    # and GamepadReader._find_device()) never found the controller at all
+    # -- not just one button mislabeled, but every button (including
+    # START) silently unreachable. If the code that fires for a physical
+    # button prints one of these instead of a BTN_A/B/X/Y-family name,
+    # that's very likely what's going on here.
+    "BTN_TRIGGER", "BTN_THUMB", "BTN_THUMB2", "BTN_TOP", "BTN_TOP2",
+    "BTN_PINKIE", "BTN_BASE", "BTN_BASE2", "BTN_BASE3", "BTN_BASE4",
+    "BTN_BASE5", "BTN_BASE6", "BTN_DEAD",
 ]
 
 
@@ -100,10 +113,14 @@ def _button_name(code, ecodes_module, known_names=KNOWN_BUTTON_NAMES):
 def _find_controller():
     """Same device-discovery predicate as
     link.gamepad_handler.GamepadReader._find_device() (an absolute axis
-    plus BTN_A) -- duplicated rather than imported so this script has no
-    dependency on GamepadReader at all: the whole point is to look at the
-    controller with NO assumptions from that class baked in, in case the
-    bug turns out to be there too."""
+    plus either the modern BTN_A or the older BTN_TRIGGER -- see that
+    module's GAMEPAD_IDENTIFYING_BUTTONS) -- duplicated rather than
+    imported so this script has no dependency on GamepadReader at all: the
+    whole point is to look at the controller with NO assumptions from that
+    class baked in, in case the bug turns out to be there too. This
+    broadened check (2026-09-18, was BTN_A only) is itself the fix for a
+    real "the controller isn't found at all" failure mode -- see
+    link/gamepad_handler.py's GAMEPAD_IDENTIFYING_BUTTONS comment."""
     for path in evdev.list_devices():
         try:
             candidate = evdev.InputDevice(path)
@@ -111,11 +128,11 @@ def _find_controller():
             continue
         capabilities = candidate.capabilities()
         has_abs = ecodes.EV_ABS in capabilities
-        has_a_button = (
-            ecodes.EV_KEY in capabilities
-            and ecodes.BTN_A in capabilities[ecodes.EV_KEY]
+        has_gamepad_button = ecodes.EV_KEY in capabilities and any(
+            getattr(ecodes, name, None) in capabilities[ecodes.EV_KEY]
+            for name in ("BTN_A", "BTN_TRIGGER")
         )
-        if has_abs and has_a_button:
+        if has_abs and has_gamepad_button:
             return candidate
     return None
 

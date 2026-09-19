@@ -22,11 +22,28 @@ approach, which breaks the day the controller re-enumerates under a
 different event number) -- devices are found by capability instead.
 
 Also exposes start_rumble()/stop_rumble() on GamepadReader (2026-09-11):
-a continuous controller vibration via evdev's force-feedback (FF) API,
-used by the gps_log_on_full_*.py field-test scripts so the driver gets a
-physical "recording right now" cue without watching a screen. See the
-RUMBLE_EFFECT_MS/RUMBLE_REFRESH_S comment below for why this is built out
-of repeated short pulses rather than one continuous effect.
+a continuous controller vibration via evdev's force-feedback (FF) API.
+See the RUMBLE_EFFECT_MS/RUMBLE_REFRESH_S comment below for why this is
+built out of repeated short pulses rather than one continuous effect.
+
+UPDATE (2026-09-18) -- every vibration call site that existed before this
+date has been removed: the gps_log_on_full_*.py field-test scripts used
+to buzz continuously for the duration of a full-throttle/full-rotation
+maneuver (strong/weak depending on live GPS fix quality, via
+motor_control/gps_condition_logger.py's on_transition/on_gps_quality
+hooks) -- that wiring is gone from those three scripts (the hooks
+themselves still exist in gps_condition_logger.py, unused, in case a
+future feature wants them again). In its place, link/server.py now uses
+the NEW pulse() method below (a short, fixed-duration buzz rather than a
+"for as long as a condition holds" one) to physically confirm a REAL
+change during actual robot operation: a strong 0.5s pulse the moment the
+live GPS fix becomes DGPS-corrected, a weak 0.5s pulse the moment it
+drops back out of DGPS -- see link/gps_reader.py's on_gps_quality
+callback and link/server.py's DGPS_PULSE_DURATION_S. start_rumble()/
+stop_rumble()/set_intensity() (continuous) remain available for a future
+caller that genuinely needs a held vibration; pulse() is what a one-shot
+event like this should use instead of hand-rolling a start-then-sleep-
+then-stop sequence, since that would block whichever thread calls it.
 
 Honesty note (same caveat as link/gps_reader.py and motor_control.
 motor_driver): evdev could not be installed in the sandbox this was
@@ -96,8 +113,80 @@ except ImportError as exc:  # pragma: no cover -- exercised whenever evdev
 DEFAULT_LEFT_Y_CODE = "ABS_Y"
 DEFAULT_RIGHT_Y_CODE = "ABS_RZ"
 
-AXIS_DEADZONE = 0.08     # normalized (-1..1) stick movement below this counts as centered
+# Which evdev EV_KEY codes _find_device() (and dump_gamepad_buttons.py's
+# own duplicated copy of the same predicate) accepts as "this looks like
+# a gamepad" -- see BUTTON MAPPING just below for the two real-world
+# families this covers. BTN_A is the modern "gamepad" set's first button
+# (BTN_GAMEPAD is the exact same numeric code, just an alias); BTN_TRIGGER
+# is the OLDER, pre-"gamepad" joystick set's equivalent (BTN_JOYSTICK is
+# again the same code aliased). 2026-09-18: added BTN_TRIGGER here after
+# realizing device discovery used to require BTN_A specifically -- a
+# controller/receiver that reports itself entirely under the older
+# joystick set (plausible, see BUTTON MAPPING below) would then never be
+# found AT ALL, which silently disables every single button, START
+# included, and looks exactly like "BTN_START doesn't power off the Pi"
+# even though the whole controller is plugged in, powered, and working.
+# This is a genuine, real bug fix on top of the two BUTTON MAPPING
+# hypotheses below (which only explain individual buttons swapping, not
+# the controller failing to be found in the first place) -- but like
+# them, it can only be confirmed by actually running
+# motor_control.dump_gamepad_buttons on the real hardware.
+GAMEPAD_IDENTIFYING_BUTTONS = ("BTN_A", "BTN_TRIGGER")
+
+# BUTTON MAPPING -- a real-world gotcha worth understanding before
+# touching robot_state_button_handler() below (2026-09-18, after a field
+# report that pressing the controller's "Y" button behaves as if "A" had
+# been pressed instead): evdev's BTN_A/BTN_B/BTN_X/BTN_Y are not
+# standalone codes, they are ALIASES the Linux kernel defines on top of a
+# positional set -- BTN_A == BTN_SOUTH, BTN_B == BTN_EAST, BTN_X ==
+# BTN_NORTH, BTN_Y == BTN_WEST (see linux/input-event-codes.h). On a
+# genuine Xbox controller, physical Y is in the NORTH position and X is
+# WEST -- i.e. the kernel's own naming has X and Y's "standard" position
+# aliases backwards relative to Microsoft's own physical layout. Most
+# drivers/receivers compensate for this so BTN_X/BTN_Y still line up with
+# the printed labels, but not every third-party dongle or generic HID
+# driver does -- and a driver that instead exposes this controller under
+# the OLDER, pre-"gamepad" Linux joystick event set entirely (BTN_TRIGGER,
+# BTN_THUMB, BTN_TOP, BTN_BASE, ...) is common for cheap receivers too,
+# see motor_control/dump_gamepad_buttons.py's KNOWN_BUTTON_NAMES for that
+# whole set. Both are real, plausible explanations for "Y behaves like A"
+# on this project's actual hardware -- there is no way to tell which
+# (if either) applies without running that diagnostic against the real
+# controller; guessing and hardcoding a "fix" without it risks trading one
+# wrong mapping for another. robot_state_button_handler()'s arm_auto_btn/
+# record_btn/save_waypoint_btn/snapshot_btn/shutdown_btn/stop_btn
+# parameters (and the matching GAMEPAD_*_BTN environment variables
+# link/server.py reads) exist precisely so the real mapping, once known,
+# can be set without touching this file at all.
+
 PWM_SCALE = 255          # matches link/robot_state.py's PWM_MIN/PWM_MAX
+
+# Normalized (-1..1) stick movement below this counts as centered.
+#
+# Widened from 0.08 (~20/255 raw PWM units) to 30/255 (2026-09-19), after a
+# field report that the gamepad's BTN_A ("arm AUTO") never seems to actually
+# arm AUTO mode. Likely root cause, once robot_state_drive_handler() and
+# GamepadReader._read_events() are read together: _read_events() calls
+# on_drive() on EVERY EV_ABS event, including the continuous analog noise a
+# centered, untouched stick still produces -- not just a deliberate push.
+# robot_state_drive_handler()'s _on_drive() treats ANY nonzero PWM as a
+# "genuine push" and immediately forces state.set_mode("MANUAL") before
+# anything else runs. With the previous ~20-unit deadzone, this specific
+# controller's idle-stick noise (reported to reach up to +/-30 raw PWM
+# units) was enough to clear it on essentially every ABS event -- so within
+# milliseconds of BTN_A calling state.set_mode("AUTO"), the next noise event
+# forced it straight back to MANUAL. ABS events fire continuously (several
+# times a second even at rest), so this is indistinguishable from "pressing
+# A does nothing" -- there was nothing wrong with the button itself.
+#
+# Widening the deadzone to cover +/-30 raw units means that noise band now
+# normalizes to _pwm_from_axis() == 0 in the first place, so it never
+# reaches on_drive()/_on_drive() as a "push" at all, and AUTO mode stays
+# armed until an actual stick movement (or another mode change) ends it.
+# If a future controller reports even noisier idle sticks, re-run
+# motor_control/dump_gamepad_axes.py on it and raise this further rather
+# than guessing.
+AXIS_DEADZONE = 30 / PWM_SCALE  # ~0.1176 normalized (30 raw PWM units)
 RETRY_INTERVAL_S = 5.0   # how often to re-scan for a controller if none is found/it disconnects
 
 # Rumble (force feedback): Linux's FF API plays short timed "effects" (an
@@ -239,6 +328,8 @@ class GamepadReader:
         self._rumble_strong = True  # target intensity for the current/next pulse
         self._rumble_lock = threading.Lock()
         self._rumble_thread = None
+        # pulse()'s pending auto-stop timer, if any -- see pulse() below.
+        self._pulse_timer = None
 
     def start(self):
         """Starts reading in a background daemon thread."""
@@ -306,11 +397,11 @@ class GamepadReader:
                 continue
             capabilities = device.capabilities()
             has_abs = ecodes.EV_ABS in capabilities
-            has_a_button = (
-                ecodes.EV_KEY in capabilities
-                and ecodes.BTN_A in capabilities[ecodes.EV_KEY]
+            has_gamepad_button = ecodes.EV_KEY in capabilities and any(
+                getattr(ecodes, name, None) in capabilities[ecodes.EV_KEY]
+                for name in GAMEPAD_IDENTIFYING_BUTTONS
             )
-            if has_abs and has_a_button:
+            if has_abs and has_gamepad_button:
                 return device
         return None
 
@@ -389,6 +480,37 @@ class GamepadReader:
         erasing it out from under it."""
         with self._rumble_lock:
             self._rumble_active = False
+
+    def pulse(self, strong, duration_s):
+        """One-shot vibration (2026-09-18): starts rumbling at `strong`
+        intensity and reliably stops it again after `duration_s` seconds,
+        without blocking the calling thread -- unlike hand-rolling
+        start_rumble() + time.sleep() + stop_rumble(), which would freeze
+        whichever thread calls it (here, link/gps_reader.py's GPSReader
+        background thread, which needs to keep reading GPS fixes while
+        this plays out). Used by link/server.py to physically confirm a
+        live GPS fix quality change (strong on gaining DGPS, weak on
+        losing it) the instant it happens.
+
+        If a previous pulse's stop timer is still pending when this is
+        called again (e.g. the fix quality flaps quickly), that timer is
+        cancelled and replaced by this call's -- so the vibration stops
+        `duration_s` after the LATEST pulse started, not the first one,
+        and two overlapping pulses never fight over turning each other
+        off early. Safe to call with no controller connected, same
+        "degrade without crashing" convention as start_rumble()/
+        stop_rumble() themselves."""
+        with self._rumble_lock:
+            if self._pulse_timer is not None:
+                self._pulse_timer.cancel()
+            timer = threading.Timer(duration_s, self.stop_rumble)
+            timer.daemon = True
+            self._pulse_timer = timer
+            timer.start()
+        # Outside the lock -- start_rumble() takes it itself, and it also
+        # runs perfectly well even if the exact same lock re-entered here
+        # (it doesn't, but this ordering keeps that always trivially true).
+        self.start_rumble(strong=strong)
 
     def _rumble_loop(self):
         """Runs in its own thread for the lifetime of one start_rumble()/
@@ -495,60 +617,236 @@ class GamepadReader:
                     pass
 
 
-def robot_state_button_handler(state):
+def robot_state_button_handler(state, on_shutdown=None,
+                                arm_auto_btn="BTN_A", record_btn="BTN_B",
+                                save_waypoint_btn="BTN_X", snapshot_btn="BTN_Y",
+                                shutdown_btn="BTN_START", stop_btn=None):
     """Returns an on_button callback wiring the gamepad's buttons to a
     link.robot_state.RobotState -- used by link/server.py.
 
-    BTN_A arms AUTO mode -- this is the controller's "go to the next
-    point" button: as of 2026-09-07 this really drives the robot toward
-    whatever NAV/RTE last set as nav_target (see link/robot_state.py's
-    module docstring and link/autopilot.py for the heading/distance PID
-    loop this now runs on every GPS fix), not just an armed-but-inert
-    mode. BTN_B stops the robot -- same as the STP sentence (full stop:
-    motors zeroed, mode back to IDLE, any in-progress route cleared),
-    not just a hand-back to MANUAL, since a plain mode switch on its own
-    doesn't cancel whatever nav_target/route is still armed. BTN_START is
-    a second, always-available physical emergency stop, same as STP --
-    kept alongside BTN_B (redundant on purpose: two ways to stop is safer
-    than one) mirroring remote_control.py's previous convention where the
-    Start button ended the program.
+    2026-09-18 remap -- the right-hand button cluster now matches how the
+    robot is actually driven day-to-day, not the earlier NAV-focused set:
+    - arm_auto_btn (default BTN_A): re-arms AUTO mode -- moved here from
+      BTN_Y (which itself had moved here from BTN_A on 2026-09-12; see
+      git history for both).
+    - record_btn (default BTN_B): toggles video recording (CAM,REC_START/
+      REC_STOP -- genuinely implemented as of this date, see
+      camera/stream_server.py's VideoRecorder and link/robot_state.py's
+      camera_command()). "record_btn" pressed while state.is_recording is
+      False sends REC_START; pressed again, REC_STOP -- so one button
+      does both, no separate "stop recording" button needed. "si la
+      caméra est présente": if the camera script isn't running, or has no
+      frame yet, camera_command() raises CommandError, which is caught
+      and logged here rather than propagated -- see the try/except in
+      _on_button below, needed because an uncaught exception here would
+      silently kill the whole GamepadReader background thread, taking
+      every OTHER button and both sticks down with it.
+    - save_waypoint_btn (default BTN_X): appends the robot's current GPS
+      fix to a waypoints file (RobotState.save_waypoint()) -- same
+      failure-must-not-crash-the-thread reasoning as record_btn above
+      (raises CommandError with no GPS fix yet).
+    - snapshot_btn (default BTN_Y): camera snapshot (CAM,SNAP) -- the one
+      button here that already existed as a working command (via the
+      website's console), just newly reachable from the gamepad too.
+      Same try/except reasoning as record_btn/save_waypoint_btn.
+    - stop_btn (default None, i.e. NO button bound): previously BTN_B, a
+      full stop (state.stop() -- motors zeroed, mode back to IDLE, any
+      route cleared), same as the STP sentence. Removed from the default
+      right-cluster mapping above because BTN_B now records video
+      instead -- this is a DELIBERATE simplification, not an oversight,
+      made explicit here because it removes a physical emergency-stop
+      button from the controller. The remaining safety nets: any genuine
+      stick push always hands control back to MANUAL immediately, even
+      mid-AUTO (robot_state_drive_handler() below), and the website keeps
+      its own "STOP" button (sends STP instantly, no console step). If a
+      dedicated gamepad stop button is wanted after all, pass a name here
+      (or set GAMEPAD_STOP_BTN in link/server.py's environment) -- a
+      shoulder button/bumper (BTN_TL/BTN_TR), both unused by this mapping,
+      would be a reasonable choice.
+    - shutdown_btn (default BTN_START, unchanged): still stops the robot
+      first, then calls `on_shutdown` if given (link/server.py wires this
+      to actually power off the Raspberry Pi -- see
+      ControlServer._shutdown_pi() there).
+
+    Every one of the six parameters above is a NAME on evdev.ecodes,
+    resolved once here rather than hardcoded (2026-09-12, extended
+    2026-09-18) -- because this project's actual controller/receiver may
+    not report a given physical button under the evdev code its label
+    would suggest (see this module's "BUTTON MAPPING" comment above
+    DEFAULT_LEFT_Y_CODE, written after a field report that pressing "Y"
+    behaves like "A"). Passing a name here that isn't a real evdev.ecodes
+    attribute logs one clear warning instead of a silent no-op reachable
+    only by reading this source. Run `python3 -m
+    motor_control.dump_gamepad_buttons` on the Pi against the real
+    controller to find out what each physical button's ACTUAL code is,
+    then either pass the right names here or, without touching code, set
+    GAMEPAD_ARM_AUTO_BTN / GAMEPAD_RECORD_BTN / GAMEPAD_SAVE_WAYPOINT_BTN
+    / GAMEPAD_SNAPSHOT_BTN / GAMEPAD_SHUTDOWN_BTN / GAMEPAD_STOP_BTN,
+    which link/server.py reads for exactly this purpose.
+
+    The gamepad is always listened to and MANUAL always wins by default
+    (see robot_state_drive_handler() below: any genuine stick push
+    switches back to MANUAL immediately, even mid-AUTO-drive) -- there is
+    no MOD button on the website, since a physical operator should never
+    need one to take control back.
+
+    arm_auto_btn only actually arms AUTO if there is something to drive
+    toward (state.has_nav_target(): a NAV point from the website, or an
+    uploaded GPS route) -- pressing it with neither set is a silent
+    no-op rather than switching into a mode that would just sit there
+    computing nothing on every GPS fix (see link/robot_state.py's
+    _autonomous_pwm_locked()). Once armed, link/autopilot.py really
+    drives the robot toward nav_target on every GPS fix.
 
     Taking the joystick back over from an active AUTO drive is handled
     separately, in robot_state_drive_handler() below -- not here, since
     that needs to distinguish an actual stick push from the idle/centered
     stick's own analog noise, which button presses don't have."""
+    # Resolved once here (not on every call) -- guarded by _EVDEV_AVAILABLE
+    # since ecodes is None when evdev isn't installed at all (see the
+    # top of this module); _on_button below already short-circuits on
+    # that same flag before ever touching these, so None here is a safe
+    # placeholder rather than a real getattr(None, ...) crash risk.
+    # stop_btn is None by default (no button bound at all, see docstring)
+    # -- resolved the same way as the rest so a name IS still honored if
+    # one is passed, but None never triggers the "unknown name" warning
+    # below (it's a deliberate absence, not a typo).
+    button_names = {
+        "arm_auto": arm_auto_btn,
+        "record": record_btn,
+        "save_waypoint": save_waypoint_btn,
+        "snapshot": snapshot_btn,
+        "shutdown": shutdown_btn,
+        "stop": stop_btn,
+    }
+    codes = {}
+    for action, name in button_names.items():
+        if name is None:
+            codes[action] = None
+            continue
+        resolved = getattr(ecodes, name, None) if _EVDEV_AVAILABLE else None
+        codes[action] = resolved
+        if _EVDEV_AVAILABLE and resolved is None:
+            log.warning(
+                "gamepad button name %r (for %s) is not a known evdev code "
+                "-- that action will never trigger. Check the GAMEPAD_*_BTN "
+                "environment variables (or this call's matching parameter) "
+                "against `python3 -m motor_control.dump_gamepad_buttons`'s "
+                "output.",
+                name, action,
+            )
+
+    # Two actions accidentally sharing one evdev code (a copy-paste in the
+    # GAMEPAD_*_BTN environment variables, most likely) would silently
+    # shadow one of them -- only the first matching `if`/`elif` branch in
+    # _on_button below would ever fire for that code. Worth one clear
+    # warning at setup time rather than a confusing "button does nothing"
+    # report later.
+    if _EVDEV_AVAILABLE:
+        seen = {}
+        for action, code in codes.items():
+            if code is None:
+                continue
+            if code in seen:
+                log.warning(
+                    "gamepad buttons %r (%s) and %r (%s) resolve to the SAME "
+                    "evdev code -- only %s will ever trigger for that button. "
+                    "Check the GAMEPAD_*_BTN environment variables for a "
+                    "duplicate.",
+                    button_names[seen[code]], seen[code], button_names[action], action, seen[code],
+                )
+            else:
+                seen[code] = action
+
     def _on_button(code, pressed):
         if not pressed or not _EVDEV_AVAILABLE:
             return
-        if code == ecodes.BTN_A:
-            state.set_mode("AUTO")
-        elif code == ecodes.BTN_B:
+        if code == codes["arm_auto"]:
+            if state.has_nav_target():
+                state.set_mode("AUTO")
+            else:
+                log.info(
+                    "%s pressed but no nav target/route is set (send NAV "
+                    "from the website or upload a GPS route first) -- "
+                    "staying in the current mode.",
+                    arm_auto_btn,
+                )
+        elif code == codes["record"]:
+            action = "REC_STOP" if state.is_recording else "REC_START"
+            try:
+                state.camera_command(action)
+            except Exception as exc:
+                # Broad except deliberately: camera_command() can raise for
+                # plenty of ordinary reasons (camera script not running, no
+                # frame yet) and an uncaught exception here would kill this
+                # whole GamepadReader thread -- taking every other button
+                # and both sticks down with it, not just recording.
+                log.warning(
+                    "%s pressed (%s) but the camera didn't cooperate (%s) "
+                    "-- is `python3 -m camera` running?",
+                    record_btn, action, exc,
+                )
+        elif code == codes["save_waypoint"]:
+            try:
+                path = state.save_waypoint()
+                log.info("%s pressed -- saved current GPS fix to %s", save_waypoint_btn, path)
+            except Exception as exc:
+                log.warning(
+                    "%s pressed but the waypoint could not be saved (%s) "
+                    "-- is there a GPS fix yet?",
+                    save_waypoint_btn, exc,
+                )
+        elif code == codes["snapshot"]:
+            try:
+                state.camera_command("SNAP")
+            except Exception as exc:
+                log.warning(
+                    "%s pressed but the camera snapshot failed (%s) -- "
+                    "is `python3 -m camera` running?",
+                    snapshot_btn, exc,
+                )
+        elif code == codes["stop"]:
             state.stop()
-        elif code == ecodes.BTN_START:
+        elif code == codes["shutdown"]:
             state.stop()
+            if on_shutdown is not None:
+                on_shutdown()
     return _on_button
 
 
 def robot_state_drive_handler(state):
     """Returns an on_drive callback wiring the gamepad's sticks to a
-    link.robot_state.RobotState -- used by link/server.py. Forwards every
-    axis change to state.drive(), same as before, but ALSO switches back
-    to MANUAL mode first, and only when the stick is actually pushed away
-    from center (nonzero PWM on either side) -- a physical operator can
-    always take back control from an active AUTO drive by touching a
-    stick, same "manual override always wins" convention this project
-    already uses for NAV/STP clearing an in-progress route.
+    link.robot_state.RobotState -- used by link/server.py. A genuine
+    stick push (nonzero PWM on either side) switches back to MANUAL mode
+    first, then always drives -- a physical operator can always take
+    back control from an active AUTO drive by touching a stick, same
+    "manual override always wins" convention this project already uses
+    for NAV/STP clearing an in-progress route.
 
-    The nonzero gate matters: GamepadReader calls on_drive on every ABS
-    event, including the analog noise/jitter a centered, untouched stick
-    can still produce -- _pwm_from_axis maps those to (0, 0), but if
-    EVERY such call forced MANUAL, an idle stick's own noise would
-    silently cancel AUTO-mode driving moments after BTN_A armed it,
-    defeating the whole point of that button. A genuine push doesn't have
-    this problem (an idle controller doesn't produce one by definition),
-    so only a nonzero result triggers the mode switch."""
+    2026-09-12 bug fix -- an idle/centered stick no longer reaches
+    drive() at all UNLESS the robot is already in MANUAL mode: GamepadReader
+    calls on_drive on every ABS event, including the analog noise/jitter
+    a centered, untouched stick can still produce -- _pwm_from_axis maps
+    those to (0, 0). The nonzero gate below (unchanged since introduction)
+    already stopped that idle noise from FORCING MANUAL mode, but it used
+    to still call state.drive(0, 0) unconditionally regardless of mode --
+    and RobotState.drive() always zeroes left_pwm/right_pwm and tells the
+    motor driver to stop, with no regard for which mode is active. In
+    AUTO mode, that meant nearly every idle-stick event (they fire
+    continuously, several times a second, from ordinary stick noise) was
+    silently overwriting whatever PWM update_gps_fix()'s autopilot tick
+    had just computed a moment before -- the robot would arm AUTO (mode
+    really did become "AUTO") but never actually move, which is exactly
+    what got reported as "AUTO mode never engages". Routing idle (0, 0)
+    through state.is_manual() first means it's now a no-op in AUTO/IDLE
+    (autopilot's own PWM output is left alone) while still zeroing the
+    motors normally when a stick is released after a genuine MANUAL
+    drive."""
     def _on_drive(left_pwm, right_pwm):
-        if left_pwm != 0 or right_pwm != 0:
+        is_push = left_pwm != 0 or right_pwm != 0
+        if is_push:
             state.set_mode("MANUAL")
-        state.drive(left_pwm, right_pwm)
+            state.drive(left_pwm, right_pwm)
+        elif state.is_manual():
+            state.drive(left_pwm, right_pwm)
     return _on_drive

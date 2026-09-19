@@ -76,6 +76,24 @@ CAMERA_PORT_DEFAULT = 8000
 CAMERA_SNAP_PATH_DEFAULT = "/snap"
 CAMERA_SNAP_TIMEOUT = 3  # seconds -- how long to wait before giving up
 
+# CAM,REC_START/REC_STOP (2026-09-18, genuinely implemented -- see
+# camera/stream_server.py's VideoRecorder and _request_recording() below;
+# both used to always raise CommandError("09", "CAM_NOT_IMPLEMENTED...")).
+# Same cross-process HTTP pattern and same host/port as SNAP above --
+# these just hit two different endpoints on that same camera process.
+CAMERA_REC_START_PATH_DEFAULT = "/rec/start"
+CAMERA_REC_STOP_PATH_DEFAULT = "/rec/stop"
+
+# CAM,X -- link/gamepad_handler.py's save_waypoint_btn (default BTN_X, see
+# robot_state_button_handler()) -- appends the live GPS fix to this file,
+# see save_waypoint() below. Lives at <repo_root>/waypoints/waypoints.txt
+# by default (a plain text file, not inside link/ itself, same "own data
+# directory next to the code that owns it" idea as camera/tmp/ for
+# snapshots) -- override with the WAYPOINTS_FILE environment variable.
+DEFAULT_WAYPOINTS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "waypoints", "waypoints.txt"
+)
+
 
 class CommandError(Exception):
     """Raised by a handler to signal an ERR response. `code` and
@@ -126,6 +144,26 @@ class RobotState:
         self.cap = 0.0          # course over ground, degrees -- from GPRMC
         self.speed_kmh = 0.0    # from GPRMC's speed over ground
         self.last_fix_at = None
+        # DGPS fix-quality flag (2026-09-19): None until a GGA sentence
+        # with a quality field has actually arrived (see
+        # link/gps_reader.py's DGPS_QUALITY), then True/False from then on
+        # -- kept in sync by update_gps_fix() below. Distinct from a plain
+        # bool default for the same reason nav_target/current_lat/lon
+        # start as None: "no GGA received yet" and "received, not a DGPS
+        # fix" are different states, and the web UI's DGPS badge should
+        # only ever show for the former (see pages/protocole_controle.html
+        # for the STA field this backs).
+        self.is_dgps = None
+        # CAM,REC_START/REC_STOP (2026-09-18): whether camera/stream_server.
+        # py is currently believed to be writing a video file. This is
+        # this class's own bookkeeping, not a live query of the camera
+        # process -- kept in sync by camera_command() below (only flipped
+        # AFTER the corresponding HTTP call actually succeeds, so a failed
+        # REC_START never leaves this True with nothing really recording).
+        # link/gamepad_handler.py's record_btn reads this to decide
+        # whether the next press should send REC_START or REC_STOP, so
+        # one button toggles both directions.
+        self.is_recording = False
 
     # -- STP: emergency stop, highest priority -------------------------
     def stop(self):
@@ -281,6 +319,22 @@ class RobotState:
 
     # -- CAM: snapshot / recording ----------------------------------------
     def camera_command(self, action):
+        """UPDATE (2026-09-18): REC_START/REC_STOP used to always raise
+        CommandError("09", "CAM_NOT_IMPLEMENTED:...") here -- no video
+        recording code existed anywhere in this project. Both are now
+        genuinely implemented, via camera/stream_server.py's VideoRecorder
+        and _request_recording() below, mirroring SNAP's existing
+        cross-process HTTP pattern (this NMEA control link and the camera
+        script are two separate processes -- see _request_snapshot()'s
+        own docstring for why). self.is_recording is only ever flipped
+        AFTER the matching HTTP call actually succeeds, and both REC_START
+        while already recording and REC_STOP while not are treated as a
+        harmless no-op rather than an error -- link/gamepad_handler.py's
+        record_btn only ever sends whichever one is_recording says is
+        next, but the website's console can send either CAM,REC_START/
+        CAM,REC_STOP command directly at any time, and there's no useful
+        difference between "start recording, it already was" and "it just
+        started"."""
         action = (action or "").upper()
         if action not in VALID_CAM_COMMANDS:
             raise CommandError("08", f"UNKNOWN_CAM_COMMAND:{action}")
@@ -291,10 +345,26 @@ class RobotState:
                 self.last_command_at = time.time()
             return
 
-        # REC_START/REC_STOP: not implemented -- no video recording code
-        # exists in this project yet (camera/stream_server.py only ever
-        # provides the live preview and one-shot snapshots).
-        raise CommandError("09", f"CAM_NOT_IMPLEMENTED:{action}")
+        if action == "REC_START":
+            if self.is_recording:
+                with self._lock:
+                    self.last_command_at = time.time()
+                return
+            self._request_recording(start=True)
+            with self._lock:
+                self.is_recording = True
+                self.last_command_at = time.time()
+            return
+
+        # action == "REC_STOP" (the only remaining VALID_CAM_COMMANDS value)
+        if not self.is_recording:
+            with self._lock:
+                self.last_command_at = time.time()
+            return
+        self._request_recording(start=False)
+        with self._lock:
+            self.is_recording = False
+            self.last_command_at = time.time()
 
     def _request_snapshot(self):
         """Asks camera/stream_server.py (a separate process, possibly not
@@ -319,9 +389,38 @@ class RobotState:
         except urllib.error.URLError as exc:
             raise CommandError("12", f"CAMERA_UNAVAILABLE:{exc.reason}")
 
+    def _request_recording(self, start: bool):
+        """Asks camera/stream_server.py to start or stop writing the live
+        feed to a video file, via its GET /rec/start or /rec/stop endpoint
+        -- same cross-process HTTP call as _request_snapshot() above, just
+        a different path and (for /rec/start) the same 503-means-no-frame-
+        yet convention as /snap. That 503 is exactly what makes REC_START
+        "record a video if the camera is present" in practice: no camera
+        delivering frames yet is treated the same as no camera plugged in
+        at all, and turns into a clean CommandError here rather than
+        arming a recorder with nothing to encode."""
+        host = os.environ.get("CAMERA_HOST", CAMERA_HOST_DEFAULT)
+        port = int(os.environ.get("CAMERA_PORT", CAMERA_PORT_DEFAULT))
+        if start:
+            path = os.environ.get("CAMERA_REC_START_PATH", CAMERA_REC_START_PATH_DEFAULT)
+        else:
+            path = os.environ.get("CAMERA_REC_STOP_PATH", CAMERA_REC_STOP_PATH_DEFAULT)
+        url = f"http://{host}:{port}{path}"
+        try:
+            with urllib.request.urlopen(url, timeout=CAMERA_SNAP_TIMEOUT) as resp:
+                if resp.status != 200:
+                    raise CommandError("12", f"CAMERA_REC_FAILED:HTTP_{resp.status}")
+        except urllib.error.HTTPError as exc:
+            # 503 from /rec/start means "no frame yet" (mirrors /snap's own
+            # 503) -- still a clean, specific reason rather than a stack
+            # trace. /rec/stop never answers 503 (see stream_server.py).
+            raise CommandError("12", f"CAMERA_REC_FAILED:HTTP_{exc.code}")
+        except urllib.error.URLError as exc:
+            raise CommandError("12", f"CAMERA_UNAVAILABLE:{exc.reason}")
+
     # -- GPS: live fix from link.gps_reader.GPSReader, if a receiver is
     #    attached -------------------------------------------------------
-    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None):
+    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None):
         motor_output = None
         with self._lock:
             self.current_lat = lat
@@ -330,6 +429,8 @@ class RobotState:
                 self.speed_kmh = speed_kmh
             if cap is not None:
                 self.cap = cap
+            if is_dgps is not None:
+                self.is_dgps = is_dgps
             self.last_fix_at = time.time()
             self._advance_route_if_arrived()
             if self.mode == "AUTO":
@@ -411,6 +512,148 @@ class RobotState:
         heading_error = heading_error_for_pid(self.cap, bearing)
         return self.autopilot.compute(distance_m, heading_error)
 
+    # -- gamepad support: is a manual drive command currently allowed to
+    #    reach the motors? ---------------------------------------------
+    def is_manual(self):
+        """True if currently in MANUAL mode. Added 2026-09-12 alongside a
+        real bug fix in link/gamepad_handler.py's robot_state_drive_handler():
+        GamepadReader.on_drive fires on EVERY stick axis event, including
+        the analog noise/jitter an idle, centered stick still produces --
+        before this fix, that idle (0, 0) was forwarded to drive()
+        unconditionally, which zeroes left_pwm/right_pwm and tells
+        motor_driver to stop no matter what mode the robot was actually
+        in. In AUTO mode that meant every idle-stick event silently
+        cancelled whatever PWM update_gps_fix()'s autopilot tick had just
+        computed a moment earlier -- indistinguishable from "AUTO mode
+        never actually drives", which is exactly what was reported. The
+        fix: an idle/centered stick now only reaches drive() while
+        actually in MANUAL (so releasing the stick during a genuine
+        manual drive still stops the motors normally); this method is
+        what the gamepad's drive handler checks to tell the two cases
+        apart."""
+        with self._lock:
+            return self.mode == "MANUAL"
+
+    # -- gamepad support: is there anything to drive toward? ---------------
+    def has_nav_target(self):
+        """True once a target has been set via NAV or RTE (a route's first
+        waypoint sets nav_target too -- see set_route() above). Used by
+        the gamepad's "re-arm AUTO" button (BTN_Y, see
+        link/gamepad_handler.py's robot_state_button_handler()) to refuse
+        arming AUTO with nothing to drive toward, rather than switching
+        into a mode that would just sit there computing nothing every GPS
+        fix (see _autonomous_pwm_locked() above)."""
+        with self._lock:
+            return self.nav_target is not None
+
+    # -- GRT: the currently active route (for robot-webserver's map) ------
+    def get_route(self):
+        """Thread-safe read of the currently active route (the last RTE
+        upload, i.e. "GPS Driving" -- see set_route() above): a list of
+        (lat, lat_dir, lon, lon_dir) tuples, already in this protocol's
+        on-the-wire encoding, in the order they're chased. Empty once no
+        route has ever been sent, or after a fresh NAV/STP cleared it (see
+        set_nav_target()/stop()). Backs the GRT sentence (link/server.py),
+        added 2026-09-19 for robot-webserver's /control map's yellow
+        markers -- every other read of shared state in this class already
+        goes through a lock-protected method (status(), has_nav_target()),
+        this just extends that to self.route, which server.py used to read
+        directly before this method existed. Returns a copy (list(...)),
+        not the live list, so a caller holding onto the result can't end
+        up seeing a route mutated out from under it by a later RTE/NAV/STP
+        on another thread."""
+        with self._lock:
+            return list(self.route)
+
+    # -- gamepad support: save the current GPS fix as a waypoint ------------
+    def save_waypoint(self):
+        """CAM,X on the gamepad (link/gamepad_handler.py's
+        save_waypoint_btn, default BTN_X, see robot_state_button_handler())
+        -- appends the robot's current live GPS fix to a plain-text
+        waypoints file, one "lat,lon,timestamp" line per point, lat/lon in
+        plain decimal degrees.
+
+        Deliberately the SAME two-leading-columns shape robot-webserver's
+        own "GPS Driving" file upload already parses (see that project's
+        app.py/parseGpsRouteFile: one "lat,lon" per line, decimal degrees,
+        extra columns and blank/"#" lines ignored) -- so a point saved
+        here, copied off the robot, can be re-uploaded there as a route
+        with zero conversion; the timestamp is just an extra column that
+        upload already knows to ignore, kept for whoever reads the raw
+        file later.
+
+        Raises CommandError("14", "NO_GPS_FIX_YET") if there's no live fix
+        yet (no GPS receiver attached, or it hasn't produced one yet) --
+        there is nothing meaningful to save. File location is the
+        WAYPOINTS_FILE environment variable if set, else
+        DEFAULT_WAYPOINTS_FILE (<repo_root>/waypoints/waypoints.txt) --
+        read at call time, not import time, same per-call-configurable
+        pattern as CAMERA_HOST/CAMERA_PORT above. Returns the path written
+        to, so callers (link/gamepad_handler.py's _on_button) can log
+        exactly where the point went."""
+        with self._lock:
+            lat, lon = self.current_lat, self.current_lon
+        if lat is None or lon is None:
+            raise CommandError("14", "NO_GPS_FIX_YET")
+
+        path = os.environ.get("WAYPOINTS_FILE", DEFAULT_WAYPOINTS_FILE)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(path, "a") as f:
+            f.write(f"{lat:.6f},{lon:.6f},{timestamp}\n")
+
+        with self._lock:
+            self.last_command_at = time.time()
+        return path
+
+    # -- WPT: list saved waypoints (for robot-webserver's map, 2026-09-19) --
+    def list_waypoints(self):
+        """Reads and parses the waypoints file (see save_waypoint() above)
+        into a list of (lat, lon) decimal-degree tuples, in the order they
+        were saved. Backs the WPT sentence (link/server.py) that
+        robot-webserver's /control map polls for its blue markers
+        (waypoints saved via the gamepad's X button, see
+        robot_state_button_handler()'s save_waypoint_btn).
+
+        Same tolerant, line-oriented parsing as robot-webserver's own GPS-
+        route-file upload (parseGpsRouteFile in that project's app.py):
+        blank lines and lines starting with "#" are skipped, and a line
+        that isn't at least two comma-separated numbers is skipped too
+        rather than raising -- this file is hand-editable, and a single
+        stray line shouldn't take the whole WPT query down. Returns an
+        empty list if the file doesn't exist yet (no waypoint saved so
+        far), the same "nothing to report yet" convention has_nav_target()/
+        status() already use elsewhere in this class.
+
+        Deliberately does not take self._lock: this only reads a file on
+        disk, never any of this instance's own in-memory state, so there's
+        nothing here for that lock to protect (save_waypoint() itself only
+        holds it while reading current_lat/current_lon, not while writing
+        the file -- see its own comment)."""
+        path = os.environ.get("WAYPOINTS_FILE", DEFAULT_WAYPOINTS_FILE)
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return []
+
+        points = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                lat, lon = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            points.append((lat, lon))
+        return points
+
     # -- STA: status snapshot for telemetry --------------------------------
     def status(self):
         with self._lock:
@@ -423,6 +666,7 @@ class RobotState:
                 "current_lon": self.current_lon,
                 "cap": self.cap,
                 "speed_kmh": self.speed_kmh,
+                "is_dgps": self.is_dgps,
                 # Not (yet) part of the STA wire sentence -- nav_target
                 # above already reflects route progress for anything
                 # reading it today. Exposed here for tests and for a
@@ -431,4 +675,10 @@ class RobotState:
                 # change to this method's shape.
                 "route_total": len(self.route),
                 "route_index": self.route_index,
+                # Not (yet) part of the STA wire sentence either -- same
+                # extend-only reasoning as route_total/route_index above.
+                # Exposed here now that REC_START/REC_STOP genuinely track
+                # a real state (2026-09-18) for tests and any future STA
+                # extension.
+                "is_recording": self.is_recording,
             }

@@ -25,6 +25,18 @@ __pycache__/
 camera/tmp/*
 !camera/tmp/.gitkeep
 
+# Enregistrements video CAM,REC_START/REC_STOP (camera/recordings.py,
+# 2026-09-18) -- meme raisonnement que les snapshots ci-dessus : jamais
+# plus de 5 a la fois, regeneres a l'usage, rien a versionner.
+camera/recordings/*
+!camera/recordings/.gitkeep
+
+# Waypoints geo-localises sauvegardes par le bouton X de la manette
+# (link/robot_state.py's save_waypoint(), 2026-09-18) -- donnees de
+# terrain propres a chaque session, pas du code a versionner.
+waypoints/*
+!waypoints/.gitkeep
+
 # Fichiers sp�cifiques aux IDE
 .idea/
 .vscode/

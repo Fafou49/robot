@@ -45,3 +45,21 @@ def test_directory_is_created_if_missing(tmp_path):
     assert os.path.isdir(target)
     store.save(b"x")
     assert store.count() == 1
+
+
+def test_list_files_returns_newest_first(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    written = [store.save(f"frame{i}".encode()) for i in range(3)]
+    assert store.list_files() == list(reversed(written))
+
+
+def test_list_files_reflects_pruning(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    written = [store.save(f"frame{i}".encode()) for i in range(8)]
+    # Only the 5 most recent remain, still newest first.
+    assert store.list_files() == list(reversed(written[3:]))
+
+
+def test_list_files_empty_when_nothing_saved(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    assert store.list_files() == []

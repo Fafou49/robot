@@ -1,0 +1,37 @@
+[Unit]
+# Starts this project's control stack (link/server.py + camera/stream_server.py,
+# via run_robot.sh) automatically at boot -- see start_robot.sh for the
+# venv-activation step this depends on, and README.md's "Demarrage
+# automatique au boot" section for the full install/troubleshooting guide.
+Description=Robot control stack (link + camera, run_robot.sh)
+# Not a hard requirement (the control server itself doesn't need the
+# network to start listening), but the website on Pi #2 can only reach
+# this Pi once WiFi is actually up, so there's no point starting earlier.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as the same user the project is normally launched by hand as (NOT
+# root) -- this is also the user the passwordless-sudo poweroff rule in
+# README.md's "Pilotage moteur et manette" section must be configured for,
+# since that's what the gamepad's START button relies on.
+User=robot
+Group=robot
+WorkingDirectory=/home/robot/Desktop/coderobot
+ExecStart=/home/robot/Desktop/coderobot/start_robot.sh
+
+# If link/server.py (the process run_robot.sh actually waits on) ever
+# exits on its own -- a crash, not a deliberate `systemctl stop` or a
+# gamepad-triggered poweroff -- restart the whole stack automatically
+# after a short delay rather than leaving the robot uncontrollable until
+# someone notices and SSHes in.
+Restart=on-failure
+RestartSec=5
+
+# journalctl -u robot.service -f to watch these live.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

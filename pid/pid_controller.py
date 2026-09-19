@@ -62,8 +62,14 @@ def move_to_target( current_distance : float, current_angle : float):
     speed = pid_distance.update(current_distance)
     angular_velocity = pid_angle.update(current_angle)
     # Limiter les valeurs de sortie si nécessaire
-    speed = max(min(speed, 2.0), -2.0) # m/s
-    angular_velocity = max(min(angular_velocity, 360), -360)# m/s
+    # Bornes mesurees sur le robot reel le 2026-09-12 (essais full-throttle /
+    # full-rotation, PWM=255 fixe) : 0.35 m/s et 33 deg/s -- avant, ces bornes
+    # (2.0 m/s / 360 deg/s) etaient arbitraires et bien au-dessus de ce que
+    # le robot peut physiquement atteindre, ce qui faussait la conversion
+    # PWM ci-dessous (speed_pwm/angular_pwm restaient loin de saturer alors
+    # que le robot demandait deja sa pleine puissance).
+    speed = max(min(speed, 0.35), -0.35) # m/s
+    angular_velocity = max(min(angular_velocity, 33), -33)# deg/s
 
     #current_distance = pid_distance.setpoint
     #current_angle = pid_angle.setpoint
@@ -74,11 +80,11 @@ def move_to_target( current_distance : float, current_angle : float):
     wheel_base = 0.59  # Distance entre les roues (en mètres)
         
     # Convertir speed (m/s) en PWM (0-255)
-    max_speed = 2.0  # Vitesse max en m/s
+    max_speed = 0.35  # Vitesse max en m/s (mesuree sur le robot le 2026-09-12)
     speed_pwm = (speed / max_speed) * 255  # échelle de 0 à 255
 
     # Convertir angular_velocity (°/s) en PWM
-    max_angular_velocity = 360  # Vitesse angulaire max en °/s
+    max_angular_velocity = 33  # Vitesse angulaire max en °/s (mesuree le 2026-09-12)
     angular_pwm = (angular_velocity / max_angular_velocity) * 255
 
     # Appliquer aux moteurs

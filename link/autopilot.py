@@ -63,8 +63,12 @@ EARTH_RADIUS_M = 6371000.0
 # -- copied rather than imported, since that function also prints to
 # stdout and reads its own module-level PID instances, neither of which
 # this live loop wants.
-MAX_SPEED_MPS = 2.0
-MAX_ANGULAR_DEG_S = 360.0
+# Values corrected 2026-09-12 from the earlier placeholders (2.0 m/s /
+# 360 deg/s) to the robot's actual measured full-throttle / full-rotation
+# speeds (see pid/pid_controller.py's move_to_target(), corrected the same
+# day from the same field test).
+MAX_SPEED_MPS = 0.35
+MAX_ANGULAR_DEG_S = 33.0
 PWM_MAX = 255
 
 DEFAULT_DISTANCE_GAINS = (1.0, 0.0, 0.5)  # kp, ki, kd -- see honesty note above

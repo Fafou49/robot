@@ -10,12 +10,13 @@ Run with:
 import socket
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
 from link.nmea import build_sentence, nmea_to_decimal, parse_sentence
 from link.robot_state import CommandError, RobotState
-from link.server import ControlServer
+from link.server import SHUTDOWN_CMD, ControlServer
 
 
 # --- RobotState unit tests -------------------------------------------------
@@ -227,6 +228,60 @@ def test_stop_cancels_an_active_route():
     assert state.route_index == 0
 
 
+# --- has_nav_target (2026-09-12, gates the gamepad's BTN_Y) -----------------
+
+def test_has_nav_target_false_by_default():
+    state = RobotState()
+    assert state.has_nav_target() is False
+
+
+def test_has_nav_target_true_after_nav():
+    state = RobotState()
+    state.set_nav_target("4723.492", "N", "00044.340", "W")
+    assert state.has_nav_target() is True
+
+
+def test_has_nav_target_true_after_route():
+    state = RobotState()
+    state.set_route(["1", "4723.492", "N", "00044.340", "W"])
+    assert state.has_nav_target() is True
+
+
+def test_has_nav_target_false_again_after_stop():
+    # stop() (STP / BTN_B / BTN_START) cancels the route but leaves the
+    # last nav_target in place (same as today's STA behavior) -- so
+    # has_nav_target() stays True, matching "there's still something to
+    # send BTN_Y back to" rather than requiring a fresh NAV/RTE after
+    # every stop.
+    state = RobotState()
+    state.set_nav_target("4723.492", "N", "00044.340", "W")
+    state.stop()
+    assert state.has_nav_target() is True
+
+
+# --- is_manual (2026-09-12, fixes the gamepad drive handler stomping on
+#     AUTO's own PWM output -- see link/gamepad_handler.py) --------------
+
+def test_is_manual_false_by_default():
+    state = RobotState()
+    assert state.is_manual() is False
+
+
+def test_is_manual_true_after_drive():
+    # DRV / a genuine gamepad stick push switches to MANUAL.
+    state = RobotState()
+    state.drive(100, 100)
+    state.set_mode("MANUAL")
+    assert state.is_manual() is True
+
+
+def test_is_manual_false_once_auto_is_armed():
+    state = RobotState()
+    state.set_nav_target("4723.492", "N", "00044.340", "W")
+    state.set_mode("AUTO")
+    assert state.is_manual() is False
+
+
 # --- PID: live gain update (2026-09-07 -- now really tunes link.autopilot) --
 
 def test_set_pid_gains_rejects_unknown_loop():
@@ -262,13 +317,87 @@ def test_camera_command_rejects_unknown_action():
     assert exc_info.value.code == "08"
 
 
-def test_camera_command_rec_not_implemented_yet():
-    # REC_START/REC_STOP: no video recording code exists in this project
-    # yet -- only SNAP (below) actually does something now.
+def test_camera_command_rec_start_fails_cleanly_when_camera_unreachable(monkeypatch):
+    # 2026-09-18: REC_START/REC_STOP are genuinely implemented now (see
+    # camera/recordings.py's VideoRecorder) -- no camera/stream_server.py
+    # running at this port in tests, so this must turn into a clean
+    # CommandError, not a raw exception, same as SNAP already does.
+    monkeypatch.setenv("CAMERA_PORT", "1")  # nothing listens on port 1
     state = RobotState()
     with pytest.raises(CommandError) as exc_info:
         state.camera_command("REC_START")
-    assert "NOT_IMPLEMENTED" in exc_info.value.message
+    assert exc_info.value.code == "12"
+    assert state.is_recording is False  # never flips True on a failed call
+
+
+def test_camera_command_rec_start_then_stop_against_a_real_endpoint(monkeypatch):
+    # Minimal stand-in for camera/stream_server.py's /rec/start and
+    # /rec/stop -- same spirit as the SNAP round-trip test below, just
+    # checking the REC_START/REC_STOP HTTP calls and is_recording
+    # bookkeeping, not camera/recordings.py's actual VideoWriter usage
+    # (that's exercised in tests/test_stream_server.py and
+    # tests/test_recordings.py instead).
+    import http.server
+    import json
+    import threading
+
+    class RecHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if self.path == "/rec/start":
+                self.wfile.write(json.dumps({"ok": True, "recording": True}).encode())
+            else:
+                self.wfile.write(json.dumps({"ok": True, "recording": False, "file": "rec_test.mp4"}).encode())
+
+        def log_message(self, format, *args):
+            pass
+
+    mock_camera = http.server.HTTPServer(("127.0.0.1", 0), RecHandler)
+    thread = threading.Thread(target=mock_camera.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("CAMERA_HOST", "127.0.0.1")
+        monkeypatch.setenv("CAMERA_PORT", str(mock_camera.server_address[1]))
+        state = RobotState()
+        assert state.is_recording is False
+
+        state.camera_command("REC_START")
+        assert state.is_recording is True
+
+        state.camera_command("REC_STOP")
+        assert state.is_recording is False
+    finally:
+        mock_camera.shutdown()
+        mock_camera.server_close()
+
+
+def test_camera_command_rec_start_while_already_recording_is_a_no_op(monkeypatch):
+    # A direct CAM,REC_START from the website console while a
+    # gamepad-started recording is already running must not make a
+    # second, pointless HTTP call -- monkeypatching urlopen to raise lets
+    # this test prove it's never even attempted.
+    state = RobotState()
+    state.is_recording = True
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must not call the camera when already recording")
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", _fail_if_called)
+    state.camera_command("REC_START")  # must not raise, must not call urlopen
+    assert state.is_recording is True
+
+
+def test_camera_command_rec_stop_while_not_recording_is_a_no_op(monkeypatch):
+    state = RobotState()
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("must not call the camera when not recording")
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", _fail_if_called)
+    state.camera_command("REC_STOP")  # must not raise, must not call urlopen
+    assert state.is_recording is False
 
 
 def test_camera_command_snap_fails_cleanly_when_camera_unreachable(monkeypatch):
@@ -310,6 +439,152 @@ def test_camera_command_snap_succeeds_against_a_real_snap_endpoint(monkeypatch):
     finally:
         mock_camera.shutdown()
         mock_camera.server_close()
+
+
+# --- save_waypoint (gamepad's BTN_X, 2026-09-18) ----------------------------
+
+def test_save_waypoint_raises_with_no_gps_fix_yet():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.save_waypoint()
+    assert exc_info.value.code == "14"
+
+
+def test_save_waypoint_appends_a_lat_lon_timestamp_line(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "subdir" / "waypoints.txt"
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+
+    state = RobotState()
+    state.update_gps_fix(47.391534, -0.739006)
+    path = state.save_waypoint()
+
+    assert path == str(waypoints_file)
+    assert waypoints_file.exists()  # os.makedirs() created the parent dir too
+    line = waypoints_file.read_text().strip()
+    lat_str, lon_str, timestamp = line.split(",")
+    assert float(lat_str) == pytest.approx(47.391534, abs=1e-6)
+    assert float(lon_str) == pytest.approx(-0.739006, abs=1e-6)
+    assert timestamp  # non-empty -- exact format isn't this test's concern
+
+
+def test_save_waypoint_is_compatible_with_the_gps_route_upload_format(tmp_path, monkeypatch):
+    # robot-webserver's own "GPS Driving" file upload parses one
+    # "lat,lon" per line in decimal degrees, ignoring any extra columns
+    # -- this is what makes a waypoint saved here re-uploadable there
+    # with zero conversion (see save_waypoint()'s docstring).
+    waypoints_file = tmp_path / "waypoints.txt"
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+
+    state = RobotState()
+    state.update_gps_fix(47.391534, -0.739006)
+    state.save_waypoint()
+    state.update_gps_fix(48.117300, 11.516667)
+    state.save_waypoint()
+
+    def parse_gps_route_file(text):
+        # Same logic as robot-webserver's parseGpsRouteFile (JS) -- see
+        # app.py in that repo -- reimplemented here in Python just to
+        # prove this file parses the same way, not to duplicate that
+        # project's own tests.
+        points = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            points.append((float(parts[0]), float(parts[1])))
+        return points
+
+    points = parse_gps_route_file(waypoints_file.read_text())
+    assert points == [
+        pytest.approx((47.391534, -0.739006), abs=1e-6),
+        pytest.approx((48.117300, 11.516667), abs=1e-6),
+    ]
+
+
+def test_save_waypoint_appends_rather_than_overwrites(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+
+    state = RobotState()
+    state.update_gps_fix(1.0, 1.0)
+    state.save_waypoint()
+    state.update_gps_fix(2.0, 2.0)
+    state.save_waypoint()
+
+    assert len(waypoints_file.read_text().strip().splitlines()) == 2
+
+
+# --- list_waypoints() / get_route() (2026-09-19, for robot-webserver's map) -
+
+def test_list_waypoints_is_empty_when_the_file_does_not_exist_yet(tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYPOINTS_FILE", str(tmp_path / "never_written.txt"))
+    state = RobotState()
+    assert state.list_waypoints() == []
+
+
+def test_list_waypoints_parses_points_saved_via_the_gamepad(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+
+    state = RobotState()
+    state.update_gps_fix(47.391534, -0.739006)
+    state.save_waypoint()
+    state.update_gps_fix(48.117300, 11.516667)
+    state.save_waypoint()
+
+    assert state.list_waypoints() == [
+        pytest.approx((47.391534, -0.739006), abs=1e-6),
+        pytest.approx((48.117300, 11.516667), abs=1e-6),
+    ]
+
+
+def test_list_waypoints_skips_blank_comment_and_malformed_lines(tmp_path, monkeypatch):
+    # Same tolerant parsing as robot-webserver's own GPS-route-file upload
+    # -- this file is hand-editable, a stray line shouldn't break WPT.
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text(
+        "47.391534,-0.739006,2026-09-19T10:00:00\n"
+        "\n"
+        "# a comment a human added by hand\n"
+        "not,a,number\n"
+        "only_one_field\n"
+        "48.117300,11.516667,2026-09-19T10:01:00\n"
+    )
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+
+    state = RobotState()
+    assert state.list_waypoints() == [
+        pytest.approx((47.391534, -0.739006), abs=1e-6),
+        pytest.approx((48.117300, 11.516667), abs=1e-6),
+    ]
+
+
+def test_get_route_is_empty_by_default():
+    state = RobotState()
+    assert state.get_route() == []
+
+
+def test_get_route_reflects_the_active_route_after_rte():
+    state = RobotState()
+    state.set_route(["2", "4807.038", "N", "1131.000", "E", "4823.192", "N", "1152.500", "E"])
+    assert state.get_route() == [
+        ("4807.038", "N", "1131.000", "E"),
+        ("4823.192", "N", "1152.500", "E"),
+    ]
+
+
+def test_get_route_returns_a_copy_not_the_live_list():
+    # A caller mutating (or just holding onto) the returned list must
+    # never see a later RTE/NAV/STP change out from under it -- see
+    # get_route()'s own docstring.
+    state = RobotState()
+    state.set_route(["1", "4807.038", "N", "1131.000", "E"])
+    snapshot = state.get_route()
+    state.stop()  # clears state.route via set_mode(), see stop()
+    assert snapshot == [("4807.038", "N", "1131.000", "E")]
 
 
 # --- End-to-end socket tests ------------------------------------------------
@@ -400,10 +675,11 @@ def test_sta_without_nav_target_or_gps_fix_reports_placeholders(running_server):
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "STA"
     # lat, lat_dir, lon, lon_dir, cap, speed, left_pwm, right_pwm, battery,
-    # mode, target_lat, target_lat_dir, target_lon, target_lon_dir
+    # mode, target_lat, target_lat_dir, target_lon, target_lon_dir, dgps
     assert fields[:4] == ["0.0", "N", "0.0", "E"]  # no real GPS fix yet
     assert fields[4:6] == ["0.0", "0.0"]  # cap, speed
-    assert fields[10:] == ["0.0", "N", "0.0", "E"]  # no NAV received yet
+    assert fields[10:14] == ["0.0", "N", "0.0", "E"]  # no NAV received yet
+    assert fields[14] == "UNKNOWN"  # no GGA quality seen yet
 
 
 def test_sta_after_nav_reports_that_target(running_server):
@@ -412,7 +688,7 @@ def test_sta_after_nav_reports_that_target(running_server):
     response = _send_and_receive(port, build_sentence("STA"))
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "STA"
-    assert fields[10:] == ["4807.038", "N", "1131.0", "E"]
+    assert fields[10:14] == ["4807.038", "N", "1131.0", "E"]
 
 
 def test_sta_reports_a_real_gps_fix_once_one_arrives(running_server):
@@ -431,6 +707,93 @@ def test_sta_reports_a_real_gps_fix_once_one_arrives(running_server):
     assert lon == pytest.approx(-0.738500, abs=1e-4)
     assert fields[4] == "284.5"  # cap
     assert fields[5] == "3.7"    # speed_kmh
+
+
+# --- STA: DGPS field (2026-09-19) -------------------------------------------
+
+def test_sta_dgps_field_is_unknown_before_any_gga_quality_seen(running_server):
+    # update_gps_fix() without is_dgps= (e.g. an RMC-only fix, or a test
+    # like the ones above that doesn't pass it) must not silently claim
+    # "GPS" -- "no quality info yet" and "not a DGPS fix" are different
+    # states, see RobotState.is_dgps's own docstring.
+    running_server.state.update_gps_fix(47.391033, -0.738500, speed_kmh=3.7, cap=284.5)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("STA"))
+    _, fields = parse_sentence(response)
+    assert fields[14] == "UNKNOWN"
+
+
+def test_sta_dgps_field_reports_dgps_once_a_corrected_fix_arrives(running_server):
+    running_server.state.update_gps_fix(47.391033, -0.738500, is_dgps=True)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("STA"))
+    _, fields = parse_sentence(response)
+    assert fields[14] == "DGPS"
+
+
+def test_sta_dgps_field_reports_gps_for_an_uncorrected_fix(running_server):
+    running_server.state.update_gps_fix(47.391033, -0.738500, is_dgps=False)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("STA"))
+    _, fields = parse_sentence(response)
+    assert fields[14] == "GPS"
+
+
+def test_sta_dgps_field_switches_back_from_dgps_to_gps(running_server):
+    # is_dgps is meant to track the *latest* fix, not latch true forever.
+    running_server.state.update_gps_fix(47.391033, -0.738500, is_dgps=True)
+    running_server.state.update_gps_fix(47.391034, -0.738501, is_dgps=False)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("STA"))
+    _, fields = parse_sentence(response)
+    assert fields[14] == "GPS"
+
+
+# --- WPT / GRT (2026-09-19, for robot-webserver's /control map) ------------
+
+def test_wpt_over_real_socket_returns_no_points_when_none_saved_yet(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("WPT"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "WPT"
+    assert fields == ["0"]
+
+
+def test_wpt_over_real_socket_returns_saved_waypoints(running_server, tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYPOINTS_FILE", str(tmp_path / "waypoints.txt"))
+    running_server.state.update_gps_fix(47.391534, -0.739006)
+    running_server.state.save_waypoint()
+
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("WPT"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "WPT"
+    assert fields[0] == "1"
+    lat = nmea_to_decimal(fields[1], fields[2])
+    lon = nmea_to_decimal(fields[3], fields[4])
+    assert lat == pytest.approx(47.391534, abs=1e-4)
+    assert lon == pytest.approx(-0.739006, abs=1e-4)
+
+
+def test_grt_over_real_socket_returns_no_points_when_no_route_sent(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("GRT"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "GRT"
+    assert fields == ["0"]
+
+
+def test_grt_over_real_socket_returns_the_active_route_after_rte(running_server):
+    port = running_server.server_address[1]
+    _send_and_receive(port, build_sentence(
+        "RTE", 2, 4807.038, "N", 1131.000, "E", 4823.192, "N", 1152.500, "E",
+    ))
+    response = _send_and_receive(port, build_sentence("GRT"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "GRT"
+    assert fields[0] == "2"
+    assert fields[1:5] == ["4807.038", "N", "1131.0", "E"]
+    assert fields[5:9] == ["4823.192", "N", "1152.5", "E"]
 
 
 def test_rte_over_real_socket_returns_ack(running_server):
@@ -459,7 +822,7 @@ def test_sta_target_reflects_route_first_waypoint(running_server):
     response = _send_and_receive(port, build_sentence("STA"))
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "STA"
-    assert fields[10:] == ["4723.492", "N", "00044.340", "W"]
+    assert fields[10:14] == ["4723.492", "N", "00044.340", "W"]
 
 
 def test_control_server_starts_fine_without_gps_hardware(monkeypatch):
@@ -479,6 +842,35 @@ def test_control_server_starts_fine_without_gps_hardware(monkeypatch):
             server.server_address[1], build_sentence("STA")
         )
         assert parse_sentence(response)[0] == "STA"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# --- BTN_START -> ControlServer._shutdown_pi (2026-09-12) -------------------
+# subprocess.run is mocked in every test here -- this must NEVER actually
+# run `sudo poweroff` (or whatever SHUTDOWN_CMD is set to) against the
+# machine running the test suite.
+
+def test_shutdown_pi_runs_the_configured_shutdown_command(running_server):
+    with patch("link.server.subprocess.run") as mock_run:
+        running_server._shutdown_pi()
+    mock_run.assert_called_once_with(SHUTDOWN_CMD, check=True, timeout=10)
+
+
+def test_shutdown_pi_stops_serve_forever_even_if_the_shutdown_command_fails():
+    # The whole point of the try/finally in _shutdown_pi(): a missing
+    # sudoers entry (very plausible on a Pi that hasn't had the one-time
+    # setup done yet) must not leave the control server running as if
+    # nothing happened -- this robot's own scripts still need to stop.
+    server = ControlServer("127.0.0.1", 0, start_gps=False, start_motor=False, start_gamepad=False)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with patch("link.server.subprocess.run", side_effect=OSError("sudo: command not found")):
+            server._shutdown_pi()  # must not raise despite the failed subprocess call
+        thread.join(timeout=2)
+        assert not thread.is_alive()  # serve_forever() actually returned
     finally:
         server.shutdown()
         server.server_close()

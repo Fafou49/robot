@@ -48,9 +48,10 @@ _fake_clock = _FakeClock()
 pid_controller.time = _fake_clock
 
 # Constants copied from move_to_target() in pid_controller.py, so the mixing
-# math here matches the real robot code exactly.
-MAX_SPEED = 2.0               # m/s
-MAX_ANGULAR_VELOCITY = 360.0  # deg/s
+# math here matches the real robot code exactly. Corrected 2026-09-12 to the
+# robot's measured full-throttle/full-rotation speeds (was 2.0 / 360.0).
+MAX_SPEED = 0.35              # m/s
+MAX_ANGULAR_VELOCITY = 33.0   # deg/s
 PWM_LIMIT = 255.0
 
 

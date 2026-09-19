@@ -45,11 +45,25 @@ value for a differentially-corrected fix -- this project's whole point,
 see gps/dgps_transfer.py and pages/rapport_rover_dgps.html) vs anything
 else (no fix, a plain autonomous GPS fix, ...). Exposed via
 `on_gps_quality(is_dgps)`, fired only while at least one condition is
-currently being logged -- used by the gps_log_on_full_*.py scripts to
-make the gamepad rumble (see link/gamepad_handler.py) strong while the
-fix is DGPS-corrected and weak otherwise, so the driver can feel, while
-actually driving, whether the data being recorded right now has a
-trustworthy (DGPS) position fix or not -- without watching a screen.
+currently being logged.
+
+UPDATE (2026-09-18): `on_transition`/`on_gps_quality` (both below) used
+to be wired up by the gps_log_on_full_*.py scripts to make the gamepad
+rumble strong/weak via link.gamepad_handler.GamepadReader -- that wiring
+has been removed from all three of those scripts (they no longer touch
+the gamepad's rumble motor at all). Both hooks are left exactly as they
+were, generic and unused by anything in this repo right now, in case a
+future feature wants to react to "a condition just started/stopped" or
+"the live fix's DGPS quality just changed" again -- they cost nothing to
+keep and nothing here needs to change if that day comes. The actual
+DGPS-quality vibration feature this project has today lives entirely
+outside this field-test module: see link/gps_reader.py's GPSReader
+(reads the SAME kind of GGA quality field, but on the main navigation
+pipeline's live fix, not a field-test recording session) and
+link/gamepad_handler.py's GamepadReader.pulse(), wired together in
+link/server.py -- a short, one-shot buzz the instant fix quality changes
+during real operation, not a continuous buzz tied to a maneuver like the
+one this module logs.
 """
 import datetime
 import threading

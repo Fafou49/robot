@@ -11,6 +11,8 @@ should be treated as unverified until they've actually run once, e.g. on
 the Pi with requirements.txt installed:
     pytest tests/test_gps_reader.py
 """
+import types
+
 import pytest
 
 from link.nmea import decimal_to_nmea, nmea_to_decimal
@@ -92,3 +94,134 @@ def test_parse_fix_valid_gga_has_no_speed_or_course():
 def test_parse_fix_gga_no_fix_returns_none():
     line = "$GPGGA,123519,4723.492,N,00044.340,W,0,00,,,M,,M,,*48"
     assert parse_fix(line) is None
+
+
+# --- GPSReader._loop(): edge-triggered on_gps_quality (2026-09-18) ---------
+#
+# Deliberately does NOT need pynmea2/pyserial installed (unlike the
+# parse_fix tests above, which do): parse_fix() and serial.Serial are
+# both monkeypatched directly on the link.gps_reader module, the same
+# "stub the hardware-facing bit, test the pure control flow around it"
+# spirit as tests/conftest.py's evdev stub for link.gamepad_handler. This
+# is what makes it possible to actually exercise the DGPS-transition
+# logic in this sandbox at all, where neither library can be installed.
+
+class _FakeState:
+    def __init__(self):
+        self.fixes = []
+
+    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None):
+        self.fixes.append((lat, lon, speed_kmh, cap, is_dgps))
+
+
+def _run_loop_with_fixes(monkeypatch, fixes, return_state=False):
+    """Drives one GPSReader._loop() pass against a scripted list of
+    `fix` dicts (as parse_fix() would return them), stopping the loop
+    itself once they're exhausted. Returns the list of on_gps_quality
+    calls made along the way -- or, with return_state=True, a
+    (calls, state) pair so a caller can also inspect what was passed to
+    RobotState.update_gps_fix() (see _FakeState above)."""
+    import link.gps_reader as gr
+
+    monkeypatch.setattr(gr, "_GPS_LIBS_AVAILABLE", True)
+
+    index = {"i": 0}
+
+    def fake_parse_fix(line):
+        i = index["i"]
+        if i >= len(fixes):
+            return None
+        index["i"] += 1
+        return fixes[i]
+
+    monkeypatch.setattr(gr, "parse_fix", fake_parse_fix)
+
+    calls = []
+    state = _FakeState()
+    reader = gr.GPSReader(state, on_gps_quality=lambda is_dgps: calls.append(is_dgps))
+    reader._running = True
+
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def readline(self):
+            if index["i"] >= len(fixes):
+                reader._running = False  # stop _loop()'s while loop after this line
+                return b""
+            return b"$GPGGA,dummy*00\r\n"
+
+    monkeypatch.setattr(gr, "serial", types.SimpleNamespace(Serial=_FakeSerial))
+
+    reader._loop()
+    if return_state:
+        return calls, state
+    return calls
+
+
+def test_gps_reader_fires_true_the_moment_dgps_is_first_seen(monkeypatch):
+    calls = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+    ])
+    assert calls == [True]
+
+
+def test_gps_reader_does_not_fire_on_a_first_non_dgps_reading(monkeypatch):
+    # A None -> False transition is not a real "lost precision" event --
+    # the fix was simply never DGPS to begin with, see GPSReader's own
+    # docstring/comment on _last_is_dgps.
+    calls = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 1},
+    ])
+    assert calls == []
+
+
+def test_gps_reader_does_not_refire_while_quality_stays_the_same(monkeypatch):
+    calls = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+    ])
+    assert calls == [True]  # only once, on the first line
+
+
+def test_gps_reader_fires_false_when_dgps_is_lost(monkeypatch):
+    calls = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 1},
+    ])
+    assert calls == [True, False]
+
+
+def test_gps_reader_ignores_rmc_lines_with_no_quality_field(monkeypatch):
+    # An RMC fix's "quality" is always None (see parse_fix()'s docstring)
+    # -- must never be treated as a transition either way.
+    calls = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": 5.0, "cap": 90.0, "quality": None},
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+    ])
+    assert calls == [True]
+
+
+# --- GPSReader._loop(): is_dgps forwarded to RobotState.update_gps_fix() ---
+# (2026-09-19, for the STA DGPS field -- see RobotState.is_dgps)
+
+def test_gps_reader_forwards_is_dgps_none_for_rmc_only_fix(monkeypatch):
+    calls, state = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": 5.0, "cap": 90.0, "quality": None},
+    ], return_state=True)
+    assert state.fixes[0][4] is None  # is_dgps
+
+
+def test_gps_reader_forwards_is_dgps_true_for_a_dgps_gga_fix(monkeypatch):
+    calls, state = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 2},
+    ], return_state=True)
+    assert state.fixes[0][4] is True
+
+
+def test_gps_reader_forwards_is_dgps_false_for_a_non_dgps_gga_fix(monkeypatch):
+    calls, state = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 1},
+    ], return_state=True)
+    assert state.fixes[0][4] is False

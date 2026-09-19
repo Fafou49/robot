@@ -68,3 +68,13 @@ class SnapshotStore:
 
     def count(self) -> int:
         return len(self._existing_files())
+
+    def list_files(self):
+        """Snapshot filenames currently on disk, newest first -- the order
+        a UI listing (the web server's Media page) wants, as opposed to
+        _existing_files()'s oldest-first order (which is what pruning
+        wants). Also used by the stream server's file-serving route to
+        validate a requested filename against what's actually still
+        present, since a name can go stale between one listing and the
+        next request (this store keeps at most max_snapshots files)."""
+        return list(reversed(self._existing_files()))

@@ -69,6 +69,17 @@ def test_pwm_from_axis_scales_linearly():
     assert _pwm_from_axis(-0.5) == 128 or _pwm_from_axis(-0.5) == 127  # round() boundary
 
 
+def test_pwm_from_axis_deadzone_covers_documented_joystick_noise():
+    # 2026-09-19: AXIS_DEADZONE was widened from ~20 to 30 raw PWM units
+    # after a field report that BTN_A ("arm AUTO") appeared to do nothing --
+    # see AXIS_DEADZONE's own comment in link/gamepad_handler.py for the
+    # full root-cause explanation (idle-stick noise up to +/-30 units was
+    # forcing MANUAL mode back on immediately after every AUTO arm).
+    assert _pwm_from_axis(29 / 255) == 0
+    assert _pwm_from_axis(-29 / 255) == 0
+    assert abs(_pwm_from_axis(35 / 255)) > 0
+
+
 # --- GamepadReader: device discovery / graceful degradation ----------------
 
 class _FakeDevice:
@@ -131,6 +142,25 @@ def test_find_device_returns_none_when_nothing_matches(monkeypatch):
 
     reader = GamepadReader(on_drive=lambda l, r: None)
     assert reader._find_device() is None
+
+
+def test_find_device_recognizes_the_older_joystick_button_set(monkeypatch):
+    # 2026-09-18 fix: a controller/receiver reporting every button under
+    # the OLDER, pre-"gamepad" joystick set (BTN_TRIGGER instead of
+    # BTN_A) used to never be found at all -- see
+    # GAMEPAD_IDENTIFYING_BUTTONS's comment in link/gamepad_handler.py.
+    # This is the exact real-world failure mode that would make BTN_START
+    # (and every other button) silently unreachable, not just one
+    # mislabeled button.
+    old_style_gamepad = _FakeDevice(
+        "Generic USB Joystick", "/dev/input/event9",
+        {ecodes.EV_ABS: [ecodes.ABS_Y, ecodes.ABS_RZ], ecodes.EV_KEY: [ecodes.BTN_TRIGGER, ecodes.BTN_TL]},
+    )
+    monkeypatch.setattr(sys.modules["evdev"], "list_devices", lambda: [old_style_gamepad.path])
+    monkeypatch.setattr(sys.modules["evdev"], "InputDevice", lambda path: old_style_gamepad)
+
+    reader = GamepadReader(on_drive=lambda l, r: None)
+    assert reader._find_device() is old_style_gamepad
 
 
 def test_run_blocking_degrades_without_evdev(monkeypatch):
@@ -206,13 +236,35 @@ def test_read_events_dispatches_left_and_right_stick_and_button_events(monkeypat
 # --- robot_state_button_handler ---------------------------------------------
 
 class _FakeState:
-    def __init__(self):
+    def __init__(self, nav_target=None, mode="IDLE", is_recording=False,
+                 raise_on_camera=None, raise_on_waypoint=None):
         self.modes = []
         self.stop_count = 0
         self.drives = []
+        # has_nav_target() reads this -- set it in a test to simulate a
+        # NAV point or GPS route already having been sent.
+        self.nav_target = nav_target
+        # is_manual() reads this -- set it in a test to simulate the
+        # robot already being in a given mode (e.g. "MANUAL" or "AUTO").
+        # set_mode() below also updates it, same as the real RobotState,
+        # so a test that arms AUTO via set_mode and then checks is_manual
+        # sees a consistent picture.
+        self.mode = mode
+        # is_recording -- read directly by record_btn's dispatch (2026-09-18)
+        # to decide whether to send REC_START or REC_STOP next, same as
+        # the real RobotState.
+        self.is_recording = is_recording
+        self.camera_commands = []
+        self.waypoints_saved = 0
+        # Simulates camera_command()/save_waypoint() raising (e.g. no
+        # camera running, no GPS fix yet) -- both must be caught inside
+        # _on_button, never propagated (see that function's docstring).
+        self._raise_on_camera = raise_on_camera
+        self._raise_on_waypoint = raise_on_waypoint
 
     def set_mode(self, mode):
         self.modes.append(mode)
+        self.mode = mode
 
     def stop(self):
         self.stop_count += 1
@@ -220,28 +272,173 @@ class _FakeState:
     def drive(self, left_pwm, right_pwm):
         self.drives.append((left_pwm, right_pwm))
 
+    def has_nav_target(self):
+        return self.nav_target is not None
+
+    def is_manual(self):
+        return self.mode == "MANUAL"
+
+    def camera_command(self, action):
+        self.camera_commands.append(action)
+        if self._raise_on_camera is not None:
+            raise self._raise_on_camera
+        if action == "REC_START":
+            self.is_recording = True
+        elif action == "REC_STOP":
+            self.is_recording = False
+
+    def save_waypoint(self):
+        if self._raise_on_waypoint is not None:
+            raise self._raise_on_waypoint
+        self.waypoints_saved += 1
+        return "/fake/waypoints.txt"
+
 
 def test_button_handler_maps_buttons_to_state_calls():
-    # BTN_A arms AUTO (the "go to the next point" button, see
-    # link/robot_state.py); BTN_B and BTN_START are both a full stop
-    # (state.stop(), same as STP) -- redundant on purpose, see
-    # robot_state_button_handler()'s docstring.
-    state = _FakeState()
+    # 2026-09-18 remap: BTN_A re-arms AUTO (moved from BTN_Y); BTN_B
+    # toggles video recording (CAM,REC_START/REC_STOP); BTN_X saves the
+    # current GPS fix as a waypoint; BTN_Y takes a camera snapshot
+    # (CAM,SNAP); BTN_START stops the robot and additionally calls
+    # on_shutdown() -- link/server.py wires this to actually power off
+    # the Raspberry Pi. There is no default stop_btn any more (see
+    # test_button_handler_no_default_stop_button below).
+    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
+    shutdown_calls = []
+    handler = robot_state_button_handler(state, on_shutdown=lambda: shutdown_calls.append(True))
+
+    handler(ecodes.BTN_A, True)
+    handler(ecodes.BTN_B, True)   # REC_START (not recording yet)
+    handler(ecodes.BTN_B, True)   # REC_STOP (toggles back)
+    handler(ecodes.BTN_X, True)
+    handler(ecodes.BTN_Y, True)
+    handler(ecodes.BTN_START, True)
+
+    assert state.modes == ["AUTO"]
+    assert state.camera_commands == ["REC_START", "REC_STOP", "SNAP"]
+    assert state.waypoints_saved == 1
+    assert state.stop_count == 1  # only BTN_START stops now, not BTN_B
+    assert shutdown_calls == [True]
+
+
+def test_button_handler_refuses_to_arm_auto_with_no_target():
+    # Pressing arm_auto (BTN_A) with neither a NAV point nor a GPS route
+    # sent yet must not switch into AUTO -- see has_nav_target()'s own
+    # docstring for why (nothing to drive toward -- it would just sit
+    # there every GPS fix).
+    state = _FakeState(nav_target=None)
     handler = robot_state_button_handler(state)
 
     handler(ecodes.BTN_A, True)
-    handler(ecodes.BTN_B, True)
+    assert state.modes == []
+
+
+def test_button_handler_shutdown_is_optional():
+    # link/server.py always passes on_shutdown, but nothing requires
+    # every caller to: BTN_START must still stop the robot even with none
+    # given, and must not raise trying to call it.
+    state = _FakeState()
+    handler = robot_state_button_handler(state)  # no on_shutdown
+
     handler(ecodes.BTN_START, True)
-    assert state.modes == ["AUTO"]
-    assert state.stop_count == 2
+    assert state.stop_count == 1
 
 
 def test_button_handler_ignores_release_events():
-    state = _FakeState()
+    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
     handler = robot_state_button_handler(state)
     handler(ecodes.BTN_A, False)
     assert state.modes == []
     assert state.stop_count == 0
+
+
+def test_button_handler_button_codes_are_configurable():
+    # 2026-09-12/2026-09-18: if this project's actual controller/receiver
+    # reports a button under a different evdev code than assumed (the
+    # same class of quirk already hit for the right stick's axis -- see
+    # DEFAULT_RIGHT_Y_CODE), arm_auto_btn/record_btn/save_waypoint_btn/
+    # snapshot_btn/stop_btn/shutdown_btn (or the matching GAMEPAD_*_BTN
+    # env vars link/server.py reads) let it be fixed without touching
+    # this module. Here BTN_Y stands in for whatever the real "arm AUTO"
+    # button turns out to be.
+    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
+    handler = robot_state_button_handler(state, arm_auto_btn="BTN_Y")
+
+    handler(ecodes.BTN_Y, True)
+    assert state.modes == ["AUTO"]
+
+    # The default (BTN_A) must NOT still trigger it once reassigned.
+    handler(ecodes.BTN_A, True)
+    assert state.modes == ["AUTO"]
+
+
+def test_button_handler_no_default_stop_button():
+    # 2026-09-18: stop_btn defaults to None (no button bound) now that
+    # BTN_B records video instead of stopping -- a deliberate
+    # simplification, see the docstring. Pressing BTN_B (the old stop
+    # button) must record, never stop; and with stop_btn left at its
+    # None default, nothing at all reaches state.stop() except BTN_START.
+    state = _FakeState()
+    handler = robot_state_button_handler(state)
+
+    handler(ecodes.BTN_B, True)
+    assert state.stop_count == 0
+    assert state.camera_commands == ["REC_START"]
+
+
+def test_button_handler_stop_btn_can_be_rebound():
+    # A dedicated stop button can still be wired back up explicitly (the
+    # docstring suggests a shoulder button/bumper) -- BTN_X stands in for
+    # one here (distinct from save_waypoint_btn's own default so the two
+    # don't collide in this test).
+    state = _FakeState()
+    handler = robot_state_button_handler(state, save_waypoint_btn=None, stop_btn="BTN_X")
+
+    handler(ecodes.BTN_X, True)
+    assert state.stop_count == 1
+
+
+def test_button_handler_record_toggles_based_on_is_recording():
+    # record_btn reads state.is_recording to decide which command to
+    # send next -- starting already-recording must send REC_STOP first.
+    state = _FakeState(is_recording=True)
+    handler = robot_state_button_handler(state)
+
+    handler(ecodes.BTN_B, True)
+    assert state.camera_commands == ["REC_STOP"]
+
+
+def test_button_handler_record_failure_is_caught_not_raised():
+    # camera_command() can raise (camera script not running, no frame
+    # yet) -- must be logged, never propagated, or an uncaught exception
+    # here would kill the whole GamepadReader thread, taking every other
+    # button and both sticks down with it (see the docstring).
+    state = _FakeState(raise_on_camera=RuntimeError("camera down"))
+    handler = robot_state_button_handler(state)
+
+    handler(ecodes.BTN_B, True)  # must not raise
+    handler(ecodes.BTN_Y, True)  # must not raise (snapshot uses the same path)
+
+
+def test_button_handler_save_waypoint_failure_is_caught_not_raised():
+    # Same "never crash the thread" reasoning as record/snapshot above --
+    # e.g. no GPS fix yet.
+    state = _FakeState(raise_on_waypoint=RuntimeError("no fix yet"))
+    handler = robot_state_button_handler(state)
+
+    handler(ecodes.BTN_X, True)  # must not raise
+    assert state.waypoints_saved == 0
+
+
+def test_button_handler_warns_on_duplicate_button_codes(caplog):
+    # Two actions accidentally sharing one evdev code (a copy-paste in
+    # the GAMEPAD_*_BTN environment variables, most likely) should log
+    # one clear warning at setup time rather than silently shadowing one
+    # of them.
+    with caplog.at_level("WARNING", logger="link.gamepad_handler"):
+        robot_state_button_handler(_FakeState(), arm_auto_btn="BTN_A", snapshot_btn="BTN_A")
+
+    duplicate_warnings = [r for r in caplog.records if "SAME evdev code" in r.message]
+    assert len(duplicate_warnings) == 1
 
 
 # --- robot_state_drive_handler -----------------------------------------------
@@ -265,6 +462,31 @@ def test_drive_handler_does_not_force_manual_on_idle_zero_output():
 
     handler(0, 0)
     assert state.modes == []
+    assert state.drives == []
+
+
+def test_drive_handler_idle_zero_output_does_not_touch_the_motors_outside_manual():
+    # 2026-09-12 bug fix: outside MANUAL (AUTO here), an idle stick's
+    # (0, 0) must not reach state.drive() at all -- it used to, and that
+    # silently zeroed whatever PWM the autopilot had just computed on the
+    # last GPS fix, which looked exactly like "AUTO mode never engages".
+    state = _FakeState(mode="AUTO")
+    handler = robot_state_drive_handler(state)
+
+    handler(0, 0)
+    assert state.modes == []
+    assert state.drives == []
+
+
+def test_drive_handler_still_zeroes_motors_on_release_during_manual_drive():
+    # Releasing the stick after a genuine MANUAL drive must still stop
+    # the motors normally -- only AUTO/IDLE are protected from idle
+    # (0, 0) noise, not an actual ongoing manual drive.
+    state = _FakeState(mode="MANUAL")
+    handler = robot_state_drive_handler(state)
+
+    handler(0, 0)
+    assert state.modes == []
     assert state.drives == [(0, 0)]
 
 
@@ -275,6 +497,51 @@ def test_drive_handler_forces_manual_when_only_one_side_is_nonzero():
     handler(0, -128)  # e.g. only the right stick pushed
     assert state.modes == ["MANUAL"]
     assert state.drives == [(0, -128)]
+
+
+def test_read_events_and_drive_handler_together_survive_the_documented_joystick_noise():
+    # End-to-end regression for the 2026-09-19 AXIS_DEADZONE fix: wires a
+    # REAL GamepadReader._read_events() (not just _pwm_from_axis in
+    # isolation) straight into robot_state_drive_handler(), and feeds it a
+    # single raw ABS event of exactly the magnitude reported as idle-stick
+    # noise on the field controller (see AXIS_DEADZONE's comment).
+    #
+    # raw=3727 on a standard signed 16-bit axis (-32768..32767) normalizes
+    # to ~0.11376 -- just BELOW the new deadzone (30/255 ~= 0.11765) but
+    # ABOVE the old one (0.08). Before this fix, this exact event would
+    # have produced a nonzero PWM, reached on_drive(), and forced AUTO
+    # straight back to MANUAL -- undoing an arm_auto_btn press within
+    # milliseconds, since ABS events fire continuously. After the fix, it
+    # must normalize to (0, 0) and leave an active AUTO mode untouched.
+    state = _FakeState(mode="AUTO")
+    drive_handler = robot_state_drive_handler(state)
+
+    AbsInfo = types.SimpleNamespace
+    device = _FakeDevice(
+        "Xbox Wireless Controller", "/dev/input/event7",
+        {
+            ecodes.EV_ABS: [ecodes.ABS_Y, ecodes.ABS_RZ],
+            ecodes.EV_KEY: [ecodes.BTN_A],
+        },
+        events=[_Event(ecodes.EV_ABS, ecodes.ABS_Y, 3727)],  # documented noise level
+    )
+    device._capabilities["absinfo"] = {ecodes.EV_ABS: [
+        (ecodes.ABS_Y, AbsInfo(min=-32768, max=32767)),
+        (ecodes.ABS_RZ, AbsInfo(min=-32768, max=32767)),
+    ]}
+
+    def _capabilities(absinfo=False):
+        if absinfo:
+            return device._capabilities["absinfo"]
+        return {k: v for k, v in device._capabilities.items() if k != "absinfo"}
+    device.capabilities = _capabilities
+
+    reader = GamepadReader(on_drive=drive_handler)
+    reader._running = True
+    reader._read_events(device)
+
+    assert state.modes == []  # AUTO must NOT have been knocked back to MANUAL
+    assert state.drives == []  # and the autopilot's own PWM must be left alone
 
 
 # --- GamepadReader: rumble (force feedback) ---------------------------------
@@ -446,6 +713,82 @@ def test_start_rumble_on_an_active_vibration_updates_intensity_in_place(monkeypa
 
     uploads = [c for c in device.ff_calls if c[0] == "upload"]
     assert uploads[-1][1].effect.ff_rumble_effect.strong_magnitude == gh.RUMBLE_WEAK_MAGNITUDE
+
+
+# --- GamepadReader: pulse() (one-shot vibration, 2026-09-18) ---------------
+
+def test_pulse_starts_rumble_and_stops_it_after_duration(monkeypatch):
+    import link.gamepad_handler as gh
+    monkeypatch.setattr(gh, "RUMBLE_REFRESH_S", 0.01)
+    device = _FakeDevice(
+        "Xbox Wireless Controller", "/dev/input/event7",
+        {ecodes.EV_FF: [ecodes.FF_RUMBLE]},
+    )
+    reader = GamepadReader(on_drive=lambda l, r: None)
+    reader._device = device
+
+    reader.pulse(strong=True, duration_s=0.05)
+    assert reader._rumble_active is True
+    time.sleep(0.15)  # well past the 0.05s pulse duration
+    assert reader._rumble_active is False
+    reader._rumble_thread.join(timeout=1)
+
+    uploads = [c for c in device.ff_calls if c[0] == "upload"]
+    assert uploads[0][1].effect.ff_rumble_effect.strong_magnitude == gh.RUMBLE_STRONG_MAGNITUDE
+
+
+def test_pulse_weak_uses_the_weak_magnitude(monkeypatch):
+    import link.gamepad_handler as gh
+    monkeypatch.setattr(gh, "RUMBLE_REFRESH_S", 0.01)
+    device = _FakeDevice(
+        "Xbox Wireless Controller", "/dev/input/event7",
+        {ecodes.EV_FF: [ecodes.FF_RUMBLE]},
+    )
+    reader = GamepadReader(on_drive=lambda l, r: None)
+    reader._device = device
+
+    reader.pulse(strong=False, duration_s=0.05)
+    time.sleep(0.15)
+    reader._rumble_thread.join(timeout=1)
+
+    uploads = [c for c in device.ff_calls if c[0] == "upload"]
+    assert uploads[0][1].effect.ff_rumble_effect.strong_magnitude == gh.RUMBLE_WEAK_MAGNITUDE
+
+
+def test_pulse_called_again_resets_the_stop_timer(monkeypatch):
+    # A second pulse() before the first one's timer fires must cancel and
+    # replace it -- the vibration should stop duration_s after the LATEST
+    # call, not the first one (see pulse()'s docstring: "the fix quality
+    # flaps quickly" is the real-world scenario this protects).
+    import link.gamepad_handler as gh
+    monkeypatch.setattr(gh, "RUMBLE_REFRESH_S", 0.01)
+    device = _FakeDevice(
+        "Xbox Wireless Controller", "/dev/input/event7",
+        {ecodes.EV_FF: [ecodes.FF_RUMBLE]},
+    )
+    reader = GamepadReader(on_drive=lambda l, r: None)
+    reader._device = device
+
+    reader.pulse(strong=True, duration_s=0.1)
+    time.sleep(0.05)
+    reader.pulse(strong=False, duration_s=0.1)  # resets the timer -- should still be active at +0.08s
+    time.sleep(0.08)
+    assert reader._rumble_active is True  # would be False already without the reset
+    time.sleep(0.15)
+    assert reader._rumble_active is False
+    reader._rumble_thread.join(timeout=1)
+
+
+def test_pulse_is_safe_with_no_controller_connected(monkeypatch):
+    # Same "degrade without crashing" convention as start_rumble()/
+    # stop_rumble() themselves.
+    import link.gamepad_handler as gh
+    monkeypatch.setattr(gh, "RUMBLE_REFRESH_S", 0.01)
+    reader = GamepadReader(on_drive=lambda l, r: None)
+
+    reader.pulse(strong=True, duration_s=0.05)  # must not raise
+    time.sleep(0.1)
+    reader._rumble_thread.join(timeout=1)
 
 
 # --- _supports_ff_rumble / the "vibrations don't work" fix (2026-09-11) -----

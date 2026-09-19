@@ -28,22 +28,20 @@ full throttle. Nothing is written while at least one motor is below 255
 -- an empty (or marker-only) log file after a session just means full
 throttle was never reached, not a bug.
 
-While a full-throttle period is being logged, the gamepad also vibrates
-continuously (link.gamepad_handler.GamepadReader.start_rumble(), wired
-below via ConditionGPSLogger's on_transition callback) -- physical
-confirmation for the driver that this exact moment is being recorded,
-without needing to glance at a screen. Stops the instant full throttle
-drops (a START/END marker pair with nothing logged in between, if it's
-ever that brief, still buzzes and un-buzzes accordingly).
-
-The vibration is also strong or weak depending on GPS fix quality
-(on_gps_quality below, driven by the GGA sentence's quality field --
-see motor_control/gps_condition_logger.py's DGPS_QUALITY): strong while
-the current fix is DGPS-corrected, weak otherwise. So a strong buzz
-while recording means the position data landing in the log right now
-can be trusted; a weak one is a live warning that this stretch of the
-log has a degraded (non-DGPS) fix, worth re-doing once DGPS comes back
-rather than discovering it only after the fact when analyzing the log.
+UPDATE (2026-09-18): this script used to also buzz the gamepad
+continuously for as long as a full-throttle period was being logged
+(link.gamepad_handler.GamepadReader.start_rumble(), wired via
+ConditionGPSLogger's on_transition/on_gps_quality callbacks below, strong
+or weak depending on live GPS fix quality) -- that vibration wiring has
+been removed (this field-test tool no longer touches the gamepad's rumble
+motor at all). See link/gamepad_handler.py's module docstring and
+link/gps_reader.py for the vibration feature that replaced it: a short,
+one-shot pulse on link/server.py's REAL control link the instant the
+live GPS fix's quality actually changes during real operation, not a
+continuous buzz tied to a field-test maneuver like this one.
+gps_condition_logger.py's on_transition/on_gps_quality hooks themselves
+still exist (unused by this script now) in case a future feature wants
+them again.
 
 Honesty note (same caveat as link/gps_reader.py): pyserial, evdev and
 gpiod (Remote's own dependencies) could not be installed in the sandbox
@@ -92,27 +90,8 @@ def main():
         )
     remote = Remote()
 
-    def _on_transition(trigger_name, triggered):
-        # Buzz the gamepad for as long as (and only while) this exact
-        # maneuver is being logged -- see the module docstring above.
-        # Seed the intensity with whatever fix quality is already known
-        # (gps_logger.last_is_dgps) so the very first pulse is already
-        # right, instead of starting strong/weak by default and waiting
-        # for the next GGA line (up to ~1s later) to correct it.
-        if triggered:
-            remote.gamepad.start_rumble(strong=gps_logger.last_is_dgps)
-        else:
-            remote.gamepad.stop_rumble()
-
-    def _on_gps_quality(is_dgps):
-        # Called only while this maneuver is actively being logged (see
-        # gps_condition_logger.py) -- keeps the vibration's intensity in
-        # sync with the fix quality of the data being recorded right now.
-        remote.gamepad.set_intensity(strong=is_dgps)
-
     gps_logger = ConditionGPSLogger(
         remote, is_full_throttle, LOG_PATH, trigger_name="FULL_THROTTLE",
-        on_transition=_on_transition, on_gps_quality=_on_gps_quality,
     )
     gps_logger.start()
     # Remote.fonction1() is itself a `while True` (waits for the gamepad,

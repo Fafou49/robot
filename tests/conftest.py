@@ -90,6 +90,12 @@ ecodes = types.SimpleNamespace(
     EV_KEY=1, EV_ABS=3, EV_FF=21,
     ABS_Y=1, ABS_Z=2, ABS_RY=4, ABS_RZ=5,
     BTN_A=304, BTN_B=305, BTN_X=307, BTN_Y=308, BTN_START=315,
+    # Older, pre-"gamepad" Linux joystick event set (2026-09-18) -- see
+    # link/gamepad_handler.py's GAMEPAD_IDENTIFYING_BUTTONS: some
+    # controllers/receivers report every button under this set instead of
+    # the modern BTN_A/B/X/Y one above, and device discovery needs to
+    # recognize that too.
+    BTN_TRIGGER=288, BTN_TL=310, BTN_TR=311,
     FF_RUMBLE=80,
 )
 

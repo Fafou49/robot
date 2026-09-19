@@ -35,12 +35,17 @@ vit dans un dépôt séparé.
 │   ├── gps_reader.py   # Lecture GPS en tâche de fond (voir plus bas)
 │   ├── gamepad_handler.py # Lecture manette (evdev), tâche de fond -- alimente le même RobotState que le TCP (voir plus bas)
 │   └── server.py        # Serveur TCP (socketserver), démarre aussi motor_driver + gamepad_handler
-├── camera/             # Flux caméra en direct + snapshots (voir plus bas) -- processus séparé de link/, relié par HTTP local
+├── camera/             # Flux caméra en direct + snapshots + enregistrement vidéo (voir plus bas) -- processus séparé de link/, relié par HTTP local
 │   ├── stream_server.py
-│   └── snapshots.py    # Stockage des snapshots, jamais plus de 5 fichiers
+│   ├── snapshots.py    # Stockage des snapshots (CAM,SNAP), jamais plus de 5 fichiers
+│   └── recordings.py   # Stockage des enregistrements vidéo (CAM,REC_START/REC_STOP, 2026-09-18), jamais plus de 5 fichiers
+├── waypoints/          # Points GPS sauvegardés par le bouton X de la manette (link/robot_state.py's save_waypoint(), 2026-09-18) -- donnees de terrain, pas du code
 ├── archive/            # Anciennes versions gardées pour référence (voir plus bas), dont pwm_2026.py (ancien motor_control/pwm.py, remplacé par motor_control/motor_driver.py)
 ├── tests/              # Tests automatisés (pytest)
+├── systemd/            # Unité systemd pour le démarrage automatique au boot (voir plus bas)
+│   └── robot.service
 ├── run_robot.sh        # Lance link/server.py + camera/stream_server.py ensemble, arrêt propre des deux au Ctrl+C (voir plus bas)
+├── start_robot.sh      # Point d'entrée au boot (2026-09-19) : active le venv puis lance run_robot.sh (voir plus bas)
 ├── requirements.txt
 └── .env.example        # Modèle pour les identifiants NTRIP et de la caméra (voir plus bas)
 ```
@@ -151,8 +156,10 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
   `camera/stream_server.py` (processus séparé, en HTTP local — voir section
   dédiée ci-dessous) et répond `ACK`/`ERR` selon que ça réussit ou non
   (caméra éteinte, pas encore de trame disponible...). `CAM,REC_START` et
-  `CAM,REC_STOP` répondent toujours `ERR` (`CAM_NOT_IMPLEMENTED`) —
-  l'enregistrement vidéo n'existe pas dans le projet à ce jour.
+  `CAM,REC_STOP` (implémentés depuis le 2026-09-18, voir la section
+  "Enregistrement vidéo" plus bas — ils répondaient auparavant toujours
+  `ERR CAM_NOT_IMPLEMENTED`) appellent de la même façon `GET /rec/start`/
+  `GET /rec/stop` et démarrent/arrêtent un vrai enregistrement vidéo.
 - `STA` (sans champ, en requête) répond avec l'état courant : position
   *courante* (`lat`/`lat_dir`/`lon`/`lon_dir`), `cap` et `speed` sont lus
   pour de vrai depuis un récepteur GPS série par `link/gps_reader.py` (voir
@@ -161,8 +168,27 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
   (`target_lat`/`target_lat_dir`/`target_lon`/`target_lon_dir`, dernière
   trame `NAV` reçue), `left_pwm`/`right_pwm` et `mode` sont réels dès
   aujourd'hui. `batterie` reste à 0 (aucun capteur de batterie dans le
-  projet). Tout ça alimente le bandeau de statut et l'onglet "TCP" de
-  `/control` sur le site web.
+  projet). Depuis le 2026-09-19, un champ `dgps` a été ajouté en fin de
+  trame (extension, les champs existants ne bougent pas) : `"DGPS"` dès
+  qu'une trame GGA a rapporté un fix corrigé en différentiel
+  (`link/gps_reader.py`, `DGPS_QUALITY`), `"GPS"` dès qu'une trame GGA a
+  rapporté un fix non corrigé, `"UNKNOWN"` tant qu'aucune trame GGA avec
+  indicateur de qualité n'a encore été reçue (pas de récepteur branché,
+  uniquement des trames RMC jusqu'ici, ou pas encore de fix) — voir
+  `RobotState.is_dgps`. Tout ça alimente le bandeau de statut et l'onglet
+  "TCP" de `/control` sur le site web.
+- `WPT` et `GRT` (2026-09-19, nouvelles trames en requête, sans champ) :
+  ajoutées pour la carte GPS de `/control` sur le site web (voir le dépôt
+  `robot-webserver`). `WPT` répond avec tous les points sauvegardés par le
+  bouton `X` de la manette (`RobotState.list_waypoints()`, relit
+  `waypoints/waypoints.txt`) — mêmes champs qu'`RTE` (`count` puis
+  `count` × `lat,lat_dir,lon,lon_dir`), converti au format ddmm.mmmm au
+  passage puisque le fichier stocke des degrés décimaux bruts. `GRT`
+  répond avec la route actuellement active (`RobotState.get_route()`,
+  donc vide tant qu'aucun `RTE` n'a été envoyé, ou après un `STP`/`NAV`
+  qui l'a annulée) — déjà au format ddmm.mmmm, donc renvoyée telle quelle.
+  Ni l'une ni l'autre ne modifie l'état du robot : ce sont de pures
+  lectures, comme `STA`.
 
 ## Pilotage moteur et manette (`motor_control/motor_driver.py`, `link/gamepad_handler.py`)
 
@@ -184,15 +210,75 @@ schéma ci-dessous) :
   gauche/droit) et `RobotState.set_mode()` (boutons) -- la manette et les
   trames TCP du site web sont deux entrées symétriques du même état, ni
   l'une ni l'autre ne touche au GPIO directement.
-- Boutons de la manette (voir `robot_state_button_handler()`) : `A` arme
-  le mode `AUTO` (c'est le bouton "vas-y jusqu'au point suivant" physique
-  -- voir plus bas, il pilote vraiment le robot depuis le 2026-09-07),
-  `B` déclenche un arrêt complet (`state.stop()`, même effet que `STP` :
-  moteurs coupés, mode remis à `IDLE`, route en cours annulée), `START`
-  fait la même chose -- deux boutons d'arrêt redondants exprès, plus sûr
-  qu'un seul. Toucher un stick reprend toujours la main en `MANUAL`,
-  même en pleine conduite `AUTO` (voir `robot_state_drive_handler()`) --
-  un opérateur physique peut toujours reprendre le contrôle.
+- Boutons de la manette (voir `robot_state_button_handler()`) -- la
+  manette est écoutée en permanence et le mode `MANUAL` reprend toujours
+  la main dès qu'un stick est réellement bougé, même en pleine conduite
+  `AUTO` (voir `robot_state_drive_handler()`) -- il n'y a donc pas de
+  bouton `MOD` sur le site, un opérateur physique n'en a jamais besoin
+  pour reprendre le contrôle.
+
+  **Remap du 2026-09-18 (cluster droit `A`/`B`/`X`/`Y`)** -- remplace
+  totalement le mapping du 2026-09-12 :
+  - **`A`** (déplacé depuis `Y`) : réarme le mode `AUTO`, mais seulement
+    s'il y a déjà une cible (`NAV` envoyé depuis le site, ou une route GPS
+    importée) -- appuyer dessus sans cible ne fait rien
+    (`RobotState.has_nav_target()`), plutôt que d'armer un mode qui ne
+    calculerait rien à chaque trame GPS.
+  - **`B`** (nouveau -- remplace l'ancien arrêt complet) : démarre/arrête
+    l'enregistrement vidéo (`CAM,REC_START`/`CAM,REC_STOP`, voir la
+    section "Flux caméra en direct" plus bas) -- une pression bascule
+    entre les deux selon `RobotState.is_recording`. Ne fait rien de
+    dangereux si la caméra n'est pas branchée/pas prête : l'appel échoue
+    proprement (voir la caméra ci-dessous), c'est juste enregistré dans
+    les logs, pas propagé plus loin.
+  - **`X`** (nouveau) : enregistre le point GPS courant (`RobotState.
+    save_waypoint()`) dans un fichier `waypoints/waypoints.txt` à la
+    racine du dépôt (personnalisable via `WAYPOINTS_FILE`, voir
+    `.env.example`) -- une ligne `lat,lon,timestamp` en degrés décimaux
+    par point, volontairement le même format `lat,lon` (colonnes en plus
+    ignorées) que l'upload "GPS Driving" du site web (`robot-webserver`),
+    pour pouvoir réutiliser un point sauvegardé ici comme route sans
+    aucune conversion. Ne fait rien s'il n'y a pas encore de fix GPS.
+  - **`Y`** (déplacé depuis l'ancien `X`, N/A avant cette date) : prend un
+    instantané de la caméra (`CAM,SNAP`) -- commande déjà existante côté
+    site web, juste rendue accessible depuis la manette aussi.
+  - **`START`** (inchangé) : arrête le robot puis éteint la Raspberry Pi
+    -- voir la note sudo ci-dessous et surtout la section "`START`
+    n'éteint pas la Pi" un peu plus bas, qui couvre TOUTES les causes
+    connues, pas seulement la config sudo.
+  - **Plus de bouton d'arrêt complet dédié sur la manette** : `B`
+    enregistrait vidéo maintenant à la place de l'ancien arrêt complet --
+    **choix délibéré, pas un oubli** (voir le docstring de
+    `robot_state_button_handler()`), documenté ici parce qu'il retire un
+    bouton d'arrêt d'urgence physique de la manette. Deux filets de
+    sécurité restent : n'importe quel mouvement de stick reprend
+    immédiatement la main en `MANUAL`, même en pleine conduite `AUTO`, et
+    le site web garde son propre bouton "STOP" (envoie `STP`
+    instantanément, sans étape console). Pour remettre un bouton d'arrêt
+    dédié sur la manette, régler `GAMEPAD_STOP_BTN` (voir `.env.example`)
+    sur un bouton libre, par exemple une gâchette/butée d'épaule
+    (`BTN_TL`/`BTN_TR`, non utilisées par ce mapping).
+
+  Tous ces boutons se règlent sans toucher au code via
+  `GAMEPAD_ARM_AUTO_BTN`/`GAMEPAD_RECORD_BTN`/`GAMEPAD_SAVE_WAYPOINT_BTN`/
+  `GAMEPAD_SNAPSHOT_BTN`/`GAMEPAD_SHUTDOWN_BTN`/`GAMEPAD_STOP_BTN` (voir
+  `.env.example`), pour la même raison que d'habitude dans ce projet : la
+  manette/récepteur réellement utilisés ici peuvent reporter un bouton
+  sous un code évdev différent de celui que son étiquette suggère --
+  section "`Y` se comporte comme `A`" plus bas.
+
+  **Configuration requise pour `START` (`sudo poweroff` sans mot de
+  passe)** : l'utilisateur qui lance `run_robot.sh` doit pouvoir exécuter
+  la commande de `SHUTDOWN_CMD` (par défaut `sudo poweroff`) sans qu'un
+  mot de passe soit demandé, sinon `_shutdown_pi()` échoue silencieusement
+  côté extinction (elle logue une erreur, et arrête quand même les
+  scripts Python de ce robot). Sur Raspberry Pi OS, ça se configure avec
+  `sudo visudo -f /etc/sudoers.d/robot-shutdown` et une ligne comme :
+  ```
+  robot ALL=(ALL) NOPASSWD: /usr/sbin/poweroff
+  ```
+  (remplacer `robot` par le nom d'utilisateur réel, et adapter le chemin
+  si `SHUTDOWN_CMD` est personnalisé -- `which poweroff` pour le vérifier).
 
 ```mermaid
 flowchart TB
@@ -215,8 +301,9 @@ depuis le 2026-09-07 le mode `AUTO` aussi : `link/autopilot.py` calcule,
 `nav_target` (posé par `NAV` ou `RTE`), les passe dans deux
 `PIDController` (distance, cap) et envoie le résultat aux moteurs --
 exactement ce que faisait un `DRV` manuel, mais calculé automatiquement.
-`RTE` avance donc vraiment de point en point tout seul une fois `A`
-appuyé. **Limite réelle, pas cachée** : il n'y a pas de boussole/IMU sur
+`RTE` avance donc vraiment de point en point tout seul une fois `Y`
+appuyé (`A` avant le 2026-09-12, voir la section "Pilotage moteur et
+manette" plus haut). **Limite réelle, pas cachée** : il n'y a pas de boussole/IMU sur
 ce robot -- le seul cap disponible est le cap sur le fond (`cap`, trame
 GPRMC du GPS), qui n'a de sens que si le robot est déjà en mouvement ;
 à l'arrêt ou juste après un départ, il peut être bruité/périmé et faire
@@ -267,6 +354,181 @@ autre récepteur est utilisé un jour et suit le mapping standard après
 tout, ne pas revenir en arrière à l'aveugle -- relancer
 `dump_gamepad_axes.py` sur ce matériel précis d'abord.
 
+**Deux bugs corrigés suite à un retour terrain (2026-09-12) : "`Y` et
+`START` ne fonctionnent pas comme prévu" et "le mode `AUTO` ne s'enclenche
+jamais".**
+
+1. **`AUTO` s'armait (le mode passait bien à `AUTO`) mais le robot ne
+   bougeait jamais.** Cause réelle : `robot_state_drive_handler()`
+   (appelée à *chaque* évènement d'axe, y compris le bruit analogique
+   d'un stick immobile/centré -- `_pwm_from_axis` ramène ça à `(0, 0)`)
+   appelait `state.drive(0, 0)` sans condition, quel que soit le mode
+   actif. Or `RobotState.drive()` remet toujours `left_pwm`/`right_pwm`
+   à zéro et coupe les moteurs, sans regarder le mode -- en `AUTO`, ce
+   `(0, 0)` du stick immobile (qui arrive plusieurs fois par seconde)
+   écrasait donc systématiquement le PWM que l'autopilote venait de
+   calculer à la dernière trame GPS, juste après. Corrigé en ajoutant
+   `RobotState.is_manual()` : un stick centré ne touche plus du tout aux
+   moteurs tant que le mode n'est pas déjà `MANUAL` (relâcher le stick
+   pendant une conduite manuelle continue de couper les moteurs
+   normalement, c'est uniquement l'idle en `AUTO`/`IDLE` qui est
+   maintenant ignoré).
+2. **`Y` et `START` "ne répondent pas comme prévu"** : même famille de bug
+   que le stick droit ci-dessus (une manette/un récepteur qui ne suit pas
+   le mapping "standard" xpad), mais côté boutons cette fois --
+   `robot_state_button_handler()` comparait les codes évdev reçus à des
+   constantes figées (`ecodes.BTN_Y`/`ecodes.BTN_START`) sans aucun moyen
+   de les corriger sans modifier le code. Elle accepte maintenant les
+   noms des boutons en paramètres (`arm_auto_btn`/`stop_btn`/
+   `shutdown_btn`, résolus dynamiquement sur `evdev.ecodes`), et
+   `link/server.py` les lit depuis `GAMEPAD_ARM_AUTO_BTN`/
+   `GAMEPAD_STOP_BTN`/`GAMEPAD_SHUTDOWN_BTN` (voir `.env.example`) --
+   valeurs par défaut inchangées (`BTN_Y`/`BTN_B`/`BTN_START`). Reste à
+   confirmer sur le vrai matériel : lancer
+   `python3 -m motor_control.dump_gamepad_buttons` (voir section
+   suivante), appuyer sur `Y` et `Start`, et si le code affiché n'est pas
+   `BTN_Y`/`BTN_START`, régler la variable d'environnement correspondante
+   sur le nom réel (sans toucher au code, même principe que
+   `DEFAULT_RIGHT_Y_CODE` pour l'axe droit).
+
+### Retour terrain (2026-09-18) : "`Y` se comporte comme `A`", et pourquoi `START` n'éteint pas la Pi
+
+**"`Y` se comporte comme `A`"** : relu la documentation `evdev` et le code
+de `link/gamepad_handler.py`/`robot_state_button_handler()` en détail --
+deux explications réelles et plausibles, documentées directement dans le
+commentaire "BUTTON MAPPING" en haut de `link/gamepad_handler.py`, et il
+n'est pas possible de trancher entre les deux sans lancer le diagnostic
+sur le matériel réel :
+
+1. `evdev.ecodes.BTN_A`/`BTN_B`/`BTN_X`/`BTN_Y` ne sont **pas** des codes
+   indépendants : ce sont des alias que le noyau Linux définit sur un jeu
+   de codes positionnels -- `BTN_A == BTN_SOUTH`, `BTN_B == BTN_EAST`,
+   `BTN_X == BTN_NORTH`, `BTN_Y == BTN_WEST` (voir
+   `linux/input-event-codes.h`). Sur une vraie manette Xbox, `Y` est en
+   position NORD et `X` en position OUEST -- soit l'inverse de ce que le
+   nommage du noyau laisserait penser par rapport à la disposition
+   physique de Microsoft. La plupart des pilotes/récepteurs compensent
+   pour que `BTN_X`/`BTN_Y` correspondent bien aux étiquettes imprimées,
+   mais pas tous les récepteurs tiers/pilotes HID génériques ne le font.
+2. Un récepteur qui expose cette manette sous l'**ancien** jeu d'évènements
+   joystick (pré-"gamepad") -- `BTN_TRIGGER`, `BTN_THUMB`, `BTN_TOP`,
+   `BTN_BASE`, ... -- est également courant sur du matériel tiers bon
+   marché (voir `motor_control/dump_gamepad_buttons.py`'s
+   `KNOWN_BUTTON_NAMES` pour la liste complète).
+
+Dans les deux cas, la correction ne demande **pas** de modifier le code :
+lancer `python3 -m motor_control.dump_gamepad_buttons` sur la Pi, appuyer
+sur chaque bouton physique un par un, noter le nom/code réel affiché pour
+chacun, puis régler les variables d'environnement `GAMEPAD_*_BTN`
+correspondantes (voir `.env.example` et le remap ci-dessus) sur les noms
+réels plutôt que deviner.
+
+**Pourquoi `START` n'éteint pas la Pi** : deux causes possibles, à
+vérifier dans cet ordre --
+
+1. **La manette n'est pas détectée du tout.** Bug réel corrigé le
+   2026-09-18 : `GamepadReader._find_device()` (et la copie de ce même
+   prédicat dans `dump_gamepad_buttons.py`) exigeait jusqu'ici la
+   présence du code évdev `BTN_A` spécifiquement pour reconnaître un
+   périphérique comme une manette. Si ce récepteur reporte tous ses
+   boutons sous l'ancien jeu joystick (hypothèse 2 ci-dessus, où `BTN_A`
+   n'existe tout simplement pas), la manette entière n'était alors
+   **jamais trouvée** -- pas seulement un bouton mal étiqueté : `START`
+   (et absolument tous les autres boutons/joysticks) restait alors
+   silencieusement inerte, le log répétant juste "no gamepad found"
+   toutes les `RETRY_INTERVAL_S` secondes. `_find_device()` (et son
+   équivalent dans `dump_gamepad_buttons.py`) reconnaît maintenant un
+   périphérique dès qu'il expose soit `BTN_A` (jeu moderne), soit
+   `BTN_TRIGGER` (ancien jeu joystick) -- voir
+   `GAMEPAD_IDENTIFYING_BUTTONS` dans `link/gamepad_handler.py`. Si
+   `python3 -m motor_control.dump_gamepad_buttons` n'affiche **rien du
+   tout**, même en appuyant sur tous les boutons, c'est le signe que la
+   manette n'est pas détectée -- vérifier avec `python3 -c "from evdev
+   import list_devices, InputDevice; [print(InputDevice(p).name, p) for p
+   in list_devices()]"` qu'elle apparaît bien dans la liste des
+   périphériques `evdev` du tout.
+2. **La config sudo n'est pas faite.** Si la manette répond bien (les
+   autres boutons fonctionnent, `dump_gamepad_buttons.py` affiche bien
+   `BTN_START` en appuyant sur `Start`) mais que la Pi ne s'éteint
+   toujours pas, voir la configuration `sudo poweroff` sans mot de passe
+   plus haut dans cette même section -- `_shutdown_pi()` logue une erreur
+   claire dans ce cas (`could not power off the Raspberry Pi`), donc
+   regarder les logs de `python3 -m link` est le premier réflexe pour
+   distinguer ces deux causes.
+
+### Retour terrain (2026-09-19) : le bouton `A` (armer AUTO) ne semble rien faire
+
+Diagnostic différent du "`Y` se comporte comme `A`" ci-dessus : ici `A` est
+bien le bon bouton (le bon code évdev arrive bien jusqu'à
+`robot_state_button_handler()`), mais le mode `AUTO` semble retomber tout
+seul immédiatement, comme si l'appui n'avait servi à rien.
+
+**Cause réelle, une fois `GamepadReader._read_events()` et
+`robot_state_drive_handler()` relus ensemble** : `_read_events()` appelle
+`on_drive()` sur **chaque** évènement `EV_ABS`, y compris le bruit
+analogique qu'un stick centré et non touché continue de produire tout
+seul (ce n'est pas réservé à une vraie poussée). Or
+`robot_state_drive_handler()`'s `_on_drive()` traite **toute** PWM non
+nulle comme "une vraie poussée du joystick" et repasse immédiatement en
+`MANUAL` (`state.set_mode("MANUAL")`) avant même de regarder quoi que ce
+soit d'autre -- c'est la convention "le manuel reprend toujours la main"
+documentée plus haut. Avec l'ancienne zone morte (`AXIS_DEADZONE = 0.08`,
+soit environ ±20 unités PWM brutes sur 255), le bruit au repos de cette
+manette précise (mesuré jusqu'à environ ±30 unités) dépassait ce seuil --
+donc quasiment chaque évènement de bruit repassait en `MANUAL` juste après
+que `A` ait appelé `state.set_mode("AUTO")`, en quelques millisecondes
+(les évènements `EV_ABS` arrivent en continu, plusieurs fois par seconde
+même stick lâché). Rien à voir avec le bouton lui-même : indiscernable en
+pratique de "appuyer sur `A` ne fait rien".
+
+**Correction appliquée** : `AXIS_DEADZONE` (dans `link/gamepad_handler.py`)
+est passé de `0.08` (~20/255) à `30/255` (~0.1176), pour couvrir
+explicitement le niveau de bruit rapporté sur cette manette. Concrètement,
+`_pwm_from_axis()` renvoie maintenant `0` pour ce bruit-là, qui n'atteint
+donc plus jamais `on_drive()` comme "une vraie poussée" -- `AUTO` reste
+armé tant qu'un vrai mouvement de stick (ou un autre changement de mode)
+ne le change pas. Deux tests couvrent cette régression dans
+`tests/test_gamepad_handler.py` :
+`test_pwm_from_axis_deadzone_covers_documented_joystick_noise` (la zone
+morte seule) et
+`test_read_events_and_drive_handler_together_survive_the_documented_joystick_noise`
+(le chemin complet `_read_events()` → `robot_state_drive_handler()`, avec
+une valeur brute d'axe calculée pour retomber exactement dans la bande de
+bruit documentée).
+
+Si une manette encore plus bruyante que ±30 est rencontrée sur le terrain,
+relancer `motor_control/dump_gamepad_axes.py` dessus pour mesurer le bruit
+réel plutôt que d'augmenter `AXIS_DEADZONE` au hasard -- une zone morte
+trop large finirait par ignorer aussi de vrais petits mouvements de stick.
+
+### Vibrations de la manette (2026-09-18)
+
+Toute vibration liée aux scripts de terrain `motor_control/
+gps_log_on_full_*.py` a été retirée (ils ne touchent plus du tout le
+moteur de vibration de la manette) -- ces scripts ne servent qu'à
+enregistrer des logs GPS pendant une manœuvre spécifique, la vibration
+continue qui accompagnait ça n'a plus de raison d'être avec la nouvelle
+fonctionnalité ci-dessous, qui couvre un usage réel du robot plutôt qu'un
+test de terrain ponctuel. Les crochets `on_transition`/`on_gps_quality`
+restent disponibles, inutilisés, dans `motor_control/
+gps_condition_logger.py` si une future fonctionnalité en a besoin.
+
+À la place, `link/server.py` fait vibrer la manette une seule fois,
+brièvement (`GamepadReader.pulse()`, 2026-09-18), exactement au moment où
+la qualité du fix GPS **change réellement** en conduite réelle (voir
+`link/gps_reader.py`'s `GPSReader.on_gps_quality`, déclenché uniquement
+sur un vrai changement, jamais à chaque trame GGA) :
+- vibration **forte** de `DGPS_PULSE_DURATION_S` (0.5s par défaut) quand
+  le fix devient corrigé DGPS ;
+- vibration **faible** de la même durée quand il perd ce niveau de
+  précision.
+
+`start_rumble()`/`stop_rumble()`/`set_intensity()` (vibration continue)
+restent disponibles sur `GamepadReader` pour un futur besoin, mais plus
+aucun appelant de ce dépôt ne les utilise directement aujourd'hui --
+`pulse()` est ce qu'un évènement ponctuel comme celui-ci doit utiliser à
+la place.
+
 ### Vérifier rapidement une manette (`motor_control/check_gamepad.py`)
 
 Petit script de diagnostic autonome (pas de moteurs, pas de GPS) pour
@@ -295,6 +557,24 @@ au lieu de deviner :
 ```bash
 python3 -m motor_control.dump_gamepad_axes
 ```
+
+De la même façon, si `Y` ou `START` ne déclenchent pas le comportement
+attendu (voir le point 2 juste au-dessus), `motor_control/
+dump_gamepad_buttons.py` affiche le code évdev brut de **chaque** bouton
+appuyé/relâché, sans le filtrage de `robot_state_button_handler()` :
+
+```bash
+python3 -m motor_control.dump_gamepad_buttons
+```
+
+Appuyer sur `A`, `B`, `X`, `Y` et `Start` un par un (voir le remap du
+2026-09-18 plus haut pour ce que chacun fait désormais) ; si un nom
+affiché ne correspond pas à ce qui est attendu (`BTN_A`/`BTN_B`/`BTN_X`/
+`BTN_Y`/`BTN_START`), régler la variable `GAMEPAD_*_BTN` correspondante
+(voir `.env.example`) sur le nom réel plutôt que de deviner. Si
+**aucun** bouton n'affiche quoi que ce soit, voir "Pourquoi `START`
+n'éteint pas la Pi" ci-dessus, point 1 : la manette n'est peut-être pas
+détectée du tout.
 
 ## Lecture GPS (`link/gps_reader.py`)
 
@@ -391,28 +671,30 @@ sauté automatiquement si `pynmea2` n'est pas installé) ; le reste
 documentées mais n'a jamais tourné pour de vrai — à vérifier sur la Pi,
 manette et récepteur GPS branchés, avant de leur faire confiance.
 
-### Retour vibrant sur la manette pendant l'enregistrement
+### Retour vibrant sur la manette pendant l'enregistrement (retiré le 2026-09-18)
 
-Pendant qu'une des conditions ci-dessus est active (donc pendant que des
-données sont réellement écrites dans un `.log`), la manette Xbox vibre en
-continu — confirmation physique, sans avoir à regarder un écran en
-conduisant, que l'enregistrement est en cours. L'intensité indique en
-plus la qualité du point GPS courant :
+**Ce comportement a été retiré.** Jusqu'au 2026-09-18, pendant qu'une des
+conditions ci-dessus était active (donc pendant que des données étaient
+réellement écrites dans un `.log`), la manette Xbox vibrait en continu —
+forte tant que la trame `GGA` la plus récente indiquait un point DGPS
+(`gps_qual == 2`), faible sinon — confirmation physique, sans avoir à
+regarder un écran en conduisant, que l'enregistrement était en cours et
+avec quelle qualité de fix. Les trois scripts de terrain ci-dessus ne
+câblent plus rien sur la manette : ils se contentent d'écrire leurs
+fichiers de log, silencieusement côté vibration.
 
-- **vibration forte** tant que la trame `GGA` la plus récente indique un
-  point DGPS (`gps_qual == 2`) ;
-- **vibration faible** sinon (pas de correction DGPS, voire pas de point
-  du tout).
+À la place, `link/server.py` fait vibrer la manette pour un usage réel du
+robot plutôt que pour un test de terrain ponctuel : un bref pulse (fort en
+gagnant le DGPS, faible en le perdant) dès que le fix GPS **réellement
+utilisé pour piloter le robot** change de qualité, voir la section
+"Vibrations de la manette (2026-09-18)" plus haut. Les callbacks
+`on_transition`/`on_gps_quality` de `gps_condition_logger.py` existent
+toujours (inchangés, juste plus appelés par personne dans ce dépôt) si un
+futur script de terrain veut les réutiliser.
 
-L'intensité se met à jour en direct pendant l'enregistrement (dès la
-trame `GGA` suivante), et la vibration s'arrête net dès que la condition
-n'est plus remplie. Implémenté dans `link/gamepad_handler.py`
-(`GamepadReader.start_rumble()`/`set_intensity()`/`stop_rumble()`, via le
-force-feedback `FF_RUMBLE` d'evdev) et câblé aux trois scripts ci-dessus
-via les callbacks `on_transition`/`on_gps_quality` de
-`gps_condition_logger.py`.
-
-**Point d'attention terrain** : le support du force-feedback sur manette
+**Point d'attention terrain (toujours valable pour `check_rumble.py`
+ci-dessous et pour la nouvelle fonctionnalité DGPS)** : le support du
+force-feedback sur manette
 Xbox sous Linux (pilote `xpad`) est fiable en filaire (USB), mais peut
 être capricieux en Bluetooth selon la version du noyau/pilote. Si la
 manette ne vibre pas du tout, tester d'abord en filaire avant de
@@ -500,9 +782,11 @@ playlist vidéo dans les trois cas.
 
 Ce module reste volontairement indépendant du protocole NMEA de `link/` en
 tant que processus (deux scripts séparés, lancés indépendamment), mais
-`link/robot_state.py` lui parle en HTTP pour `CAM,SNAP` (voir plus haut) :
-`camera/` gère à la fois l'aperçu vidéo continu et, depuis peu, les
-snapshots à la demande.
+`link/robot_state.py` lui parle en HTTP pour `CAM,SNAP` et, depuis le
+2026-09-18, `CAM,REC_START`/`CAM,REC_STOP` (voir plus haut et la section
+"Enregistrement vidéo" plus bas) : `camera/` gère l'aperçu vidéo continu,
+les snapshots à la demande, et maintenant l'enregistrement vidéo à la
+demande.
 
 ### Lancer `link/` et `camera/` en même temps (`run_robot.sh`)
 
@@ -511,17 +795,106 @@ n'exécute la seconde commande qu'après la sortie de la première, or
 `link/server.py` tourne indéfiniment (il sert des connexions jusqu'à
 interruption) — `camera/stream_server.py` ne démarre donc jamais.
 `run_robot.sh`, à la racine du dépôt, lance les deux en parallèle et les
-arrête tous les deux proprement sur un seul Ctrl+C (y compris si l'un des
-deux plante tout seul, pour éviter de laisser l'autre tourner seul sans
-s'en rendre compte) :
+arrête proprement sur un seul Ctrl+C :
 
 ```bash
 ./run_robot.sh
 ```
 
+La caméra est **optionnelle** : `link/server.py` (pilotage/GPS/protocole de
+contrôle) est le seul processus critique. Si la caméra ne démarre pas (pas
+de webcam branchée, `CAMERA_DEVICE` invalide, device déjà utilisé...) ou
+plante en cours de route, `run_robot.sh` affiche un avertissement et
+continue à faire tourner `link/server.py` seul plutôt que de tout arrêter.
+Un plantage de `link/server.py`, lui, reste fatal et arrête aussi la
+caméra avec lui. Pour ne même pas essayer de démarrer la caméra :
+
+```bash
+CAMERA_ENABLED=0 ./run_robot.sh
+```
+
 Les variables d'environnement des deux scripts (`CAMERA_DEVICE`,
 `GPS_DEVICE`, `CONTROL_PORT`, etc.) restent utilisables normalement,
 exportées avant l'appel ou via `.env`.
+
+### Démarrage automatique au boot (`systemd/robot.service`, 2026-09-19)
+
+Pour que `run_robot.sh` démarre tout seul à chaque allumage de la Pi
+(sans avoir besoin d'ouvrir un terminal), la solution recommandée est un
+service `systemd` — il démarre avant toute session graphique/SSH, et
+redémarre automatiquement le robot si le processus plante.
+
+**Le problème que ça résout** : `run_robot.sh` appelle `python3 -m link`
+et `python3 -m camera`, qui doivent tourner avec l'environnement virtuel
+du projet activé (celui où `requirements.txt` a été installé) pour que
+`python3` pointe vers le bon interpréteur. Or `source .../activate` est
+une commande *shell* (pas un programme exécutable) — `systemd` ne peut
+pas l'appeler directement. `start_robot.sh` (nouveau, à la racine du
+dépôt) fait exactement cette étape : il active l'environnement virtuel
+puis lance `run_robot.sh` à sa place (`exec`, pour que `systemd` suive
+directement ce processus plutôt qu'un script parent inutile).
+
+**Deux chemins à vérifier avant d'installer**, en haut de
+`start_robot.sh` :
+```bash
+PROJECT_DIR="/home/robot/Desktop/coderobot"
+VENV_DIR="$PROJECT_DIR/.venv"
+```
+Adapter ces deux lignes (et `WorkingDirectory=`/`ExecStart=` dans
+`systemd/robot.service`, mêmes chemins) si le dépôt ou l'environnement
+virtuel ne vivent pas exactement là sur cette Pi.
+
+**Installation (à faire une fois, sur la Pi, avec `sudo`)** :
+```bash
+chmod +x start_robot.sh                                    # si pas déjà fait
+sudo cp systemd/robot.service /etc/systemd/system/robot.service
+sudo systemctl daemon-reload
+sudo systemctl enable robot.service   # démarre automatiquement à chaque boot
+sudo systemctl start robot.service    # démarre tout de suite, sans attendre un reboot
+```
+
+**Vérifier que ça tourne** :
+```bash
+sudo systemctl status robot.service   # actif ou non, dernières lignes de log
+journalctl -u robot.service -f        # logs en direct (Ctrl+C pour arrêter de suivre)
+```
+
+**Arrêter/redémarrer/désactiver** :
+```bash
+sudo systemctl stop robot.service       # arrête maintenant (jusqu'au prochain boot/start)
+sudo systemctl restart robot.service    # redémarre tout de suite
+sudo systemctl disable robot.service    # ne redémarre plus tout seul au boot
+```
+
+**Points d'attention** :
+- Le service tourne sous l'utilisateur `robot` (`User=robot` dans
+  `robot.service`, à adapter si ce projet tourne sous un autre nom
+  d'utilisateur sur cette Pi) — le même utilisateur que celui pour lequel
+  la config `sudo poweroff` sans mot de passe doit être faite (voir la
+  section "Pilotage moteur et manette" plus haut), puisque c'est ce même
+  utilisateur qui exécute `_shutdown_pi()` quand `START` est pressé sur
+  la manette.
+- Si le service démarre mais que la manette/le GPIO/la caméra ne
+  répondent pas alors qu'ils fonctionnent en lançant `./run_robot.sh` à
+  la main, la cause la plus probable est une histoire de permissions :
+  l'utilisateur `robot` doit déjà appartenir aux groupes Linux
+  nécessaires (`gpio`, `dialout` pour le port série GPS, `video` pour la
+  webcam, accès à `/dev/input` pour la manette) — `systemd` hérite des
+  mêmes groupes que cet utilisateur a normalement, donc si ça marche déjà
+  à la main sous ce même utilisateur, ça doit marcher pareil via le
+  service.
+- `Restart=on-failure` ne redémarre qu'en cas de plantage réel (crash) —
+  un `sudo poweroff` déclenché par le bouton `START` de la manette est un
+  arrêt normal de l'OS, pas un crash du service, donc pas de conflit
+  entre les deux : la Pi s'éteint normalement, elle ne cherche pas à
+  relancer le robot juste avant de s'éteindre.
+- **Non testé sur une vraie Raspberry Pi** (même honnêteté que le reste
+  de ce projet) : `start_robot.sh` et `robot.service` ont été relus et
+  vérifiés syntaxiquement (`bash -n`), mais l'installation `systemd`
+  elle-même — chemins, permissions, comportement réel au boot — n'a pas
+  pu être vérifiée dans cet environnement (pas de vraie Pi ni de
+  `systemd` actif ici). À tester avec un vrai redémarrage avant de s'y
+  fier pour un déploiement sur le terrain.
 
 ### Snapshots (`camera/snapshots.py`)
 
@@ -542,6 +915,66 @@ plafond à 5 fichiers de `SnapshotStore` (voir `tests/test_link_server.py`
 et `tests/test_snapshots.py`). Mais il n'y a pas de vraie webcam ni de
 Raspberry Pi dans l'environnement où il a été écrit — à tester avec la
 caméra réellement branchée avant de s'y fier.
+
+### Enregistrement vidéo (`camera/recordings.py`, 2026-09-18)
+
+`CAM,REC_START`/`CAM,REC_STOP` — déclenchables depuis le site web ou
+depuis le bouton `B` de la manette (voir la section "Pilotage moteur et
+manette" plus haut) — étaient jusqu'ici **non implémentés** (l'erreur
+`CAM_NOT_IMPLEMENTED` était systématique). C'est maintenant une vraie
+fonctionnalité : `GET /rec/start`/`GET /rec/stop` sur ce même serveur
+caméra (port `8000` par défaut) arment/désarment `VideoRecorder`
+(`camera/recordings.py`), qui écrit chaque frame brute capturée par
+`FrameGrabber` dans un fichier vidéo (`cv2.VideoWriter`, codec `mp4v` par
+défaut) pendant qu'il est armé. Comme pour les snapshots, jamais plus de
+**5 enregistrements** ne sont gardés (`camera/recordings/` par défaut,
+personnalisable avec `CAMERA_RECORDING_DIR`) — le plus ancien est
+supprimé automatiquement au-delà.
+
+`/rec/start` répond `503` (même convention que `/snap`) si aucune image
+n'a encore été capturée — pas de caméra branchée, ou pas encore prête —
+ce qui fait que `CAM,REC_START` échoue proprement dans ce cas plutôt que
+d'armer un enregistreur qui n'aura jamais rien à écrire : c'est très
+exactement ce que "enregistrer une vidéo si la caméra est présente"
+signifie en pratique ici. `RobotState.is_recording` garde la trace de
+l'état côté `link/`, pour que le bouton `B` de la manette sache s'il doit
+envoyer `REC_START` ou `REC_STOP` au prochain appui.
+
+**Non testé sur du vrai matériel** (même honnêteté que le reste de ce
+module) : écrit contre l'API documentée de `cv2.VideoWriter`, jamais
+lancé contre une vraie caméra/un vrai encodeur. Si les fichiers
+enregistrés sont vides ou que `VideoWriter.isOpened()` renvoie `False`
+sur la Pi, essayer `fourcc="MJPG"` avec une extension `.avi` à la place
+(ne nécessite aucun codec système supplémentaire, contrairement à
+`mp4v`) avant de chercher un bug ailleurs dans ce code.
+
+### Lister et télécharger les snapshots/enregistrements (2026-09-19)
+
+Jusqu'ici, ni `camera/tmp/` (snapshots) ni `camera/recordings/`
+(enregistrements) n'étaient accessibles autrement qu'en se connectant
+directement sur la Raspberry Pi — seules les actions (`/snap`,
+`/rec/start`, `/rec/stop`) et le flux en direct (`/stream.mjpg`)
+répondaient sur le serveur caméra. Ajouté pour la nouvelle page "Media"
+du site web (dépôt `robot-webserver`, voir son propre README) :
+
+- `GET /snapshots` — liste JSON des fichiers actuellement présents dans
+  `SnapshotStore`, du plus récent au plus ancien (`{"ok": true,
+  "snapshots": [...]}`) ;
+- `GET /snapshots/<nom_de_fichier>` — renvoie les octets JPEG bruts d'un
+  fichier précis ;
+- `GET /recordings` — même chose côté `VideoRecorder` (`{"ok": true,
+  "recordings": [...]}`) ;
+- `GET /recordings/<nom_de_fichier>` — renvoie les octets MP4 bruts.
+
+Le nom de fichier demandé sur les deux routes `/<...>` est vérifié par
+rapport à la liste courante (`list_files()`) avant d'être servi : un nom
+obsolète (déjà supprimé par la purge FIFO à 5 fichiers) ou une tentative
+de traversée de chemin (`../../etc/passwd`) répond `404`, jamais un accès
+direct au disque sur la base du nom reçu. Les fichiers sont transmis par
+blocs (`shutil.copyfileobj`) plutôt que chargés entièrement en mémoire —
+surtout utile pour les enregistrements vidéo, nettement plus volumineux
+qu'un simple snapshot JPEG, sur une Raspberry Pi qui fait par ailleurs du
+temps réel (moteurs, GPS, manette).
 
 ## Tests
 
