@@ -1166,6 +1166,47 @@ surtout utile pour les enregistrements vidéo, nettement plus volumineux
 qu'un simple snapshot JPEG, sur une Raspberry Pi qui fait par ailleurs du
 temps réel (moteurs, GPS, manette).
 
+### Supprimer un point de la carte GPS de `/control` : `WPD`, `MDD` (2026-10-05)
+
+Deux nouvelles trames de COMMANDE (contrairement à `WPT`/`GRT`/`MED`,
+celles-ci modifient réellement l'état du robot), ajoutées pour le clic
+droit "supprimer ce point" de la carte GPS de `/control` (voir le README
+de `robot-webserver`) :
+
+- `WPD,<index>` — supprime le waypoint situé à la position `index`
+  (0-based, même ordre que `WPT`) dans `waypoints/waypoints.txt`
+  (`RobotState.delete_waypoint()`). Par index plutôt que par
+  coordonnées : reconvertir un `lat/lon` reçu en ddmm.mmmm puis le
+  comparer au texte brut du fichier risquerait un écart d'arrondi qui
+  manquerait la bonne ligne — l'index évite complètement le problème.
+  Les autres lignes du fichier (commentaires, lignes vides, entrées
+  invalides) sont toujours laissées telles quelles ; seule l'entrée
+  demandée disparaît. `ERR,18` (`WAYPOINT_INDEX_OUT_OF_RANGE`) si cet
+  index n'existe pas (fichier plus court que prévu, déjà supprimé par
+  une requête concurrente, ou modifié à la main entre-temps).
+- `MDD,<nom_de_fichier>,<SNAP|VID>` — supprime une photo ou vidéo à la
+  fois du buffer caméra correspondant (nouvelle méthode `delete()` sur
+  `SnapshotStore`/`VideoRecorder`, exposée en HTTP par un nouveau `DELETE
+  /snapshots/<nom>` ou `DELETE /recordings/<nom>` sur `camera/
+  stream_server.py`) ET de sa ligne dans la table `snapshots` de
+  `link/power_history.py` (`delete_media_row()`) — `RobotState.
+  delete_media()` fait les deux. La ligne en base est nettoyée même si le
+  fichier caméra avait déjà disparu (`ERR,20`,
+  `MEDIA_NOT_FOUND`) : une fois cette commande envoyée, il n'y a plus de
+  raison de garder une géolocalisation qui pointe vers un fichier
+  volontairement effacé. Si le processus caméra est carrément
+  injoignable, `ERR,12` (`CAMERA_UNAVAILABLE`, même code que `CAM,SNAP`/
+  `CAM,REC_START`/`CAM,REC_STOP`) et la ligne en base n'est PAS touchée
+  dans ce cas — le fichier existe peut-être toujours, en vrai.
+  `ERR,19` (`BAD_MEDIA_KIND`) si `<SNAP|VID>` n'est ni l'un ni l'autre.
+
+Le site web (`robot-webserver`) ne propose ce clic droit que sur les
+points bleus (waypoints) et violets (photos/vidéos) de la carte — les
+points rouges (NAV envoyé / route GPS Driving active) et le point vert
+(robot) n'ont volontairement pas d'équivalent ici : rien ne les
+sauvegarde individuellement sur la Pi #1 pour qu'il y ait quelque chose à
+retirer proprement point par point.
+
 ## Tests
 
 ```bash
