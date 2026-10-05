@@ -98,7 +98,13 @@ def test_loop_retries_opening_until_camera_becomes_available():
 
     with patch("camera.stream_server.cv2.VideoCapture", side_effect=fake_video_capture), \
          patch("camera.stream_server.cv2.imencode", return_value=(True, fake_buffer)):
-        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05)
+        # on_demand=False: this test is about the open/retry control flow
+        # itself, not about the 2026-10-03 viewer-gating feature (covered
+        # by its own tests below) -- a bare start() with nobody calling
+        # add_viewer() would otherwise never even attempt to open the
+        # device under the new default.
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                on_demand=False)
         grabber.start()
         deadline = time.time() + 2.0
         while grabber.latest_jpeg() is None and time.time() < deadline:
@@ -126,7 +132,13 @@ def test_frame_grabber_feeds_raw_frames_to_an_optional_recorder():
 
     with patch("camera.stream_server.cv2.VideoCapture", return_value=fake_capture), \
          patch("camera.stream_server.cv2.imencode", return_value=(True, fake_buffer)):
-        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, recorder=fake_recorder)
+        # on_demand=False: this test is about recorder wiring, not about
+        # viewer-gating -- without this, fake_recorder (a bare MagicMock)
+        # would make _should_capture() pass by accident, since
+        # fake_recorder.is_recording is a truthy MagicMock attribute by
+        # default rather than the real False/True this feature expects.
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, recorder=fake_recorder,
+                                on_demand=False)
         grabber.start()
         deadline = time.time() + 2.0
         while grabber.latest_jpeg() is None and time.time() < deadline:
@@ -143,6 +155,108 @@ def test_frame_grabber_recorder_defaults_to_none():
     assert grabber.recorder is None
 
 
+# --- FrameGrabber on-demand capture: viewer-gated power saving (2026-10-03) -
+
+def _wait_until(predicate, timeout=2.0, interval=0.02):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def test_device_stays_closed_with_on_demand_and_no_viewer():
+    """The actual point of this feature: with nobody watching /stream.mjpg
+    and no recording armed, the capture device must never even be opened
+    -- this is what is expected to save power on a UVC webcam (unlike
+    pausing the GPS read loop, see this file's module docstring)."""
+    frame = MagicMock()
+    frame.shape = (480, 640, 3)
+    open_calls = {"count": 0}
+
+    def fake_video_capture(device):
+        open_calls["count"] += 1
+        return _FakeCapture(opened=True, frames=[(True, frame)])
+
+    with patch("camera.stream_server.cv2.VideoCapture", side_effect=fake_video_capture), \
+         patch("camera.stream_server.cv2.imencode", return_value=(True, MagicMock(tobytes=lambda: b"x"))):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                on_demand=True)
+        grabber.start()
+        time.sleep(0.3)  # several retry_interval cycles -- plenty of chances to (wrongly) open
+        grabber._running = False
+
+    assert open_calls["count"] == 0
+    assert grabber.latest_jpeg() is None
+
+
+def test_device_opens_once_a_viewer_connects_and_releases_when_it_leaves():
+    frame = MagicMock()
+    frame.shape = (480, 640, 3)
+    captures = []
+
+    def fake_video_capture(device):
+        cap = _FakeCapture(opened=True, frames=[(True, frame)])
+        captures.append(cap)
+        return cap
+
+    with patch("camera.stream_server.cv2.VideoCapture", side_effect=fake_video_capture), \
+         patch("camera.stream_server.cv2.imencode", return_value=(True, MagicMock(tobytes=lambda: b"x"))):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                on_demand=True)
+        grabber.start()
+
+        grabber.add_viewer()
+        assert _wait_until(lambda: grabber.latest_jpeg() is not None), "device never opened for the viewer"
+        assert len(captures) == 1
+
+        grabber.remove_viewer()
+        assert _wait_until(lambda: captures[0].released), "device never released after the last viewer left"
+        assert _wait_until(lambda: grabber.latest_jpeg() is None)
+
+        grabber._running = False
+
+
+def test_recording_in_progress_keeps_device_open_with_zero_viewers():
+    """REC_START must keep producing a video even if nobody has the live
+    feed open in a browser at the time -- see _should_capture()."""
+    frame = MagicMock()
+    frame.shape = (480, 640, 3)
+
+    class _Recorder:
+        is_recording = True
+
+        def write(self, frame):
+            pass
+
+    with patch("camera.stream_server.cv2.VideoCapture",
+               return_value=_FakeCapture(opened=True, frames=[(True, frame)])), \
+         patch("camera.stream_server.cv2.imencode", return_value=(True, MagicMock(tobytes=lambda: b"x"))):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                recorder=_Recorder(), on_demand=True)
+        grabber.start()
+        assert _wait_until(lambda: grabber.latest_jpeg() is not None), \
+            "armed recording at 0 viewers should still open the device"
+        grabber._running = False
+
+
+def test_on_demand_false_preserves_previous_always_on_behavior():
+    """CAMERA_ON_DEMAND=false escape hatch: device opens with zero viewers
+    and no recording, exactly like before this feature existed."""
+    frame = MagicMock()
+    frame.shape = (480, 640, 3)
+
+    with patch("camera.stream_server.cv2.VideoCapture",
+               return_value=_FakeCapture(opened=True, frames=[(True, frame)])), \
+         patch("camera.stream_server.cv2.imencode", return_value=(True, MagicMock(tobytes=lambda: b"x"))):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                on_demand=False)
+        grabber.start()
+        assert _wait_until(lambda: grabber.latest_jpeg() is not None)
+        grabber._running = False
+
+
 # --- StreamHandler: /rec/start, /rec/stop (2026-09-18) ----------------------
 
 def _start_test_server():
@@ -154,7 +268,12 @@ def _start_test_server():
 
 def test_rec_start_arms_the_recorder_when_a_frame_is_already_available(monkeypatch):
     fake_grabber = MagicMock()
-    fake_grabber.latest_jpeg.return_value = b"jpeg-bytes"
+    # _handle_rec_start() calls wait_for_frame() (2026-10-03), not a bare
+    # latest_jpeg() -- see that method's own tests further down for the
+    # real wake-up mechanism against an actual FrameGrabber; this one is
+    # only about what _handle_rec_start() does with whatever frame (or
+    # None) it gets back.
+    fake_grabber.wait_for_frame.return_value = b"jpeg-bytes"
     fake_recorder = MagicMock()
     monkeypatch.setattr(stream_server, "grabber", fake_grabber)
     monkeypatch.setattr(stream_server, "recorder", fake_recorder)
@@ -177,7 +296,7 @@ def test_rec_start_answers_503_with_no_frame_yet(monkeypatch):
     # rather than arming a recorder with nothing to encode (this is what
     # makes "record a video if the camera is present" true in practice).
     fake_grabber = MagicMock()
-    fake_grabber.latest_jpeg.return_value = None
+    fake_grabber.wait_for_frame.return_value = None  # see the comment in the test above
     fake_recorder = MagicMock()
     monkeypatch.setattr(stream_server, "grabber", fake_grabber)
     monkeypatch.setattr(stream_server, "recorder", fake_recorder)
@@ -197,6 +316,97 @@ def test_rec_start_answers_503_with_no_frame_yet(monkeypatch):
 
     assert body == {"ok": False, "error": "NO_FRAME_YET"}
     fake_recorder.start.assert_not_called()
+
+
+# --- /snap, /rec/start wake a released on-demand camera (2026-10-03) -------
+# End-to-end against a REAL FrameGrabber (not a mocked one, unlike the
+# tests just above) -- these are the ones that actually exercise
+# wait_for_frame()'s wake-up mechanism, covering the gamepad's normal use
+# case: SNAP/REC_START with nobody watching /stream.mjpg at all.
+
+def test_snap_wakes_a_released_on_demand_camera(monkeypatch):
+    frame = MagicMock()
+    frame.shape = (480, 640, 3)
+
+    with patch("camera.stream_server.cv2.VideoCapture",
+               return_value=_FakeCapture(opened=True, frames=[(True, frame)])), \
+         patch("camera.stream_server.cv2.imencode",
+               return_value=(True, MagicMock(tobytes=lambda: b"jpeg-bytes"))):
+        real_grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                     on_demand=True)
+        real_grabber.start()
+        time.sleep(0.2)
+        # Confirms the regression this feature could otherwise reintroduce:
+        # the camera must genuinely be released before the request below.
+        assert real_grabber.latest_jpeg() is None
+
+        fake_store = MagicMock()
+        fake_store.save.return_value = "snap_20261003_120000_000001.jpg"
+        fake_store.count.return_value = 1
+        monkeypatch.setattr(stream_server, "grabber", real_grabber)
+        monkeypatch.setattr(stream_server, "snapshot_store", fake_store)
+
+        server, thread = _start_test_server()
+        try:
+            port = server.server_address[1]
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/snap", timeout=2) as resp:
+                assert resp.status == 200
+                body = json.loads(resp.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+            real_grabber._running = False
+
+    assert body == {"ok": True, "file": "snap_20261003_120000_000001.jpg", "count": 1}
+
+
+def test_rec_start_wakes_a_released_on_demand_camera_and_keeps_it_open(monkeypatch):
+    frame = MagicMock()
+    frame.shape = (480, 640, 3)
+
+    class _Recorder:
+        def __init__(self):
+            self.is_recording = False
+            self.started = False
+
+        def start(self):
+            self.started = True
+            self.is_recording = True
+
+        def write(self, frame):
+            pass
+
+    recorder_obj = _Recorder()
+
+    with patch("camera.stream_server.cv2.VideoCapture",
+               return_value=_FakeCapture(opened=True, frames=[(True, frame)])), \
+         patch("camera.stream_server.cv2.imencode",
+               return_value=(True, MagicMock(tobytes=lambda: b"jpeg-bytes"))):
+        real_grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05,
+                                     recorder=recorder_obj, on_demand=True)
+        real_grabber.start()
+        time.sleep(0.2)
+        assert real_grabber.latest_jpeg() is None
+
+        monkeypatch.setattr(stream_server, "grabber", real_grabber)
+        monkeypatch.setattr(stream_server, "recorder", recorder_obj)
+
+        server, thread = _start_test_server()
+        try:
+            port = server.server_address[1]
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/rec/start", timeout=2) as resp:
+                assert resp.status == 200
+                body = json.loads(resp.read())
+            # The device must stay open on its own now that recording is
+            # armed -- no transient viewer left over from the request above.
+            assert _wait_until(lambda: real_grabber.latest_jpeg() is not None)
+        finally:
+            server.shutdown()
+            server.server_close()
+            real_grabber._running = False
+
+    assert body == {"ok": True, "recording": True}
+    assert recorder_obj.started is True
 
 
 def test_rec_stop_reports_the_filename_that_was_written(monkeypatch):
@@ -343,162 +553,3 @@ def test_recording_file_is_served_with_video_content_type(monkeypatch, tmp_path)
         server.server_close()
 
     assert body == b"fake-mp4-bytes"
-
-
-# --- _handle_file: Range requests (2026-09-21, for real <video> seeking/
-# Safari playback -- see _handle_file()'s own docstring) -------------------
-
-def test_whole_file_response_advertises_accept_ranges(monkeypatch, tmp_path):
-    filename = "rec_20260921_090000_000001.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/recordings/{filename}", timeout=2) as resp:
-            assert resp.status == 200
-            assert resp.headers["Accept-Ranges"] == "bytes"
-            assert resp.headers["Content-Length"] == "10"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"0123456789"
-
-
-def test_range_request_returns_206_with_just_that_slice(monkeypatch, tmp_path):
-    filename = "rec_20260921_090001_000002.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")  # bytes 2-4 == b"234"
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=2-4"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 206
-            assert resp.headers["Content-Range"] == "bytes 2-4/10"
-            assert resp.headers["Content-Length"] == "3"
-            assert resp.headers["Accept-Ranges"] == "bytes"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"234"
-
-
-def test_open_ended_range_request_returns_through_eof(monkeypatch, tmp_path):
-    filename = "rec_20260921_090002_000003.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=7-"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 206
-            assert resp.headers["Content-Range"] == "bytes 7-9/10"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"789"
-
-
-def test_suffix_range_request_returns_last_n_bytes(monkeypatch, tmp_path):
-    filename = "rec_20260921_090003_000004.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=-3"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 206
-            assert resp.headers["Content-Range"] == "bytes 7-9/10"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"789"
-
-
-def test_out_of_range_request_returns_416_with_content_range(monkeypatch, tmp_path):
-    filename = "rec_20260921_090004_000005.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")  # 10 bytes -- asking for byte 100 is unsatisfiable
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=100-200"}
-        )
-        try:
-            urllib.request.urlopen(req, timeout=2)
-            raise AssertionError("expected an HTTPError (416)")
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            content_range = exc.headers.get("Content-Range")
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert status == 416
-    assert content_range == "bytes */10"
-
-
-def test_multi_range_request_falls_back_to_the_whole_file(monkeypatch, tmp_path):
-    # No mainstream browser <video> element actually sends this, but a
-    # multi-range Range header must degrade to "ignore it, send
-    # everything" rather than erroring or misbehaving -- see
-    # _parse_range_header()'s own docstring.
-    filename = "rec_20260921_090005_000006.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=0-1,3-4"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 200
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"0123456789"

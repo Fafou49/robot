@@ -1,0 +1,180 @@
+diff --git a/README.md b/README.md
+index 9f7cbc0..a2724fe 100644
+--- a/README.md
++++ b/README.md
+@@ -195,7 +195,7 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
+   avec `pv_voltage, pv_current, pv_power, battery_voltage,
+   battery_charging_current, battery_charging_power, load_voltage,
+   load_current, load_power, battery_soc, battery_temp, controller_temp,
+-  available` (13 champs — voir `link/robot_state.py`,
++  cpu_temp, available` (14 champs — voir `link/robot_state.py`,
+   `RobotState.power_status()`) : les 12 premiers viennent de
+   `link/tracer_reader.py` (voir section dédiée ci-dessous), `0.0` tant
+   qu'aucune lecture n'a encore réussi ; `available` vaut `1` si la
+@@ -203,6 +203,12 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
+   Tracer non alimenté, erreur CRC...) — dans ce dernier cas les 12 autres
+   champs gardent leur dernière valeur connue plutôt que de retomber à
+   `0.0`, pour éviter un affichage qui clignote à chaque erreur passagère.
++  `cpu_temp` (2026-10-05, 13ᵉ champ, ajouté en fin de trame existante)
++  est la température du CPU du Pi #1 lui-même (`link/cpu_temp.py`,
++  lecture directe de `/sys/class/thermal/thermal_zone0/temp`, pas
++  d'appel à `vcgencmd`) — indépendante du Tracer : elle reste renvoyée
++  même si `available` vaut `0` (câble RS485 débranché), puisque rien
++  n'empêche de lire le CPU du Pi dans ce cas.
+   Trame pure lecture, comme `STA`/`WPT`/`GRT` : ne modifie rien dans
+   `RobotState`.
+ 
+@@ -674,6 +680,27 @@ actuel, contrairement à tous les autres champs — si la valeur affichée
+ semble fausse d'un facteur 100 (ex: "0.85 %" au lieu de "85 %"), c'est le
+ premier endroit à vérifier.
+ 
++## Température CPU du Pi #1 (`link/cpu_temp.py`)
++
++Ajouté le 2026-10-05 pour le nouveau panneau "Temperatures" de la page
++`/power` (`robot-webserver`), qui regroupe désormais la température
++batterie, la température contrôleur (toutes deux lues via le Tracer,
++ci-dessus) et la température du CPU du Pi #1 lui-même. Contrairement à
++`GPSReader`/`TracerReader`, pas de thread de fond ici : une simple lecture
++de `/sys/class/thermal/thermal_zone0/temp` (fichier sysfs du noyau, en
++millidegrés) à chaque requête `PWR`, suffisamment peu coûteuse pour ne pas
++avoir besoin d'être mise en cache — voir le docstring de
++`link/cpu_temp.py` pour la comparaison avec `vcgencmd measure_temp`
++(écartée : binaire externe + sous-processus à chaque lecture).
++
++Se dégrade proprement si le fichier n'existe pas (environnement de
++développement qui n'est pas un vrai Raspberry Pi) : `None`, qui redevient
++le placeholder `0.0` habituel sur la trame `PWR`, avec un avertissement
++dans les logs la première fois seulement. Contrairement aux champs du
++Tracer, `cpu_temp` ne dépend pas du flag `available` de `PWR` : il est
++renvoyé même si le câble RS485 est débranché, puisque rien n'empêche de
++lire le CPU du Pi dans ce cas.
++
+ ## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
+ 
+ Trois variantes de `motor_control/remote_control.py` (même manette, mêmes
+diff --git a/link/robot_state.py b/link/robot_state.py
+index ed6ac92..e5aef11 100644
+--- a/link/robot_state.py
++++ b/link/robot_state.py
+@@ -42,6 +42,7 @@ import urllib.error
+ import urllib.request
+ 
+ from link.autopilot import Autopilot, bearing_deg, haversine_distance_m, heading_error_for_pid
++from link.cpu_temp import read_cpu_temperature_c
+ from link.nmea import nmea_to_decimal
+ 
+ PWM_MIN, PWM_MAX = -255, 255
+@@ -748,6 +749,15 @@ class RobotState:
+ 
+     # -- PWR: solar/battery/load status snapshot for the power page --------
+     def power_status(self):
++        # cpu_temp is read fresh here rather than cached on self like the
++        # Tracer fields above: it's Pi #1's own CPU, not something
++        # link.tracer_reader polls over RS485, so it has nothing to do
++        # with power_available (still reported even if the Tracer cable
++        # is unplugged) and no background thread to keep it updated --
++        # see link.cpu_temp for why a fresh read is cheap enough to just
++        # do here, on every PWR request. Read outside the lock since it's
++        # a plain file read with nothing to do with RobotState itself.
++        cpu_temp = read_cpu_temperature_c()
+         with self._lock:
+             return {
+                 "pv_voltage": self.pv_voltage,
+@@ -762,5 +772,6 @@ class RobotState:
+                 "battery_soc": self.battery_soc,
+                 "battery_temp": self.battery_temp,
+                 "controller_temp": self.controller_temp,
++                "cpu_temp": cpu_temp,
+                 "available": self.power_available,
+             }
+diff --git a/link/server.py b/link/server.py
+index c6d13c9..e4accfe 100644
+--- a/link/server.py
++++ b/link/server.py
+@@ -236,6 +236,14 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
+         # format as "87" instead of "87.0" on the wire. Forcing float
+         # first keeps every numeric field consistently formatted
+         # regardless of what type the underlying reading happens to be.
++        #
++        # cpu_temp (2026-10-05, 13th data field, extend-only -- an older
++        # robot-webserver that doesn't know about it yet just ignores the
++        # extra field) is Pi #1's own CPU temperature, not a Tracer
++        # reading -- it does NOT depend on `available` above, and is
++        # still reported even when the Tracer cable is unplugged. See
++        # link.cpu_temp for why it falls back to the same 0.0 placeholder
++        # as every other field here rather than needing its own flag.
+         return build_sentence(
+             "PWR",
+             round(float(p["pv_voltage"] or 0.0), 2), round(float(p["pv_current"] or 0.0), 2),
+@@ -247,6 +255,7 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
+             round(float(p["load_power"] or 0.0), 2),
+             round(float(p["battery_soc"] or 0.0), 1),
+             round(float(p["battery_temp"] or 0.0), 1), round(float(p["controller_temp"] or 0.0), 1),
++            round(float(p["cpu_temp"] or 0.0), 1),
+             1 if available else 0,
+         )
+ 
+diff --git a/tests/test_link_server.py b/tests/test_link_server.py
+index 0914889..50572d6 100644
+--- a/tests/test_link_server.py
++++ b/tests/test_link_server.py
+@@ -872,16 +872,28 @@ def test_control_server_starts_fine_without_tracer_hardware(monkeypatch):
+ 
+ 
+ # --- PWR (2026-10-03, for robot-webserver's /power page) --------------------
+-
+-def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_server):
++# cpu_temp (2026-10-05) is monkeypatched to a fixed value in every test
++# below rather than left to the real /sys/class/thermal/thermal_zone0/temp
++# read: it's Pi #1's own CPU, nothing to do with the Tracer fields these
++# tests are actually about, and leaving it unpatched would make these
++# tests' expected fields depend on whether they happen to run on a real
++# Raspberry Pi (see link.cpu_temp) -- patched where robot_state looks it
++# up (link.robot_state.read_cpu_temperature_c), not where it's defined.
++
++def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_server, monkeypatch):
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+     port = running_server.server_address[1]
+     response = _send_and_receive(port, build_sentence("PWR"))
+     sentence_type, fields = parse_sentence(response)
+     assert sentence_type == "PWR"
+-    assert fields == ["0.0"] * 9 + ["0.0", "0.0", "0.0", "0"]
++    # 9 Tracer flow fields + battery_soc/battery_temp/controller_temp +
++    # cpu_temp (also "0.0" here -- the monkeypatched reader returned None)
++    # + the trailing available flag.
++    assert fields == ["0.0"] * 9 + ["0.0", "0.0", "0.0"] + ["0.0", "0"]
+ 
+ 
+-def test_pwr_over_real_socket_reports_a_real_reading(running_server):
++def test_pwr_over_real_socket_reports_a_real_reading(running_server, monkeypatch):
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: 46.5)
+     port = running_server.server_address[1]
+     running_server.state.update_power_reading(
+         available=True,
+@@ -897,10 +909,24 @@ def test_pwr_over_real_socket_reports_a_real_reading(running_server):
+     assert fields[3:6] == ["13.1", "1.1", "14.41"]
+     assert fields[6:9] == ["12.9", "0.5", "6.45"]
+     assert fields[9:12] == ["87.0", "24.3", "28.1"]
+-    assert fields[12] == "1"
++    assert fields[12] == "46.5"  # cpu_temp -- independent of the Tracer's own available flag
++    assert fields[13] == "1"
++
++
++def test_pwr_cpu_temp_is_reported_even_when_tracer_is_unavailable(running_server, monkeypatch):
++    # The whole point of reading cpu_temp outside of update_power_reading():
++    # an unplugged Tracer cable must not blank out Pi #1's own CPU reading.
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: 52.1)
++    port = running_server.server_address[1]
++    response = _send_and_receive(port, build_sentence("PWR"))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "PWR"
++    assert fields[12] == "52.1"
++    assert fields[-1] == "0"  # Tracer itself still correctly reported as unavailable
+ 
+ 
+-def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values(running_server):
++def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values(running_server, monkeypatch):
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+     port = running_server.server_address[1]
+     running_server.state.update_power_reading(available=True, pv_voltage=15.82)
+     running_server.state.update_power_reading(available=False)

@@ -1,0 +1,580 @@
+diff --git a/.gitignore b/.gitignore
+index c36a86f..9a52687 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -37,6 +37,13 @@ camera/recordings/*
+ waypoints/*
+ !waypoints/.gitkeep
+ 
++# Base SQLite de l'historique power/GPS/snapshots (link/power_history.py,
++# 2026-10-05) -- donnees de terrain propres a chaque robot/session, pas
++# du code a versionner. Le dossier data/ est cree automatiquement par
++# PowerHistoryLogger/ensure_schema() au premier demarrage.
++data/*
++!data/.gitkeep
++
+ # Fichiers sp�cifiques aux IDE
+ .idea/
+ .vscode/
+diff --git a/README.md b/README.md
+index 9f7cbc0..83f0d02 100644
+--- a/README.md
++++ b/README.md
+@@ -195,7 +195,7 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
+   avec `pv_voltage, pv_current, pv_power, battery_voltage,
+   battery_charging_current, battery_charging_power, load_voltage,
+   load_current, load_power, battery_soc, battery_temp, controller_temp,
+-  available` (13 champs — voir `link/robot_state.py`,
++  cpu_temp, available` (14 champs — voir `link/robot_state.py`,
+   `RobotState.power_status()`) : les 12 premiers viennent de
+   `link/tracer_reader.py` (voir section dédiée ci-dessous), `0.0` tant
+   qu'aucune lecture n'a encore réussi ; `available` vaut `1` si la
+@@ -203,6 +203,12 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
+   Tracer non alimenté, erreur CRC...) — dans ce dernier cas les 12 autres
+   champs gardent leur dernière valeur connue plutôt que de retomber à
+   `0.0`, pour éviter un affichage qui clignote à chaque erreur passagère.
++  `cpu_temp` (2026-10-05, 13ᵉ champ, ajouté en fin de trame existante)
++  est la température du CPU du Pi #1 lui-même (`link/cpu_temp.py`,
++  lecture directe de `/sys/class/thermal/thermal_zone0/temp`, pas
++  d'appel à `vcgencmd`) — indépendante du Tracer : elle reste renvoyée
++  même si `available` vaut `0` (câble RS485 débranché), puisque rien
++  n'empêche de lire le CPU du Pi dans ce cas.
+   Trame pure lecture, comme `STA`/`WPT`/`GRT` : ne modifie rien dans
+   `RobotState`.
+ 
+@@ -674,6 +680,85 @@ actuel, contrairement à tous les autres champs — si la valeur affichée
+ semble fausse d'un facteur 100 (ex: "0.85 %" au lieu de "85 %"), c'est le
+ premier endroit à vérifier.
+ 
++## Température CPU du Pi #1 (`link/cpu_temp.py`)
++
++Ajouté le 2026-10-05 pour le nouveau panneau "Temperatures" de la page
++`/power` (`robot-webserver`), qui regroupe désormais la température
++batterie, la température contrôleur (toutes deux lues via le Tracer,
++ci-dessus) et la température du CPU du Pi #1 lui-même. Contrairement à
++`GPSReader`/`TracerReader`, pas de thread de fond ici : une simple lecture
++de `/sys/class/thermal/thermal_zone0/temp` (fichier sysfs du noyau, en
++millidegrés) à chaque requête `PWR`, suffisamment peu coûteuse pour ne pas
++avoir besoin d'être mise en cache — voir le docstring de
++`link/cpu_temp.py` pour la comparaison avec `vcgencmd measure_temp`
++(écartée : binaire externe + sous-processus à chaque lecture).
++
++Se dégrade proprement si le fichier n'existe pas (environnement de
++développement qui n'est pas un vrai Raspberry Pi) : `None`, qui redevient
++le placeholder `0.0` habituel sur la trame `PWR`, avec un avertissement
++dans les logs la première fois seulement. Contrairement aux champs du
++Tracer, `cpu_temp` ne dépend pas du flag `available` de `PWR` : il est
++renvoyé même si le câble RS485 est débranché, puisque rien n'empêche de
++lire le CPU du Pi dans ce cas.
++
++## Historique power/GPS/snapshots (`link/power_history.py`)
++
++Ajouté le 2026-10-05 pour les deux nouveaux graphes "History" de la page
++`/power` (`robot-webserver`) : un relevé toutes les 5 minutes (date/heure,
++position GPS si dispo, les 12 indicateurs du Tracer, `cpu_temp`), stocké
++dans une base SQLite **sur le Pi #1** (`data/power_history.db` par défaut,
++`POWER_HISTORY_DB_PATH` pour changer l'emplacement) plutôt que sur le Pi
++#2/robot-webserver — choix délibéré de l'utilisateur : le Pi #1 continue
++d'enregistrer même si la liaison WiFi vers le Pi #2 est coupée, puisque le
++logger lit directement l'état interne du process (`RobotState`) plutôt que
++de passer par le réseau.
++
++**Condition d'enregistrement (règle explicite, ne pas assouplir)** : une
++ligne n'est écrite que si `PWR` a actuellement `available=True`, c'est à
++dire que la liaison RS485/Tracer répond réellement. Journaliser sur un
++simple minuteur, sans cette condition, remplirait l'historique de lignes à
++zéro à chaque fois que le câble est débranché.
++
++Tourne en tâche de fond dans `ControlServer` (même schéma `start()`/
++`stop()` + thread daemon que `TracerReader`/`GPSReader`), activé par
++défaut (`POWER_LOG_ENABLED=false` pour désactiver), avec deux réglages :
++`POWER_LOG_INTERVAL_S` (300 par défaut, soit 5 minutes) et
++`POWER_LOG_RETENTION_DAYS` (395 par défaut, ~13 mois — à ce rythme ça
++représente environ 1,3 Mo/mois, donc la fenêtre par défaut a été fixée
++large plutôt que serrée, le stockage n'étant pas la contrainte ici).
++
++**Nouvelle trame `HIS`** (requête, sans conséquence sur l'état du robot) :
++`HIS,<DAY|MONTH>,<offset>` → renvoie `total_count`, `offset`, le nombre de
++lignes retournées, puis jusqu'à `HIS_CHUNK_ROWS` (100 par défaut) lignes
++aplaties (16 champs chacune, voir `FIELD_ORDER` dans
++`link/power_history.py`) pour la fenêtre glissante demandée (24h ou 30
++jours). Paginée plutôt qu'une seule trame géante : un mois à 5 minutes
++d'intervalle représente ~8640 lignes. Codes d'erreur ajoutés :
++`CommandError("15", "HIS_NEEDS_2_FIELDS")` et `CommandError("16", ...)`
++pour une période ou un offset invalide. Côté `robot-webserver`, voir
++`power_history_client.py` (boucle de pagination) et la route Flask
++`GET /api/power_history?period=day|month`.
++
++**Géolocalisation des snapshots** : chaque `CAM,SNAP` réussi enregistre
++désormais aussi son nom de fichier dans une table séparée (`snapshots`)
++avec la position GPS au moment de la prise (`NULL`/`NULL` si pas de fix) —
++voir `RobotState._request_snapshot()`. Indépendant du flag `available` du
++Tracer (ça n'a rien à voir avec le contrôleur solaire) ; best-effort,
++comme le reste de ce module : un échec d'écriture ne fait jamais échouer
++la commande `CAM,SNAP` elle-même, la photo est déjà enregistrée à ce
++stade.
++
++**Non testé sur le robot réel** (même réserve que pour le reste du
++projet) : `sqlite3` est dans la bibliothèque standard donc pas de souci
++d'installation, mais le comportement réel de la condition
++`available=True` sur le terrain reste à confirmer. Vérifié dans ce
++sandbox via des scripts autonomes (pas de `pytest` installable ici, voir
++plus haut) qui exercent directement `PowerHistoryLogger._log_once()`,
++`fetch_period_chunk()` et la trame `HIS` sur un vrai socket TCP, ainsi que
++`tests/test_link_server.py` (nouveaux tests `test_his_*` et
++`test_snapshot_is_geotagged_on_successful_cam_snap`, à lancer avec
++`pytest` sur une machine qui peut l'installer).
++
+ ## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
+ 
+ Trois variantes de `motor_control/remote_control.py` (même manette, mêmes
+diff --git a/link/robot_state.py b/link/robot_state.py
+index ed6ac92..9b35a52 100644
+--- a/link/robot_state.py
++++ b/link/robot_state.py
+@@ -35,6 +35,8 @@ existing test that constructs a bare RobotState() keeps working exactly
+ as before.
+ """
+ 
++import json
++import logging
+ import os
+ import threading
+ import time
+@@ -42,7 +44,12 @@ import urllib.error
+ import urllib.request
+ 
+ from link.autopilot import Autopilot, bearing_deg, haversine_distance_m, heading_error_for_pid
++from link.cpu_temp import read_cpu_temperature_c
+ from link.nmea import nmea_to_decimal
++from link.power_history import log_snapshot
++from link.power_history import resolve_db_path as resolve_history_db_path
++
++log = logging.getLogger("link.robot_state")
+ 
+ PWM_MIN, PWM_MAX = -255, 255
+ VALID_MODES = ("AUTO", "MANUAL", "IDLE")
+@@ -402,7 +409,16 @@ class RobotState:
+         endpoint. Any failure -- camera script not running, no frame
+         grabbed yet, network hiccup -- becomes one CommandError so the
+         console shows a clear reason instead of a raw socket/HTTP
+-        traceback; nothing here assumes the camera is actually available."""
++        traceback; nothing here assumes the camera is actually available.
++
++        2026-10-05: on success, also geotags the snapshot -- reads the
++        filename back out of /snap's own JSON body (it already returns
++        one, see camera/stream_server.py's _handle_snap) and records it
++        against whatever GPS fix is live right now (link.power_history.
++        log_snapshot) for pages/power.html's history section. This is
++        deliberately best-effort: a geotagging failure (disk error, no
++        GPS fix at all) must never turn a snapshot that the camera
++        genuinely saved into a CAM,SNAP error for the console."""
+         host = os.environ.get("CAMERA_HOST", CAMERA_HOST_DEFAULT)
+         port = int(os.environ.get("CAMERA_PORT", CAMERA_PORT_DEFAULT))
+         path = os.environ.get("CAMERA_SNAP_PATH", CAMERA_SNAP_PATH_DEFAULT)
+@@ -411,6 +427,7 @@ class RobotState:
+             with urllib.request.urlopen(url, timeout=CAMERA_SNAP_TIMEOUT) as resp:
+                 if resp.status != 200:
+                     raise CommandError("12", f"CAMERA_SNAP_FAILED:HTTP_{resp.status}")
++                body = resp.read()
+         except urllib.error.HTTPError as exc:
+             # 503 from _handle_snap means "no frame yet" (grabber hasn't
+             # produced one, e.g. camera just starting up) -- still a clean,
+@@ -419,6 +436,19 @@ class RobotState:
+         except urllib.error.URLError as exc:
+             raise CommandError("12", f"CAMERA_UNAVAILABLE:{exc.reason}")
+ 
++        try:
++            filename = json.loads(body).get("file")
++            if filename:
++                with self._lock:
++                    lat, lon = self.current_lat, self.current_lon
++                log_snapshot(resolve_history_db_path(), filename, lat, lon)
++        except Exception:
++            # Best-effort geotagging (see docstring above) -- the photo
++            # itself is already safely on disk by this point, so a
++            # malformed JSON body or a DB hiccup here is logged and
++            # swallowed rather than surfaced as a CAM,SNAP failure.
++            log.exception("failed to geotag snapshot %r in power_history.db", body)
++
+     def _request_recording(self, start: bool):
+         """Asks camera/stream_server.py to start or stop writing the live
+         feed to a video file, via its GET /rec/start or /rec/stop endpoint
+@@ -748,6 +778,15 @@ class RobotState:
+ 
+     # -- PWR: solar/battery/load status snapshot for the power page --------
+     def power_status(self):
++        # cpu_temp is read fresh here rather than cached on self like the
++        # Tracer fields above: it's Pi #1's own CPU, not something
++        # link.tracer_reader polls over RS485, so it has nothing to do
++        # with power_available (still reported even if the Tracer cable
++        # is unplugged) and no background thread to keep it updated --
++        # see link.cpu_temp for why a fresh read is cheap enough to just
++        # do here, on every PWR request. Read outside the lock since it's
++        # a plain file read with nothing to do with RobotState itself.
++        cpu_temp = read_cpu_temperature_c()
+         with self._lock:
+             return {
+                 "pv_voltage": self.pv_voltage,
+@@ -762,5 +801,6 @@ class RobotState:
+                 "battery_soc": self.battery_soc,
+                 "battery_temp": self.battery_temp,
+                 "controller_temp": self.controller_temp,
++                "cpu_temp": cpu_temp,
+                 "available": self.power_available,
+             }
+diff --git a/link/server.py b/link/server.py
+index c6d13c9..fdd362a 100644
+--- a/link/server.py
++++ b/link/server.py
+@@ -19,6 +19,14 @@ import subprocess
+ from link.gamepad_handler import GamepadReader, robot_state_button_handler, robot_state_drive_handler
+ from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
+ from link.nmea import SentenceError, build_sentence, decimal_to_nmea, parse_sentence
++from link.power_history import (
++    DEFAULT_LOG_INTERVAL_S as HISTORY_DEFAULT_LOG_INTERVAL_S,
++    DEFAULT_RETENTION_DAYS as HISTORY_DEFAULT_RETENTION_DAYS,
++    HIS_PERIODS,
++    PowerHistoryLogger,
++    fetch_period_chunk,
++    resolve_db_path,
++)
+ from link.robot_state import CommandError, RobotState
+ from link.tracer_reader import (
+     DEFAULT_BAUDRATE as TRACER_DEFAULT_BAUDRATE,
+@@ -236,6 +244,14 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
+         # format as "87" instead of "87.0" on the wire. Forcing float
+         # first keeps every numeric field consistently formatted
+         # regardless of what type the underlying reading happens to be.
++        #
++        # cpu_temp (2026-10-05, 13th data field, extend-only -- an older
++        # robot-webserver that doesn't know about it yet just ignores the
++        # extra field) is Pi #1's own CPU temperature, not a Tracer
++        # reading -- it does NOT depend on `available` above, and is
++        # still reported even when the Tracer cable is unplugged. See
++        # link.cpu_temp for why it falls back to the same 0.0 placeholder
++        # as every other field here rather than needing its own flag.
+         return build_sentence(
+             "PWR",
+             round(float(p["pv_voltage"] or 0.0), 2), round(float(p["pv_current"] or 0.0), 2),
+@@ -247,9 +263,43 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
+             round(float(p["load_power"] or 0.0), 2),
+             round(float(p["battery_soc"] or 0.0), 1),
+             round(float(p["battery_temp"] or 0.0), 1), round(float(p["controller_temp"] or 0.0), 1),
++            round(float(p["cpu_temp"] or 0.0), 1),
+             1 if available else 0,
+         )
+ 
++    if sentence_type == "HIS":
++        # Query (2026-10-05): one page of the day/month history logged by
++        # link.power_history.PowerHistoryLogger, for robot-webserver's
++        # /power history charts. Paginated (see link.power_history.
++        # HIS_CHUNK_ROWS) rather than returning a whole period in one
++        # sentence -- a month at 5-minute samples is ~8640 rows, which
++        # would make for an unreasonably long single line. Caller
++        # (robot-webserver's power_history_client.py) loops, bumping
++        # `offset` by the returned row count, until it has everything.
++        #
++        # Fields in: period ("DAY"/"MONTH"), offset (0-based row index
++        # into that rolling window, oldest-first).
++        # Fields out: period (echoed), total_count (rows in the whole
++        # window right now), offset (echoed), returned_count, then
++        # `returned_count` rows flattened back-to-back -- each row is
++        # link.power_history.FIELD_ORDER's 16 fields (ts, lat, lon, then
++        # the same PWR indicators PWR itself reports).
++        if len(fields) != 2:
++            raise CommandError("15", "HIS_NEEDS_2_FIELDS")
++        period = fields[0].strip().upper()
++        if period not in HIS_PERIODS:
++            raise CommandError("16", f"HIS_BAD_PERIOD:{period}")
++        try:
++            offset = int(fields[1])
++        except ValueError:
++            raise CommandError("16", f"HIS_BAD_OFFSET:{fields[1]}")
++        if offset < 0:
++            raise CommandError("16", f"HIS_BAD_OFFSET:{offset}")
++
++        total_count, rows = fetch_period_chunk(resolve_db_path(), period, offset)
++        flat_rows = [value for row in rows for value in row]
++        return build_sentence("HIS", period, total_count, offset, len(rows), *flat_rows)
++
+     raise CommandError("11", f"UNKNOWN_SENTENCE_TYPE:{sentence_type}")
+ 
+ 
+@@ -288,7 +338,8 @@ class ControlServer(socketserver.ThreadingTCPServer):
+     daemon_threads = True
+ 
+     def __init__(self, host, port, state: RobotState = None, start_gps: bool = True,
+-                 start_motor: bool = True, start_gamepad: bool = True, start_tracer: bool = True):
++                 start_motor: bool = True, start_gamepad: bool = True, start_tracer: bool = True,
++                 start_history: bool = True):
+         super().__init__((host, port), ControlHandler)
+ 
+         # MotorDriver is always constructed (cheap -- no hardware is
+@@ -385,6 +436,28 @@ class ControlServer(socketserver.ThreadingTCPServer):
+                 )
+                 self.tracer_reader.start()
+ 
++        self.power_history_logger = None
++        if start_history:
++            # POWER_LOG_ENABLED=false disables this entirely -- same
++            # escape hatch as TRACER_ENABLED etc. above. Independent of
++            # TRACER_ENABLED on purpose: the logger just checks
++            # state.power_status()["available"] on every tick and skips
++            # the write when it's False, same as it would with the
++            # Tracer cable physically unplugged -- no need to couple the
++            # two switches.
++            if os.environ.get("POWER_LOG_ENABLED", "true").lower() not in ("false", "0", "no"):
++                self.power_history_logger = PowerHistoryLogger(
++                    self.state,
++                    db_path=resolve_db_path(),
++                    log_interval=float(
++                        os.environ.get("POWER_LOG_INTERVAL_S", HISTORY_DEFAULT_LOG_INTERVAL_S)
++                    ),
++                    retention_days=float(
++                        os.environ.get("POWER_LOG_RETENTION_DAYS", HISTORY_DEFAULT_RETENTION_DAYS)
++                    ),
++                )
++                self.power_history_logger.start()
++
+     def _on_gps_quality_change(self, is_dgps):
+         """Wired in as link.gps_reader.GPSReader's on_gps_quality callback
+         above -- called on the GPS background thread the instant the live
+diff --git a/tests/test_link_server.py b/tests/test_link_server.py
+index 0914889..5819da0 100644
+--- a/tests/test_link_server.py
++++ b/tests/test_link_server.py
+@@ -591,18 +591,22 @@ def test_get_route_returns_a_copy_not_the_live_list():
+ 
+ @pytest.fixture()
+ def running_server():
+-    # start_gps/start_motor/start_gamepad/start_tracer=False: tests don't
+-    # need a real (or attempted) GPS fix, GPIO chip, gamepad, or RS485
+-    # read, and this avoids every test run making real subprocess/device-
+-    # scan/serial-open calls (gpiodetect, evdev.list_devices,
+-    # serial.Serial(...)) -- see
++    # start_gps/start_motor/start_gamepad/start_tracer/start_history=False:
++    # tests don't need a real (or attempted) GPS fix, GPIO chip, gamepad,
++    # RS485 read, or a background history logger writing to data/
++    # power_history.db in whatever directory the test suite happens to
++    # run from -- this avoids every test run making real subprocess/
++    # device-scan/serial-open calls (gpiodetect, evdev.list_devices,
++    # serial.Serial(...)) or leaving SQLite files behind. See
+     # test_control_server_starts_fine_without_gps_hardware and
+     # test_control_server_starts_fine_without_tracer_hardware below for
+     # dedicated checks that leaving these at their True default doesn't
+-    # crash when the hardware behind them isn't there.
++    # crash when the hardware behind them isn't there, and
++    # test_his_* below (own fixture, own tmp DB) for the history logger.
+     server = ControlServer(
+         "127.0.0.1", 0,  # port 0 = pick a free port
+         start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
++        start_history=False,
+     )
+     thread = threading.Thread(target=server.serve_forever, daemon=True)
+     thread.start()
+@@ -872,16 +876,28 @@ def test_control_server_starts_fine_without_tracer_hardware(monkeypatch):
+ 
+ 
+ # --- PWR (2026-10-03, for robot-webserver's /power page) --------------------
+-
+-def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_server):
++# cpu_temp (2026-10-05) is monkeypatched to a fixed value in every test
++# below rather than left to the real /sys/class/thermal/thermal_zone0/temp
++# read: it's Pi #1's own CPU, nothing to do with the Tracer fields these
++# tests are actually about, and leaving it unpatched would make these
++# tests' expected fields depend on whether they happen to run on a real
++# Raspberry Pi (see link.cpu_temp) -- patched where robot_state looks it
++# up (link.robot_state.read_cpu_temperature_c), not where it's defined.
++
++def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_server, monkeypatch):
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+     port = running_server.server_address[1]
+     response = _send_and_receive(port, build_sentence("PWR"))
+     sentence_type, fields = parse_sentence(response)
+     assert sentence_type == "PWR"
+-    assert fields == ["0.0"] * 9 + ["0.0", "0.0", "0.0", "0"]
++    # 9 Tracer flow fields + battery_soc/battery_temp/controller_temp +
++    # cpu_temp (also "0.0" here -- the monkeypatched reader returned None)
++    # + the trailing available flag.
++    assert fields == ["0.0"] * 9 + ["0.0", "0.0", "0.0"] + ["0.0", "0"]
+ 
+ 
+-def test_pwr_over_real_socket_reports_a_real_reading(running_server):
++def test_pwr_over_real_socket_reports_a_real_reading(running_server, monkeypatch):
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: 46.5)
+     port = running_server.server_address[1]
+     running_server.state.update_power_reading(
+         available=True,
+@@ -897,10 +913,24 @@ def test_pwr_over_real_socket_reports_a_real_reading(running_server):
+     assert fields[3:6] == ["13.1", "1.1", "14.41"]
+     assert fields[6:9] == ["12.9", "0.5", "6.45"]
+     assert fields[9:12] == ["87.0", "24.3", "28.1"]
+-    assert fields[12] == "1"
++    assert fields[12] == "46.5"  # cpu_temp -- independent of the Tracer's own available flag
++    assert fields[13] == "1"
+ 
+ 
+-def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values(running_server):
++def test_pwr_cpu_temp_is_reported_even_when_tracer_is_unavailable(running_server, monkeypatch):
++    # The whole point of reading cpu_temp outside of update_power_reading():
++    # an unplugged Tracer cable must not blank out Pi #1's own CPU reading.
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: 52.1)
++    port = running_server.server_address[1]
++    response = _send_and_receive(port, build_sentence("PWR"))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "PWR"
++    assert fields[12] == "52.1"
++    assert fields[-1] == "0"  # Tracer itself still correctly reported as unavailable
++
++
++def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values(running_server, monkeypatch):
++    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+     port = running_server.server_address[1]
+     running_server.state.update_power_reading(available=True, pv_voltage=15.82)
+     running_server.state.update_power_reading(available=False)
+@@ -938,3 +968,144 @@ def test_shutdown_pi_stops_serve_forever_even_if_the_shutdown_command_fails():
+     finally:
+         server.shutdown()
+         server.server_close()
++
++
++# --- HIS / power history (2026-10-05) --------------------------------------
++
++@pytest.fixture()
++def history_server(tmp_path, monkeypatch):
++    """Own fixture rather than reusing `running_server`: HIS needs
++    start_history=True and a throwaway POWER_HISTORY_DB_PATH (tmp_path,
++    so nothing is left behind in the repo and tests never share a
++    database with each other)."""
++    monkeypatch.setenv("POWER_HISTORY_DB_PATH", str(tmp_path / "power_history.db"))
++    server = ControlServer(
++        "127.0.0.1", 0,
++        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
++        start_history=True,
++    )
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield server
++    finally:
++        server.shutdown()
++        server.server_close()
++
++
++def test_his_empty_database_returns_zero_rows(history_server):
++    port = history_server.server_address[1]
++    response = _send_and_receive(port, build_sentence("HIS", "DAY", 0))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "HIS"
++    assert fields[:4] == ["DAY", "0", "0", "0"]
++
++
++def test_his_rejects_bad_period(history_server):
++    port = history_server.server_address[1]
++    response = _send_and_receive(port, build_sentence("HIS", "YEAR", 0))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "ERR"
++    assert fields[0] == "16"
++
++
++def test_his_rejects_wrong_field_count(history_server):
++    port = history_server.server_address[1]
++    response = _send_and_receive(port, build_sentence("HIS", "DAY"))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "ERR"
++    assert fields[0] == "15"
++
++
++def test_his_returns_logged_rows_paginated(history_server, monkeypatch):
++    from link import power_history as ph
++
++    db_path = ph.resolve_db_path()
++    now = int(time.time())
++    # 5 rows, 5 minutes apart, well inside the DAY window.
++    for i in range(5):
++        sample = {key: float(i) for key in ph.FIELD_ORDER}
++        sample["ts"] = now - i * 300
++        sample["lat"] = None
++        sample["lon"] = None
++        ph.insert_sample(db_path, sample)
++
++    port = history_server.server_address[1]
++
++    # HIS_CHUNK_ROWS is 100 by default, well above 5 -- one page covers
++    # everything, but patch it down to 2 here so the pagination offset
++    # logic itself (not just "small enough to fit in one page") is
++    # actually exercised.
++    monkeypatch.setattr(ph, "HIS_CHUNK_ROWS", 2)
++
++    collected = []
++    offset = 0
++    while True:
++        response = _send_and_receive(port, build_sentence("HIS", "DAY", offset))
++        sentence_type, fields = parse_sentence(response)
++        assert sentence_type == "HIS"
++        period, total_count, resp_offset, returned_count = (
++            fields[0], int(fields[1]), int(fields[2]), int(fields[3]),
++        )
++        assert period == "DAY"
++        assert total_count == 5
++        assert resp_offset == offset
++        row_fields = fields[4:]
++        assert len(row_fields) == returned_count * len(ph.FIELD_ORDER)
++        collected.extend(row_fields)
++        offset += returned_count
++        if returned_count == 0 or offset >= total_count:
++            break
++
++    assert len(collected) == 5 * len(ph.FIELD_ORDER)
++
++
++def test_power_history_logger_skips_writes_when_tracer_unavailable(history_server):
++    # The control server's own PowerHistoryLogger ticks every
++    # POWER_LOG_INTERVAL_S (5 minutes by default) -- far too slow for a
++    # test, so this calls its _log_once() directly rather than waiting.
++    # No Tracer is running in this fixture (start_tracer=False), so
++    # state.power_status()["available"] is always False/None here --
++    # exactly the case test_his_empty_database_returns_zero_rows above
++    # already covers end-to-end; this test names the gating rule
++    # explicitly so a future change that logs unconditionally fails
++    # loudly.
++    history_server.power_history_logger._log_once()
++    from link import power_history as ph
++    total, _ = ph.fetch_period_chunk(ph.resolve_db_path(), "DAY", 0)
++    assert total == 0
++
++
++def test_snapshot_is_geotagged_on_successful_cam_snap(history_server, monkeypatch):
++    # _request_snapshot() calls camera/stream_server.py over HTTP --
++    # mock urlopen so this runs without a camera process actually
++    # running.
++    import json
++
++    class FakeResponse:
++        status = 200
++
++        def read(self):
++            return json.dumps({"ok": True, "file": "snap_0001.jpg"}).encode()
++
++        def __enter__(self):
++            return self
++
++        def __exit__(self, *args):
++            return False
++
++    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", lambda *a, **k: FakeResponse())
++
++    state = history_server.state
++    with state._lock:
++        state.current_lat = 48.8566
++        state.current_lon = 2.3522
++    state.camera_command("SNAP")
++
++    from link import power_history as ph
++    import sqlite3
++    conn = sqlite3.connect(ph.resolve_db_path())
++    row = conn.execute(
++        "SELECT filename, lat, lon FROM snapshots WHERE filename=?", ("snap_0001.jpg",)
++    ).fetchone()
++    assert row == ("snap_0001.jpg", 48.8566, 2.3522)

@@ -1,0 +1,931 @@
+diff --git a/.env.example b/.env.example
+index 22c1bef..5e97836 100644
+--- a/.env.example
++++ b/.env.example
+@@ -25,6 +25,20 @@ CAMERA_DEVICE=/dev/video0
+ #CAMERA_SNAPSHOT_DIR=camera/tmp
+ #CAMERA_RECORDING_DIR=camera/recordings
+ 
++# EPever Tracer solar charge controller over RS485 (used by
++# link/tracer_reader.py, run via `python3 -m link`). TRACER_DEVICE is the
++# one usually needed -- find it with `ls /dev/ttyCH343USB*` (the
++# CC-USB-RS485-150U cable's ch343 driver device node; see README.md's
++# "Liaison RS485 / Tracer" section for the driver setup). Leave the
++# others commented out to keep their built-in defaults (115200 8N1,
++# slave id 1, polled every 3s). Set TRACER_ENABLED=false to disable this
++# entirely (e.g. on a dev machine, or if the cable isn't wired up yet).
++TRACER_DEVICE=/dev/ttyCH343USB0
++#TRACER_BAUDRATE=115200
++#TRACER_SLAVE_ID=1
++#TRACER_POLL_INTERVAL_S=3.0
++#TRACER_ENABLED=true
++
+ # Gamepad control (used by link/server.py, run via `python3 -m link`).
+ # Only needed if this project's actual controller/receiver reports a
+ # button under a different evdev code than the "standard" Xbox mapping
+diff --git a/README.md b/README.md
+index 5b71638..9f7cbc0 100644
+--- a/README.md
++++ b/README.md
+@@ -189,6 +189,22 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
+   qui l'a annulée) — déjà au format ddmm.mmmm, donc renvoyée telle quelle.
+   Ni l'une ni l'autre ne modifie l'état du robot : ce sont de pures
+   lectures, comme `STA`.
++- `PWR` (2026-10-03, nouvelle trame en requête, sans champ) : ajoutée pour
++  la page `/power` dédiée du site web (`robot-webserver`), qui affiche en
++  direct les données du boîtier de charge solaire EPever Tracer. Répond
++  avec `pv_voltage, pv_current, pv_power, battery_voltage,
++  battery_charging_current, battery_charging_power, load_voltage,
++  load_current, load_power, battery_soc, battery_temp, controller_temp,
++  available` (13 champs — voir `link/robot_state.py`,
++  `RobotState.power_status()`) : les 12 premiers viennent de
++  `link/tracer_reader.py` (voir section dédiée ci-dessous), `0.0` tant
++  qu'aucune lecture n'a encore réussi ; `available` vaut `1` si la
++  dernière interrogation du Tracer a réussi, `0` sinon (câble débranché,
++  Tracer non alimenté, erreur CRC...) — dans ce dernier cas les 12 autres
++  champs gardent leur dernière valeur connue plutôt que de retomber à
++  `0.0`, pour éviter un affichage qui clignote à chaque erreur passagère.
++  Trame pure lecture, comme `STA`/`WPT`/`GRT` : ne modifie rien dans
++  `RobotState`.
+ 
+ ## Pilotage moteur et manette (`motor_control/motor_driver.py`, `link/gamepad_handler.py`)
+ 
+@@ -285,9 +301,11 @@ flowchart TB
+     WEB["Site web (Pi #2)<br/>TCP :5050"] --> TCP["ControlServer<br/>(link/server.py)"]
+     XBOX["Manette Xbox"] --> GAMEPAD["GamepadReader<br/>(link/gamepad_handler.py)"]
+     GPSDEV["Récepteur GPS"] --> GPS["GPSReader<br/>(link/gps_reader.py)"]
++    TRACERDEV["Tracer EPever (RS485)"] --> TRACER["TracerReader<br/>(link/tracer_reader.py)"]
+     TCP --> STATE[("RobotState (partagé)")]
+     GAMEPAD --> STATE
+     GPS --> STATE
++    TRACER --> STATE
+     STATE --> AUTOPILOT["Autopilot<br/>(link/autopilot.py)"]
+     AUTOPILOT --> STATE
+     STATE --> DRIVER["MotorDriver<br/>(motor_control/motor_driver.py)"]
+@@ -607,6 +625,55 @@ La dégradation propre (récepteur absent, bibliothèques absentes) a en
+ revanche été vérifiée pour de vrai : le serveur démarre et répond
+ normalement dans les deux cas.
+ 
++## Liaison RS485 / Tracer (`link/tracer_reader.py`)
++
++Tourne automatiquement en arrière-plan dans `link/server.py` (désactivable
++avec `TRACER_ENABLED=false`), même principe que `GPSReader` : interroge en
++boucle (toutes les `TRACER_POLL_INTERVAL_S`, 3s par défaut) le boîtier de
++charge solaire EPever Tracer en Modbus RTU via le câble USB-RS485
++CC-USB-RS485-150U, et met à jour les champs lus par `PWR` (tension/courant/
++puissance PV, tension batterie, courant/puissance de charge, tension/
++courant/puissance de la sortie "load", température batterie et
++contrôleur, état de charge). Se dégrade proprement si le câble n'est pas
++branché (ou si `pyserial` n'est pas installé) : un avertissement dans les
++logs, et le serveur de contrôle continue de fonctionner normalement avec
++`PWR` renvoyant le placeholder `0.0`/`available=0`.
++
++Le câble utilise la puce WCH CH343 (`1a86:55d3`), **pas** la puce Exar
++XR21V1410 initialement supposée en tout début de projet — voir le pilote
++`ch343ser_linux` (dépôt officiel WCH) et sa règle udev `99-ch34x.rules`
++(nécessaire car la puce est aussi détectée par le pilote générique
++`cdc_acm` du noyau, qui la capture avant `ch343` sans cette règle).
++Device par défaut : `/dev/ttyCH343USB0`.
++
++```bash
++python3 -m link                           # Tracer sur /dev/ttyCH343USB0 @ 115200 bauds par défaut
++TRACER_DEVICE=/dev/ttyUSB0 python3 -m link  # port série personnalisé
++TRACER_ENABLED=false python3 -m link      # désactive la lecture Tracer (câble pas encore branché)
++```
++
++**Registres Modbus lus** (protocole officiel EPEVER B-series V2.3, deux
++blocs non contigus, deux requêtes séparées — voir le docstring de
++`link/tracer_reader.py` pour le détail et les sources croisées) :
++"Real-time Datum" (`0x3100`, fonction `0x04`) pour le PV/charge/load/
++températures/SOC, "Statistical Parameters" (`0x331A`) pour la tension
++batterie et le courant de charge batterie.
++
++**Partiellement vérifié sur le vrai matériel** : le calcul de CRC16 et la
++lecture d'un seul registre (`0x3100`, tension PV) ont été validés contre
++le vrai Tracer le 2026-10-03 (script `check_tracer.py`, délivré
++séparément, hors de ce dépôt). La lecture multi-registres que
++`read_power_snapshot()` effectue réellement (les deux blocs complets) n'a
++PAS encore tourné contre le vrai boîtier — `tests/test_tracer_reader.py`
++la couvre contre un faux port série, mais une vérification `python3 -c
++"..."` (ou simplement regarder une fois les valeurs renvoyées par `PWR`)
++sur la Pi reste à faire avant de faire confiance aux champs
++batterie/charge/load/température/SOC. L'état de charge (SOC, registre
++`0x311A`) en particulier n'est PAS mis à l'échelle (`/100`) dans le code
++actuel, contrairement à tous les autres champs — si la valeur affichée
++semble fausse d'un facteur 100 (ex: "0.85 %" au lieu de "85 %"), c'est le
++premier endroit à vérifier.
++
+ ## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
+ 
+ Trois variantes de `motor_control/remote_control.py` (même manette, mêmes
+diff --git a/link/robot_state.py b/link/robot_state.py
+index 46b84df..ed6ac92 100644
+--- a/link/robot_state.py
++++ b/link/robot_state.py
+@@ -164,6 +164,36 @@ class RobotState:
+         # whether the next press should send REC_START or REC_STOP, so
+         # one button toggles both directions.
+         self.is_recording = False
++        # PWR (2026-10-03): latest EPever Tracer reading, set by
++        # link.tracer_reader.TracerReader in the background -- same "live
++        # hardware fix, set by a background reader" shape as current_lat/
++        # current_lon above. None until the first successful read ever
++        # arrives, so power_status() can report the honest "no cable
++        # connected / not read yet" placeholder for as long as that's
++        # true, exactly like current_lat/current_lon do for the GPS.
++        self.pv_voltage = None
++        self.pv_current = None
++        self.pv_power = None
++        self.battery_voltage = None
++        self.battery_charging_current = None
++        self.battery_charging_power = None
++        self.load_voltage = None
++        self.load_current = None
++        self.load_power = None
++        self.battery_soc = None
++        self.battery_temp = None
++        self.controller_temp = None
++        # Tri-state, same reasoning as is_dgps above: None = never read
++        # successfully (no cable, or the reader hasn't run yet), True =
++        # the most recent poll succeeded, False = the most recent poll
++        # failed (cable unplugged mid-run, Tracer unpowered, CRC error...)
++        # -- distinguishing "never worked" from "was working, now isn't"
++        # is worth keeping for the power page's status badge. The last
++        # known-good values above are deliberately left untouched on a
++        # failed poll rather than reset to None/0 -- a stale-but-plausible
++        # reading is more useful on screen than a flicker back to zero.
++        self.power_available = None
++        self.last_power_reading_at = None
+ 
+     # -- STP: emergency stop, highest priority -------------------------
+     def stop(self):
+@@ -444,6 +474,39 @@ class RobotState:
+         if motor_output is not None and self.motor_driver is not None:
+             self.motor_driver.drive(*motor_output)
+ 
++    # -- PWR: latest EPever Tracer reading, set by link.tracer_reader ----
++    def update_power_reading(self, available, pv_voltage=None, pv_current=None,
++                              pv_power=None, battery_voltage=None,
++                              battery_charging_current=None, battery_charging_power=None,
++                              load_voltage=None, load_current=None, load_power=None,
++                              battery_soc=None, battery_temp=None, controller_temp=None):
++        """Called by link.tracer_reader.TracerReader on every poll (success
++        or failure). `available=False` (a failed poll -- cable unplugged,
++        Tracer unpowered, a CRC/timeout error) only updates power_available
++        and leaves every other field at its last known-good value -- see
++        the __init__ comment above these fields for why a stale reading
++        beats flickering back to a 0.0 placeholder. `available=True`
++        always comes with every field actually filled in (see
++        link.tracer_reader.read_power_snapshot, which is all-or-nothing by
++        construction), so there's no partial-update case to handle here."""
++        with self._lock:
++            self.power_available = available
++            if not available:
++                return
++            self.pv_voltage = pv_voltage
++            self.pv_current = pv_current
++            self.pv_power = pv_power
++            self.battery_voltage = battery_voltage
++            self.battery_charging_current = battery_charging_current
++            self.battery_charging_power = battery_charging_power
++            self.load_voltage = load_voltage
++            self.load_current = load_current
++            self.load_power = load_power
++            self.battery_soc = battery_soc
++            self.battery_temp = battery_temp
++            self.controller_temp = controller_temp
++            self.last_power_reading_at = time.time()
++
+     def _advance_route_if_arrived(self):
+         """Called with self._lock already held, on every new GPS fix. This
+         is what makes RTE "chase the whole list" rather than just remember
+@@ -682,3 +745,22 @@ class RobotState:
+                 # extension.
+                 "is_recording": self.is_recording,
+             }
++
++    # -- PWR: solar/battery/load status snapshot for the power page --------
++    def power_status(self):
++        with self._lock:
++            return {
++                "pv_voltage": self.pv_voltage,
++                "pv_current": self.pv_current,
++                "pv_power": self.pv_power,
++                "battery_voltage": self.battery_voltage,
++                "battery_charging_current": self.battery_charging_current,
++                "battery_charging_power": self.battery_charging_power,
++                "load_voltage": self.load_voltage,
++                "load_current": self.load_current,
++                "load_power": self.load_power,
++                "battery_soc": self.battery_soc,
++                "battery_temp": self.battery_temp,
++                "controller_temp": self.controller_temp,
++                "available": self.power_available,
++            }
+diff --git a/link/server.py b/link/server.py
+index 82ec4de..c6d13c9 100644
+--- a/link/server.py
++++ b/link/server.py
+@@ -20,6 +20,13 @@ from link.gamepad_handler import GamepadReader, robot_state_button_handler, robo
+ from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
+ from link.nmea import SentenceError, build_sentence, decimal_to_nmea, parse_sentence
+ from link.robot_state import CommandError, RobotState
++from link.tracer_reader import (
++    DEFAULT_BAUDRATE as TRACER_DEFAULT_BAUDRATE,
++    DEFAULT_DEVICE as TRACER_DEFAULT_DEVICE,
++    DEFAULT_POLL_INTERVAL_S as TRACER_DEFAULT_POLL_INTERVAL_S,
++    DEFAULT_SLAVE_ID as TRACER_DEFAULT_SLAVE_ID,
++    TracerReader,
++)
+ from motor_control.motor_driver import MotorDriver
+ 
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+@@ -210,6 +217,39 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
+             dgps_field,
+         )
+ 
++    if sentence_type == "PWR":
++        # Query, no fields: returns the latest EPever Tracer reading (see
++        # link.tracer_reader.TracerReader, which polls it in the
++        # background) for robot-webserver's dedicated /power page
++        # (2026-10-03). Same "0.0 placeholder until real hardware data
++        # arrives" shape as STA's lat/lon -- see RobotState.power_status()
++        # and its __init__ comment for why `available` is a trailing
++        # 1/0 flag rather than the values themselves going None on the
++        # wire (this protocol is text-only, there's no clean "null"
++        # field -- the flag is what the power page actually checks before
++        # trusting the numbers next to it).
++        p = state.power_status()
++        available = p["available"] is True
++        # float(...) before round(): battery_soc in particular is a plain
++        # int (see link.tracer_reader.read_power_snapshot) -- round(87, 1)
++        # returns the int 87, not 87.0, which would make this one field
++        # format as "87" instead of "87.0" on the wire. Forcing float
++        # first keeps every numeric field consistently formatted
++        # regardless of what type the underlying reading happens to be.
++        return build_sentence(
++            "PWR",
++            round(float(p["pv_voltage"] or 0.0), 2), round(float(p["pv_current"] or 0.0), 2),
++            round(float(p["pv_power"] or 0.0), 2),
++            round(float(p["battery_voltage"] or 0.0), 2),
++            round(float(p["battery_charging_current"] or 0.0), 2),
++            round(float(p["battery_charging_power"] or 0.0), 2),
++            round(float(p["load_voltage"] or 0.0), 2), round(float(p["load_current"] or 0.0), 2),
++            round(float(p["load_power"] or 0.0), 2),
++            round(float(p["battery_soc"] or 0.0), 1),
++            round(float(p["battery_temp"] or 0.0), 1), round(float(p["controller_temp"] or 0.0), 1),
++            1 if available else 0,
++        )
++
+     raise CommandError("11", f"UNKNOWN_SENTENCE_TYPE:{sentence_type}")
+ 
+ 
+@@ -248,7 +288,7 @@ class ControlServer(socketserver.ThreadingTCPServer):
+     daemon_threads = True
+ 
+     def __init__(self, host, port, state: RobotState = None, start_gps: bool = True,
+-                 start_motor: bool = True, start_gamepad: bool = True):
++                 start_motor: bool = True, start_gamepad: bool = True, start_tracer: bool = True):
+         super().__init__((host, port), ControlHandler)
+ 
+         # MotorDriver is always constructed (cheap -- no hardware is
+@@ -325,6 +365,26 @@ class ControlServer(socketserver.ThreadingTCPServer):
+                 )
+                 self.gamepad_reader.start()
+ 
++        self.tracer_reader = None
++        if start_tracer:
++            # TRACER_ENABLED=false disables this entirely -- same escape
++            # hatch as GPS_ENABLED/CAMERA_ENABLED/MOTOR_ENABLED/
++            # GAMEPAD_ENABLED above, useful on a dev machine or if the
++            # RS485 cable isn't plugged in at all (this already degrades
++            # gracefully even when left on, see TracerReader, but the env
++            # var avoids even trying).
++            if os.environ.get("TRACER_ENABLED", "true").lower() not in ("false", "0", "no"):
++                self.tracer_reader = TracerReader(
++                    self.state,
++                    device=os.environ.get("TRACER_DEVICE", TRACER_DEFAULT_DEVICE),
++                    baudrate=int(os.environ.get("TRACER_BAUDRATE", TRACER_DEFAULT_BAUDRATE)),
++                    slave_id=int(os.environ.get("TRACER_SLAVE_ID", TRACER_DEFAULT_SLAVE_ID)),
++                    poll_interval=float(
++                        os.environ.get("TRACER_POLL_INTERVAL_S", TRACER_DEFAULT_POLL_INTERVAL_S)
++                    ),
++                )
++                self.tracer_reader.start()
++
+     def _on_gps_quality_change(self, is_dgps):
+         """Wired in as link.gps_reader.GPSReader's on_gps_quality callback
+         above -- called on the GPS background thread the instant the live
+diff --git a/link/tracer_reader.py b/link/tracer_reader.py
+new file mode 100644
+index 0000000..82c6964
+--- /dev/null
++++ b/link/tracer_reader.py
+@@ -0,0 +1,269 @@
++"""Background EPever Tracer (solar charge controller) reader: polls the
++charge controller over Modbus RTU (RS485, via the CC-USB-RS485-150U cable
++and its ch343 kernel driver -- see README.md's "Liaison RS485 / Tracer"
++section) and updates a RobotState with the latest power readings, so the
++new PWR sentence (see link/server.py and pages/power.html on
++robot-webserver) can report real solar/battery/load data instead of a
++placeholder.
++
++Kept separate from the standalone check_tracer.py diagnostic script
++(delivered earlier, not part of this repo) rather than importing it: that
++script is a one-shot CLI tool that opens the port, asks one question and
++exits -- this module owns a long-lived connection in a background thread
++instead, polling repeatedly, and degrades gracefully if the cable isn't
++there. Same "optional, best-effort hardware" pattern already used for the
++live camera feed (camera/stream_server.py) and the GPS receiver
++(link/gps_reader.py): a missing/unplugged cable logs a warning and leaves
++RobotState's power fields at their honest "unavailable" placeholder
++rather than crashing the whole control server.
++
++MODBUS REGISTER MAP -- EPever B-series protocol (official EPEVER
++"Communication Protocol V2.3"), confirmed against an independent
++open-source implementation (rosswarren/epevermodbus). Two separate
++blocks, read as two separate Modbus requests since they aren't address-
++contiguous:
++  - "Real-time Datum" (function 0x04, base 0x3100): PV voltage/current/
++    power, battery charging power, load voltage/current/power, battery
++    and controller temperature, battery SOC.
++  - "Statistical Parameters" (function 0x04, base 0x331A): battery
++    voltage and battery charging current -- NOT in the 0x3100 block
++    (a documented EPever quirk; see the diysolarforum thread "Epever
++    Tracer Modbus - digging deeper" for the community history of
++    confusion around this exact split).
++All values are /100 except battery SOC, which is a plain percentage
++(verified against the chip's own register table, NOT yet cross-checked
++against this project's real Tracer display -- flag any obviously wrong
++SOC reading, e.g. "0.85%" instead of "85%", if that turns out to be
++backwards on this particular firmware).
++
++IMPORTANT -- honesty note, same as link/gps_reader.py: pyserial is
++already a requirement (used by gps_reader.py too), but this module's
++Modbus framing (CRC16, request building, response parsing) was validated
++standalone against the real Tracer hardware on 2026-10-03 via a one-off
++diagnostic script (single-register read of 0x3100, the PV voltage
++register) -- NOT yet against the full multi-register reads this module
++actually performs. Run `pytest tests/test_tracer_reader.py` (mock-based,
++always runs) AND a real read on the Pi before relying on the full field
++set (battery/load/temperature/SOC) in the field.
++"""
++import logging
++import threading
++import time
++
++log = logging.getLogger("link.tracer_reader")
++
++try:
++    import serial
++    _SERIAL_AVAILABLE = True
++    _SERIAL_IMPORT_ERROR = None
++except ImportError as exc:  # pragma: no cover -- exercised whenever pyserial
++    # isn't installed (e.g. this project's dev sandbox); on the Pi, with
++    # requirements.txt installed, this branch is never taken.
++    serial = None
++    _SERIAL_AVAILABLE = False
++    _SERIAL_IMPORT_ERROR = exc
++
++DEFAULT_DEVICE = "/dev/ttyCH343USB0"  # the RS485 cable's ch343 driver device node
++DEFAULT_BAUDRATE = 115200
++DEFAULT_SLAVE_ID = 1
++DEFAULT_POLL_INTERVAL_S = 3.0  # matches STA's own polling cadence (robot-webserver)
++DEFAULT_READ_TIMEOUT_S = 1.0
++
++# -- Modbus register map (see module docstring) ------------------------------
++REALTIME_START = 0x3100
++REALTIME_QUANTITY = 0x1B  # covers 0x3100..0x311A inclusive (27 registers)
++BATTERY_START = 0x331A
++BATTERY_QUANTITY = 3      # covers 0x331A..0x331C inclusive
++
++# Offsets within the REALTIME block (index = address - REALTIME_START).
++_PV_VOLTAGE = 0x00        # 0x3100, /100, V
++_PV_CURRENT = 0x01        # 0x3101, /100, A
++_PV_POWER = 0x02          # 0x3102-0x3103 (double), /100, W
++_BATTERY_CHARGING_POWER = 0x06  # 0x3106-0x3107 (double), /100, W
++_LOAD_VOLTAGE = 0x0C      # 0x310C, /100, V
++_LOAD_CURRENT = 0x0D      # 0x310D, /100, A
++_LOAD_POWER = 0x0E        # 0x310E-0x310F (double), /100, W
++_BATTERY_TEMP = 0x10      # 0x3110, /100, signed, degC
++_CONTROLLER_TEMP = 0x11   # 0x3111, /100, signed, degC
++_BATTERY_SOC = 0x1A       # 0x311A, NOT scaled, %
++
++# Offsets within the BATTERY block (index = address - BATTERY_START).
++_BATTERY_VOLTAGE = 0x00          # 0x331A, /100, V
++_BATTERY_CHARGING_CURRENT = 0x01  # 0x331B-0x331C (double, signed), /100, A
++
++
++class ModbusError(Exception):
++    """Raised by read_input_registers() for anything that keeps a request
++    from yielding a trustworthy set of register values -- timeout,
++    truncated response, a Modbus exception reply, or a CRC mismatch. One
++    exception type for all of these since every caller in this module
++    reacts the same way (log and treat this poll as failed)."""
++
++
++def modbus_crc16(data: bytes) -> bytes:
++    """Modbus RTU CRC-16 (polynomial 0xA001, init 0xFFFF, LSB-first).
++    Transmitted low byte first, then high byte -- exactly what
++    to_bytes(2, 'little') produces. Verified 2026-10-03 against the
++    textbook reference frame 01 03 00 00 00 0A -> C5 CD (see
++    tests/test_tracer_reader.py)."""
++    crc = 0xFFFF
++    for byte in data:
++        crc ^= byte
++        for _ in range(8):
++            if crc & 1:
++                crc = (crc >> 1) ^ 0xA001
++            else:
++                crc >>= 1
++    return crc.to_bytes(2, "little")
++
++
++def build_read_input_registers(slave_id: int, start_register: int, quantity: int) -> bytes:
++    """Builds a Modbus RTU function-0x04 (Read Input Registers) request."""
++    body = bytes([
++        slave_id, 0x04,
++        (start_register >> 8) & 0xFF, start_register & 0xFF,
++        (quantity >> 8) & 0xFF, quantity & 0xFF,
++    ])
++    return body + modbus_crc16(body)
++
++
++def read_input_registers(ser, slave_id: int, start_register: int, quantity: int) -> list:
++    """Sends one function-0x04 request and returns `quantity` raw uint16
++    register values. Raises ModbusError (see its docstring) for any
++    response that isn't a clean, CRC-valid success reply."""
++    request = build_read_input_registers(slave_id, start_register, quantity)
++    ser.reset_input_buffer()
++    ser.write(request)
++    ser.flush()
++
++    expected_len = 5 + 2 * quantity  # slave_id + func + byte_count + data + crc
++    response = ser.read(expected_len)
++
++    if len(response) == 0:
++        raise ModbusError(f"no response from slave {slave_id} (timeout)")
++    if len(response) < 5:
++        raise ModbusError(f"truncated response ({len(response)} bytes)")
++    if response[1] & 0x80:
++        raise ModbusError(f"Modbus exception, code {response[2]:#04x}")
++    if len(response) < expected_len:
++        raise ModbusError(f"incomplete response ({len(response)}/{expected_len} bytes)")
++
++    payload, received_crc = response[:-2], response[-2:]
++    if modbus_crc16(payload) != received_crc:
++        raise ModbusError("CRC mismatch")
++
++    byte_count = response[2]
++    if byte_count != 2 * quantity:
++        raise ModbusError(f"unexpected byte count ({byte_count}, expected {2 * quantity})")
++
++    data = response[3:3 + byte_count]
++    return [int.from_bytes(data[i:i + 2], "big") for i in range(0, byte_count, 2)]
++
++
++def _u32(regs, index):
++    """Combines two consecutive registers into an unsigned 32-bit value --
++    EPever's documented convention is low register first, high register
++    second (ascending address = ascending significance)."""
++    return (regs[index + 1] << 16) | regs[index]
++
++
++def _s32(regs, index):
++    value = _u32(regs, index)
++    return value - 0x100000000 if value >= 0x80000000 else value
++
++
++def _s16(regs, index):
++    value = regs[index]
++    return value - 0x10000 if value >= 0x8000 else value
++
++
++def read_power_snapshot(ser, slave_id: int) -> dict:
++    """Reads both register blocks and returns a dict of scaled, named
++    values. Raises ModbusError (uncaught here -- see TracerReader._loop)
++    if either request fails; a snapshot is all-or-nothing, since a
++    partial reading (e.g. PV data but no battery voltage) is more
++    confusing on the power page than simply retrying next poll."""
++    realtime = read_input_registers(ser, slave_id, REALTIME_START, REALTIME_QUANTITY)
++    battery = read_input_registers(ser, slave_id, BATTERY_START, BATTERY_QUANTITY)
++
++    return {
++        "pv_voltage": realtime[_PV_VOLTAGE] / 100.0,
++        "pv_current": realtime[_PV_CURRENT] / 100.0,
++        "pv_power": _u32(realtime, _PV_POWER) / 100.0,
++        "battery_charging_power": _u32(realtime, _BATTERY_CHARGING_POWER) / 100.0,
++        "load_voltage": realtime[_LOAD_VOLTAGE] / 100.0,
++        "load_current": realtime[_LOAD_CURRENT] / 100.0,
++        "load_power": _u32(realtime, _LOAD_POWER) / 100.0,
++        "battery_temp": _s16(realtime, _BATTERY_TEMP) / 100.0,
++        "controller_temp": _s16(realtime, _CONTROLLER_TEMP) / 100.0,
++        "battery_soc": realtime[_BATTERY_SOC],
++        "battery_voltage": battery[_BATTERY_VOLTAGE] / 100.0,
++        "battery_charging_current": _s32(battery, _BATTERY_CHARGING_CURRENT) / 100.0,
++    }
++
++
++class TracerReader:
++    """Runs in a background thread, polling the Tracer every
++    `poll_interval` seconds and updating `state` (a
++    link.robot_state.RobotState) via state.update_power_reading(). Same
++    "open once, degrade on failure, no retry-reopen" shape as
++    link.gps_reader.GPSReader -- see that module's docstring for the
++    rationale; a cable plugged in after this thread has already given up
++    needs the control server restarted, same as the GPS today."""
++
++    def __init__(self, state, device=DEFAULT_DEVICE, baudrate=DEFAULT_BAUDRATE,
++                 slave_id=DEFAULT_SLAVE_ID, poll_interval=DEFAULT_POLL_INTERVAL_S):
++        self.state = state
++        self.device = device
++        self.baudrate = baudrate
++        self.slave_id = slave_id
++        self.poll_interval = poll_interval
++        self._running = False
++
++    def start(self):
++        self._running = True
++        thread = threading.Thread(target=self._loop, daemon=True)
++        thread.start()
++        return thread
++
++    def stop(self):
++        self._running = False
++
++    def _loop(self):
++        if not _SERIAL_AVAILABLE:
++            log.warning(
++                "pyserial not installed (%s) -- Tracer/solar reading disabled, "
++                "power fields stay unavailable. Run `pip install -r "
++                "requirements.txt` to enable it.",
++                _SERIAL_IMPORT_ERROR,
++            )
++            return
++
++        try:
++            ser = serial.Serial(
++                port=self.device, baudrate=self.baudrate,
++                bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
++                stopbits=serial.STOPBITS_ONE, timeout=DEFAULT_READ_TIMEOUT_S,
++            )
++        except Exception as exc:  # SerialException, FileNotFoundError, PermissionError...
++            log.warning(
++                "Tracer device %s not available (%s) -- power fields stay "
++                "unavailable until the RS485 cable is connected.",
++                self.device, exc,
++            )
++            return
++
++        log.info("Tracer reader started on %s @ %s baud (slave id %s)",
++                  self.device, self.baudrate, self.slave_id)
++        while self._running:
++            try:
++                snapshot = read_power_snapshot(ser, self.slave_id)
++            except ModbusError as exc:
++                log.warning("Tracer read failed: %s", exc)
++                self.state.update_power_reading(available=False)
++            except Exception as exc:  # serial.SerialException mid-operation, etc.
++                log.warning("Tracer serial error: %s", exc)
++                self.state.update_power_reading(available=False)
++            else:
++                self.state.update_power_reading(available=True, **snapshot)
++            time.sleep(self.poll_interval)
+diff --git a/tests/test_link_server.py b/tests/test_link_server.py
+index 40a58d9..0914889 100644
+--- a/tests/test_link_server.py
++++ b/tests/test_link_server.py
+@@ -591,16 +591,18 @@ def test_get_route_returns_a_copy_not_the_live_list():
+ 
+ @pytest.fixture()
+ def running_server():
+-    # start_gps/start_motor/start_gamepad=False: tests don't need a real
+-    # (or attempted) GPS fix, GPIO chip, or gamepad, and this avoids every
+-    # test run making real subprocess/device-scan calls (gpiodetect,
+-    # evdev.list_devices) -- see
+-    # test_control_server_starts_fine_without_gps_hardware below for a
+-    # dedicated check that leaving all three at their True default doesn't
++    # start_gps/start_motor/start_gamepad/start_tracer=False: tests don't
++    # need a real (or attempted) GPS fix, GPIO chip, gamepad, or RS485
++    # read, and this avoids every test run making real subprocess/device-
++    # scan/serial-open calls (gpiodetect, evdev.list_devices,
++    # serial.Serial(...)) -- see
++    # test_control_server_starts_fine_without_gps_hardware and
++    # test_control_server_starts_fine_without_tracer_hardware below for
++    # dedicated checks that leaving these at their True default doesn't
+     # crash when the hardware behind them isn't there.
+     server = ControlServer(
+         "127.0.0.1", 0,  # port 0 = pick a free port
+-        start_gps=False, start_motor=False, start_gamepad=False,
++        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+     )
+     thread = threading.Thread(target=server.serve_forever, daemon=True)
+     thread.start()
+@@ -847,6 +849,68 @@ def test_control_server_starts_fine_without_gps_hardware(monkeypatch):
+         server.server_close()
+ 
+ 
++def test_control_server_starts_fine_without_tracer_hardware(monkeypatch):
++    # Same idea as test_control_server_starts_fine_without_gps_hardware,
++    # for the RS485/Tracer reader (2026-10-03): a device path that cannot
++    # possibly exist must never crash server startup, and PWR must still
++    # answer (with the "unavailable" placeholder) rather than hang or
++    # raise.
++    monkeypatch.setenv("TRACER_DEVICE", "/dev/definitely-not-a-real-device")
++    server = ControlServer("127.0.0.1", 0)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        response = _send_and_receive(
++            server.server_address[1], build_sentence("PWR")
++        )
++        sentence_type, fields = parse_sentence(response)
++        assert sentence_type == "PWR"
++        assert fields[-1] == "0"  # available=0 -- no Tracer ever read
++    finally:
++        server.shutdown()
++        server.server_close()
++
++
++# --- PWR (2026-10-03, for robot-webserver's /power page) --------------------
++
++def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_server):
++    port = running_server.server_address[1]
++    response = _send_and_receive(port, build_sentence("PWR"))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "PWR"
++    assert fields == ["0.0"] * 9 + ["0.0", "0.0", "0.0", "0"]
++
++
++def test_pwr_over_real_socket_reports_a_real_reading(running_server):
++    port = running_server.server_address[1]
++    running_server.state.update_power_reading(
++        available=True,
++        pv_voltage=15.82, pv_current=1.2, pv_power=18.98,
++        battery_voltage=13.1, battery_charging_current=1.1, battery_charging_power=14.41,
++        load_voltage=12.9, load_current=0.5, load_power=6.45,
++        battery_soc=87, battery_temp=24.3, controller_temp=28.1,
++    )
++    response = _send_and_receive(port, build_sentence("PWR"))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "PWR"
++    assert fields[0:3] == ["15.82", "1.2", "18.98"]
++    assert fields[3:6] == ["13.1", "1.1", "14.41"]
++    assert fields[6:9] == ["12.9", "0.5", "6.45"]
++    assert fields[9:12] == ["87.0", "24.3", "28.1"]
++    assert fields[12] == "1"
++
++
++def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values(running_server):
++    port = running_server.server_address[1]
++    running_server.state.update_power_reading(available=True, pv_voltage=15.82)
++    running_server.state.update_power_reading(available=False)
++    response = _send_and_receive(port, build_sentence("PWR"))
++    sentence_type, fields = parse_sentence(response)
++    assert sentence_type == "PWR"
++    assert fields[0] == "15.82"  # last known-good value, not reset to 0.0
++    assert fields[-1] == "0"     # but correctly flagged as stale/unavailable
++
++
+ # --- BTN_START -> ControlServer._shutdown_pi (2026-09-12) -------------------
+ # subprocess.run is mocked in every test here -- this must NEVER actually
+ # run `sudo poweroff` (or whatever SHUTDOWN_CMD is set to) against the
+diff --git a/tests/test_tracer_reader.py b/tests/test_tracer_reader.py
+new file mode 100644
+index 0000000..424e44d
+--- /dev/null
++++ b/tests/test_tracer_reader.py
+@@ -0,0 +1,233 @@
++"""Tests for link.tracer_reader: pure Modbus framing/math (always runs,
++no dependencies) plus TracerReader's background loop against a fake
++serial port (needs pyserial importable -- see conftest.py's note on why
++gpiod/evdev are stubbed there; pyserial itself has no such stub since
++link.gps_reader already requires it unconditionally for this whole test
++suite to import link.server).
++
++Honesty note, same as tests/test_gps_reader.py: the CRC16/request-framing
++logic (modbus_crc16, build_read_input_registers, a single-register read of
++0x3100) WAS validated against the real Tracer hardware on 2026-10-03 (see
++the standalone check_tracer.py diagnostic delivered that day) -- the
++multi-register reads read_power_snapshot() performs (the 0x3100 and
++0x331A blocks together) have NOT been run against the real device yet.
++Run a real read on the Pi (e.g. via the new PWR sentence, or a quick
++`python3 -c "..."` using read_power_snapshot directly) before trusting
++the full field set in the field.
++"""
++import pytest
++
++serial = pytest.importorskip("serial")  # noqa: F841 -- just probing availability
++
++from link.tracer_reader import (  # noqa: E402
++    BATTERY_QUANTITY,
++    BATTERY_START,
++    REALTIME_QUANTITY,
++    REALTIME_START,
++    ModbusError,
++    TracerReader,
++    _BATTERY_CHARGING_CURRENT,
++    _BATTERY_CHARGING_POWER,
++    _BATTERY_SOC,
++    _BATTERY_TEMP,
++    _BATTERY_VOLTAGE,
++    _CONTROLLER_TEMP,
++    _LOAD_CURRENT,
++    _LOAD_POWER,
++    _LOAD_VOLTAGE,
++    _PV_CURRENT,
++    _PV_POWER,
++    _PV_VOLTAGE,
++    build_read_input_registers,
++    modbus_crc16,
++    read_input_registers,
++    read_power_snapshot,
++)
++from link.robot_state import RobotState  # noqa: E402
++
++
++# --- modbus_crc16 / build_read_input_registers (pure math) ------------------
++
++def test_modbus_crc16_matches_the_textbook_reference_frame():
++    # 01 03 00 00 00 0A -> C5 CD, transmitted low byte first -- the same
++    # vector this project self-verified by hand on 2026-10-03 before
++    # trusting the algorithm (see check_tracer.py's delivery message).
++    assert modbus_crc16(bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x0A])) == bytes([0xC5, 0xCD])
++
++
++def test_build_read_input_registers_matches_the_real_validated_request():
++    # The exact bytes this project sent to the real Tracer on 2026-10-03
++    # (slave 1, function 0x04, register 0x3100, quantity 1) and got a
++    # real, CRC-valid 15.82V reply back for.
++    request = build_read_input_registers(1, 0x3100, 1)
++    assert request == bytes([0x01, 0x04, 0x31, 0x00, 0x00, 0x01, 0x3F, 0x36])
++
++
++# --- read_input_registers (needs a fake serial port) -------------------------
++
++class FakeSerial:
++    """Queue of canned responses: each call to read() pops (a prefix of)
++    the next one. write()/flush()/reset_input_buffer() are no-ops that
++    just record what was sent, same shape as camera/stream_server.py's
++    tests' fakes elsewhere in this project."""
++
++    def __init__(self):
++        self.sent = []
++        self.responses = []
++
++    def reset_input_buffer(self):
++        pass
++
++    def write(self, data):
++        self.sent.append(bytes(data))
++
++    def flush(self):
++        pass
++
++    def read(self, n):
++        if not self.responses:
++            return b""
++        return self.responses.pop(0)[:n]
++
++
++def _framed(payload: bytes) -> bytes:
++    return payload + modbus_crc16(payload)
++
++
++def test_read_input_registers_success():
++    # Real captured reply from the Tracer for register 0x3100 (PV voltage
++    # = 0x062E / 100 = 15.82V), 2026-10-03.
++    ser = FakeSerial()
++    ser.responses = [_framed(bytes([0x01, 0x04, 0x02, 0x06, 0x2E]))]
++    assert read_input_registers(ser, 1, 0x3100, 1) == [0x062E]
++
++
++def test_read_input_registers_raises_on_timeout():
++    ser = FakeSerial()
++    ser.responses = [b""]
++    with pytest.raises(ModbusError, match="timeout"):
++        read_input_registers(ser, 1, 0x3100, 1)
++
++
++def test_read_input_registers_raises_on_truncated_response():
++    ser = FakeSerial()
++    ser.responses = [bytes([0x01, 0x04])]
++    with pytest.raises(ModbusError, match="truncated"):
++        read_input_registers(ser, 1, 0x3100, 1)
++
++
++def test_read_input_registers_raises_on_modbus_exception_reply():
++    ser = FakeSerial()
++    ser.responses = [_framed(bytes([0x01, 0x84, 0x02]))]  # illegal data address
++    with pytest.raises(ModbusError, match="exception"):
++        read_input_registers(ser, 1, 0x3100, 1)
++
++
++def test_read_input_registers_raises_on_crc_mismatch():
++    ser = FakeSerial()
++    ser.responses = [bytes([0x01, 0x04, 0x02, 0x06, 0x2E, 0x00, 0x00])]  # wrong CRC
++    with pytest.raises(ModbusError, match="CRC"):
++        read_input_registers(ser, 1, 0x3100, 1)
++
++
++# --- read_power_snapshot (both register blocks, double-registers, signed) ---
++
++def _registers_to_response(regs):
++    data = b"".join(v.to_bytes(2, "big") for v in regs)
++    payload = bytes([0x01, 0x04, len(data)]) + data
++    return _framed(payload)
++
++
++def test_read_power_snapshot_decodes_every_field_correctly():
++    realtime = [0] * REALTIME_QUANTITY
++    realtime[_PV_VOLTAGE] = 1582          # 15.82 V
++    realtime[_PV_CURRENT] = 120           # 1.20 A
++    realtime[_PV_POWER] = 1898            # 18.98 W, low word
++    realtime[_PV_POWER + 1] = 0           # high word
++    realtime[_BATTERY_CHARGING_POWER] = 1441
++    realtime[_BATTERY_CHARGING_POWER + 1] = 0
++    realtime[_LOAD_VOLTAGE] = 1290
++    realtime[_LOAD_CURRENT] = 50
++    realtime[_LOAD_POWER] = 645
++    realtime[_LOAD_POWER + 1] = 0
++    realtime[_BATTERY_TEMP] = 2430                # +24.30 degC
++    realtime[_CONTROLLER_TEMP] = 0x10000 - 50      # -0.50 degC (signed int16)
++    realtime[_BATTERY_SOC] = 87                    # NOT /100 -- raw percent
++
++    battery = [0] * BATTERY_QUANTITY
++    battery[_BATTERY_VOLTAGE] = 1310
++    battery[_BATTERY_CHARGING_CURRENT] = 110
++    battery[_BATTERY_CHARGING_CURRENT + 1] = 0
++
++    ser = FakeSerial()
++    ser.responses = [_registers_to_response(realtime), _registers_to_response(battery)]
++    snapshot = read_power_snapshot(ser, 1)
++
++    assert snapshot == {
++        "pv_voltage": 15.82, "pv_current": 1.2, "pv_power": 18.98,
++        "battery_charging_power": 14.41,
++        "load_voltage": 12.9, "load_current": 0.5, "load_power": 6.45,
++        "battery_temp": 24.3, "controller_temp": -0.5, "battery_soc": 87,
++        "battery_voltage": 13.1, "battery_charging_current": 1.1,
++    }
++
++    # Two separate requests, correct target blocks (not address-contiguous).
++    assert build_read_input_registers(1, REALTIME_START, REALTIME_QUANTITY) == ser.sent[0]
++    assert build_read_input_registers(1, BATTERY_START, BATTERY_QUANTITY) == ser.sent[1]
++
++
++def test_read_power_snapshot_raises_if_either_block_fails():
++    # All-or-nothing by design (see module docstring): a working realtime
++    # block but a failing battery block must not silently return a
++    # half-filled dict.
++    ser = FakeSerial()
++    ser.responses = [_registers_to_response([0] * REALTIME_QUANTITY), b""]
++    with pytest.raises(ModbusError):
++        read_power_snapshot(ser, 1)
++
++
++# --- TracerReader background loop (degrade-gracefully paths) ----------------
++
++def test_tracer_reader_degrades_gracefully_with_no_device(monkeypatch):
++    # Device path that cannot possibly exist -- must log and return, never
++    # raise out of the background thread (same contract as GPSReader).
++    state = RobotState()
++    reader = TracerReader(state, device="/dev/definitely-not-a-real-device")
++    reader._loop()  # run synchronously instead of via start(), for the test
++    p = state.power_status()
++    assert p["available"] is None  # never even attempted a poll
++
++
++def test_tracer_reader_updates_state_on_a_successful_poll(monkeypatch):
++    fake_ser = FakeSerial()
++    realtime = [0] * REALTIME_QUANTITY
++    realtime[_PV_VOLTAGE] = 1582
++    battery = [0] * BATTERY_QUANTITY
++    battery[_BATTERY_VOLTAGE] = 1310
++    fake_ser.responses = [_registers_to_response(realtime), _registers_to_response(battery)]
++
++    monkeypatch.setattr(
++        "link.tracer_reader.serial.Serial", lambda *a, **kw: fake_ser
++    )
++
++    state = RobotState()
++    reader = TracerReader(state, poll_interval=0)
++    reader._running = True
++
++    # Run exactly one iteration of the loop body by stopping it right
++    # after the first successful update -- same "drive the loop from the
++    # test" approach as a bare call to _loop() above, just stopping
++    # between iterations instead of never entering the while loop.
++    original_update = state.update_power_reading
++
++    def _update_once(*a, **kw):
++        original_update(*a, **kw)
++        reader._running = False
++
++    monkeypatch.setattr(state, "update_power_reading", _update_once)
++    reader._loop()
++
++    p = state.power_status()
++    assert p["available"] is True
++    assert p["pv_voltage"] == 15.82
++    assert p["battery_voltage"] == 13.1
