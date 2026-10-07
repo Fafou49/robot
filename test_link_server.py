@@ -220,6 +220,45 @@ def test_nav_cancels_an_active_route():
     assert state.route_index == 0
 
 
+# --- NAV/RTE plausibility check (2026-10-07) --------------------------------
+# Catches the "typed in plain decimal degrees instead of this protocol's
+# ddmm.mmmm wire format" mistake -- see RAW_LAT_MAGNITUDE_FLOOR's honesty
+# note in robot_state.py. Both are "valid floats" so the older
+# BAD_LAT_LON_VALUE check alone never caught this.
+
+def test_set_nav_target_rejects_plain_decimal_degrees():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        # 47.391534 is the SAME point as 4723.492 above, just typed as
+        # decimal degrees -- a raw magnitude of 47 is far below
+        # RAW_LAT_MAGNITUDE_FLOOR (90), so this must be rejected rather
+        # than silently decoding to ~0.79 degrees North.
+        state.set_nav_target("47.391534", "N", "0.739006", "W")
+    assert exc_info.value.code == "22"
+    assert "NAV_LAT_LON_IMPLAUSIBLE" in str(exc_info.value)
+    # Rejected before anything else changes -- no half-applied NAV.
+    assert state.nav_target is None
+
+
+def test_set_nav_target_accepts_genuine_ddmm_values_far_from_france():
+    # Sanity check that the floor doesn't reject real points -- including
+    # ones from well outside this project's own usual area (same Munich
+    # example the over-the-wire tests already use), confirming this is a
+    # format check, not a "near France" geography check.
+    state = RobotState()
+    state.set_nav_target("4807.038", "N", "1131.000", "E")
+    assert state.nav_target == ("4807.038", "N", "1131.000", "E")
+
+
+def test_set_route_rejects_plain_decimal_degrees_point():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.set_route(["1", "47.391534", "N", "0.739006", "W"])
+    assert exc_info.value.code == "13"
+    assert "RTE_LAT_LON_IMPLAUSIBLE" in str(exc_info.value)
+    assert state.route == []
+
+
 def test_stop_cancels_an_active_route():
     state = RobotState()
     state.set_route(["1", "4723.492", "N", "00044.340", "W"])
@@ -587,6 +626,38 @@ def test_get_route_returns_a_copy_not_the_live_list():
     assert snapshot == [("4807.038", "N", "1131.000", "E")]
 
 
+def test_get_route_progress_reflects_index_and_return_flag(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.0,20.0,t1\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+
+    # No route yet.
+    route, index, is_return = state.get_route_progress()
+    assert (route, index, is_return) == ([], 0, False)
+
+    # An ordinary GPS Driving route.
+    state.set_route(["2", "4807.038", "N", "1131.000", "E", "4823.192", "N", "1152.500", "E"])
+    route, index, is_return = state.get_route_progress()
+    assert route == [("4807.038", "N", "1131.000", "E"), ("4823.192", "N", "1152.500", "E")]
+    assert (index, is_return) == (0, False)
+
+    # A waypoint return overrides it.
+    state.update_gps_fix(10.0, 20.0)
+    state.start_waypoint_return()
+    route, index, is_return = state.get_route_progress()
+    assert len(route) == 1
+    assert (index, is_return) == (0, True)
+
+
+def test_get_route_progress_returns_a_copy_not_the_live_list():
+    state = RobotState()
+    state.set_route(["1", "4807.038", "N", "1131.000", "E"])
+    snapshot, _, _ = state.get_route_progress()
+    state.stop()
+    assert snapshot == [("4807.038", "N", "1131.000", "E")]
+
+
 # --- End-to-end socket tests ------------------------------------------------
 
 @pytest.fixture()
@@ -697,6 +768,17 @@ def test_sta_after_nav_reports_that_target(running_server):
     assert fields[10:14] == ["4807.038", "N", "1131.0", "E"]
 
 
+def test_nav_rejects_plain_decimal_degrees_over_real_socket(running_server):
+    # Same mistake as test_set_nav_target_rejects_plain_decimal_degrees
+    # (unit-level), checked end-to-end over the actual TCP socket this
+    # time -- see RAW_LAT_MAGNITUDE_FLOOR's honesty note in robot_state.py.
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("NAV", 47.391534, "N", 0.739006, "W"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "ERR"
+    assert fields[0] == "22"
+
+
 def test_sta_reports_a_real_gps_fix_once_one_arrives(running_server):
     # Simulates what link.gps_reader.GPSReader would do once a receiver is
     # attached and gets a fix -- this project's robot operates just west
@@ -786,7 +868,10 @@ def test_grt_over_real_socket_returns_no_points_when_no_route_sent(running_serve
     response = _send_and_receive(port, build_sentence("GRT"))
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "GRT"
-    assert fields == ["0"]
+    # Trailing route_index/mode fields (2026-10-07): 0 and "DRIVE" are
+    # arbitrary-but-consistent defaults here since count is already 0 --
+    # see get_route_progress()/server.py's GRT handler.
+    assert fields == ["0", "0", "DRIVE"]
 
 
 def test_grt_over_real_socket_returns_the_active_route_after_rte(running_server):
@@ -800,6 +885,50 @@ def test_grt_over_real_socket_returns_the_active_route_after_rte(running_server)
     assert fields[0] == "2"
     assert fields[1:5] == ["4807.038", "N", "1131.0", "E"]
     assert fields[5:9] == ["4823.192", "N", "1152.5", "E"]
+    # Trailing route_index/mode fields (2026-10-07): a fresh RTE upload is
+    # a "GPS Driving" route, not yet advanced past its first point.
+    assert fields[9] == "0"
+    assert fields[10] == "DRIVE"
+
+
+def test_grt_over_real_socket_reports_return_mode_after_waypoint_return(
+    running_server, tmp_path, monkeypatch
+):
+    # Isolate WAYPOINTS_FILE (same reasoning as
+    # test_wpt_over_real_socket_returns_saved_waypoints above) -- without
+    # this, save_waypoint() below appends to the real default
+    # waypoints/waypoints.txt, which other running_server-based tests in
+    # this same file may have already written to, making the "exactly 1
+    # waypoint" assumption below flaky depending on test order.
+    monkeypatch.setenv("WAYPOINTS_FILE", str(tmp_path / "waypoints.txt"))
+    port = running_server.server_address[1]
+    running_server.state.update_gps_fix(10.0, 20.0)
+    running_server.state.save_waypoint()
+    running_server.state.start_waypoint_return()
+
+    response = _send_and_receive(port, build_sentence("GRT"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "GRT"
+    assert fields[0] == "1"
+    assert fields[-2:] == ["0", "RETURN"]
+
+
+def test_grt_over_real_socket_reports_route_index_as_robot_advances(running_server):
+    port = running_server.server_address[1]
+    p1 = ("4723.492", "N", "00044.340", "W")   # ~ 47.391533, -0.739
+    p2 = ("4723.532", "N", "00044.292", "W")   # ~ 95m away
+    _send_and_receive(port, build_sentence("RTE", 2, *p1, *p2))
+
+    response = _send_and_receive(port, build_sentence("GRT"))
+    _, fields = parse_sentence(response)
+    assert fields[-2:] == ["0", "DRIVE"]  # not yet arrived at p1
+
+    running_server.state.update_gps_fix(47.391533, -0.739)  # on top of p1
+
+    response = _send_and_receive(port, build_sentence("GRT"))
+    _, fields = parse_sentence(response)
+    assert fields[0] == "2"  # both points still listed -- the map's full route is unaffected
+    assert fields[-2:] == ["1", "DRIVE"]  # but route_index advanced to the next leg
 
 
 def test_rte_over_real_socket_returns_ack(running_server):
@@ -1517,3 +1646,119 @@ def test_mdd_sentence_rejects_bad_wire_kind(history_server):
     resp_type, fields = parse_sentence(response)
     assert resp_type == "ERR"
     assert fields[0] == "19"
+
+
+# -- RTD: delete one point from the active route (2026-10-06) ---------------
+def _route_point(i):
+    return (f"47{i:02d}.000", "N", f"000{i:02d}.000", "W")
+
+
+def test_delete_route_point_ahead_of_current_target_leaves_index_untouched():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2), _route_point(3)]
+    state.route_index = 0
+    state.nav_target = state.route[0]
+
+    state.delete_route_point(2)
+
+    assert state.route == [_route_point(1), _route_point(2)]
+    assert state.route_index == 0
+    assert state.nav_target == _route_point(1)
+
+
+def test_delete_route_point_behind_current_target_shifts_index_down():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2), _route_point(3)]
+    state.route_index = 2
+    state.nav_target = state.route[2]
+
+    state.delete_route_point(0)
+
+    assert state.route == [_route_point(2), _route_point(3)]
+    assert state.route_index == 1
+    assert state.nav_target == _route_point(3)  # untouched -- index 0 < route_index 2
+
+
+def test_delete_route_point_currently_chased_advances_nav_target():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2), _route_point(3)]
+    state.route_index = 1
+    state.nav_target = state.route[1]
+
+    state.delete_route_point(1)
+
+    assert state.route == [_route_point(1), _route_point(3)]
+    assert state.route_index == 1
+    assert state.nav_target == _route_point(3)
+
+
+def test_delete_last_route_point_while_current_target_empties_route():
+    state = RobotState()
+    state.route = [_route_point(1)]
+    state.route_index = 0
+    state.nav_target = state.route[0]
+
+    state.delete_route_point(0)
+
+    assert state.route == []
+    assert state.route_index == 0
+    # Left as-is (the just-deleted point's own coordinates), same "done"
+    # convention _advance_route_if_arrived() already uses once a route
+    # finishes on its own -- see delete_route_point()'s docstring.
+    assert state.nav_target == _route_point(1)
+
+
+def test_delete_route_point_out_of_range_raises():
+    state = RobotState()
+    state.route = [_route_point(1)]
+    with pytest.raises(CommandError) as exc_info:
+        state.delete_route_point(5)
+    assert exc_info.value.code == "21"
+
+
+def test_delete_route_point_keeps_return_raw_lines_in_lockstep():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2)]
+    state.route_index = 0
+    state.nav_target = state.route[0]
+    state.route_is_return = True
+    state._return_raw_lines = ["line1\n", "line2\n"]
+
+    state.delete_route_point(0)
+
+    assert state._return_raw_lines == ["line2\n"]
+    assert state.route == [_route_point(2)]
+    assert state.nav_target == _route_point(2)
+
+
+def test_rtd_sentence_deletes_over_a_real_socket(running_server):
+    port = running_server.server_address[1]
+    _send_and_receive(
+        port,
+        build_sentence("RTE", "2", "4723.492", "N", "00044.340", "W", "4724.010", "N", "00044.500", "W"),
+    )
+    response = _send_and_receive(port, build_sentence("RTD", 0))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ACK"
+    assert fields == ["RTD"]
+
+    grt_response = _send_and_receive(port, build_sentence("GRT"))
+    _, grt_fields = parse_sentence(grt_response)
+    assert grt_fields[0] == "1"
+    assert grt_fields[1:5] == ["4724.010", "N", "00044.500", "W"]
+
+
+def test_rtd_sentence_rejects_wrong_field_count(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("RTD"))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ERR"
+    assert fields[0] == "10"
+
+
+def test_rtd_sentence_out_of_range_over_real_socket_returns_err(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("RTD", 0))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ERR"
+    assert fields[0] == "21"

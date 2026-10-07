@@ -69,6 +69,55 @@ ROUTE_MAX_POINTS = 200
 # if a particular receiver/route needs something stricter or looser.
 ROUTE_ARRIVAL_RADIUS_M = float(os.environ.get("ROUTE_ARRIVAL_RADIUS_M", "5.0"))
 
+# Catches the single most common manual-NAV/RTE mistake (2026-10-07): an
+# operator typing a point in plain decimal degrees -- e.g. copied straight
+# from /control's own "current"/"target" status display, which IS decimal
+# degrees (see robot-webserver's app.py), or from a map -- where this
+# protocol's ddmm.mmmm wire format was expected. Before this existed, that
+# mistake was accepted silently: nmea_to_decimal() has no way to tell "a
+# valid-looking but wrong point" from a genuine one, so e.g. typing
+# "47.391534,N" instead of "4723.492,N" for the SAME intended latitude
+# decoded as roughly 0.79 degrees North -- ~45x off -- with no error
+# anywhere, and nothing but a suspiciously-wrong "target" reading downstream
+# to notice by.
+#
+# The check below is deliberately NOT a "this must be somewhere near
+# France" geography box: this project's own protocol examples and test
+# suite already use points as far as Munich (48.12N, 11.52E) and 6N/20E
+# purely to exercise the sentence format, and a geography-based box would
+# wrongly reject those. Instead it uses a fact that's true regardless of
+# where the robot is: a GENUINE ddmm.mmmm latitude's raw numeric value is
+# at least "degree * 100" -- so for any site more than roughly half a
+# degree from the equator (every real site and every test fixture this
+# project has), the raw value is comfortably >= 50. A raw magnitude below
+# that can only be a plain decimal-degrees latitude (whose maximum
+# possible magnitude is 90) typed where ddmm.mmmm was expected.
+#
+# Longitude can't carry this same check on its own: near the Greenwich
+# meridian (degree 0), this protocol's own ddmm.mmmm longitude is
+# numerically small too (e.g. "00044.340"), indistinguishable from decimal
+# degrees by magnitude alone -- so the format decision for a whole point
+# is made from latitude only and applied to both of its fields together.
+# This never touches the robot's own live GPS fix (link/gps_reader.py's
+# own code path, never this one) -- only an operator's/the website's own
+# typed-in target. GPS Driving's route-file upload and the Distance+angle
+# panel already build correct NMEA fields themselves and will simply
+# never trip this; same mirrored check client-side in robot-webserver's
+# app.py (normalizeGpsCommand) auto-converts the mistake away before it
+# ever reaches here, so this is mainly a safety net for anything that
+# talks to this TCP port directly, bypassing the website.
+RAW_LAT_MAGNITUDE_FLOOR = 90.0
+
+
+def _point_is_plausible(raw_lat):
+    """True if `raw_lat` (the field as typed/received, BEFORE
+    nmea_to_decimal()) has the numeric shape of a genuine ddmm.mmmm
+    latitude rather than a plain decimal-degrees value typed by mistake --
+    see RAW_LAT_MAGNITUDE_FLOOR's honesty note above. Callers already know
+    `raw_lat` parses as a float (the existing BAD_LAT_LON_VALUE-style check
+    runs first)."""
+    return abs(float(raw_lat)) >= RAW_LAT_MAGNITUDE_FLOOR
+
 
 # CAM,SNAP is handled by calling into camera/stream_server.py's own /snap
 # endpoint over plain HTTP rather than sharing a process with it (same
@@ -303,6 +352,14 @@ class RobotState:
             float(lon)
         except (TypeError, ValueError):
             raise CommandError("05", f"BAD_LAT_LON_VALUE:{lat},{lon}")
+        # Catches the single most common manual-NAV mistake: typing the
+        # point in plain decimal degrees instead of this protocol's
+        # ddmm.mmmm wire format -- see RAW_LAT_MAGNITUDE_FLOOR's honesty
+        # note above for why this can't just be folded into the
+        # BAD_LAT_LON_VALUE check above (both are "valid floats", just one
+        # is the wrong shape for this field).
+        if not _point_is_plausible(lat):
+            raise CommandError("22", f"NAV_LAT_LON_IMPLAUSIBLE:{lat},{lat_dir},{lon},{lon_dir}")
         with self._lock:
             self.nav_target = (lat, lat_dir, lon, lon_dir)
             # A manual NAV takes back control from an active route -- without
@@ -314,17 +371,21 @@ class RobotState:
             self.route_is_return = False
             self._return_raw_lines = []
             self.last_command_at = time.time()
-            # TODO: hook this into the GPS/PID pipeline (gps/dgps_transfer.py
-            # and pid/pid_controller.py) so AUTO mode actually steers here.
+            # AUTO mode actually steers toward this target -- see
+            # link.autopilot.Autopilot and update_gps_fix() below (2026-09-07,
+            # see this module's own top-of-file docstring); this used to be
+            # a TODO pointing at the old gps/pid_controller.py pipeline,
+            # which this class never ended up calling into.
 
     # -- RTE: set an ordered list of GPS waypoints to chase automatically --
     def set_route(self, fields):
         """fields = [count, lat1, lat_dir1, lon1, lon_dir1, lat2, ...] --
         same per-point encoding as NAV, just repeated `count` times.
         Replaces any previous route and re-arms automatic advancement from
-        the first waypoint. The robot doesn't drive itself yet (same
-        scaffolding caveat as NAV, see module docstring), but nav_target is
-        kept in sync with "the waypoint currently being pursued" so
+        the first waypoint. AUTO mode actually drives toward it (see
+        link.autopilot.Autopilot, same as NAV -- this module's top-of-file
+        docstring has the full story); nav_target is kept in sync with
+        "the waypoint currently being pursued" so
         everything already reading it (STA, /control's status bar) shows
         route progress with no further changes needed on their end."""
         if not fields:
@@ -355,6 +416,13 @@ class RobotState:
                 float(lon)
             except (TypeError, ValueError):
                 raise CommandError("13", f"RTE_BAD_LAT_LON_VALUE:point_{i}:{lat},{lon}")
+            # Same plausibility check as NAV's own (see
+            # RAW_LAT_MAGNITUDE_FLOOR's honesty note above) -- catches a
+            # route file/point typed in plain decimal degrees by mistake,
+            # one point at a time, with the field index (point_{i}) in the
+            # error.
+            if not _point_is_plausible(lat):
+                raise CommandError("13", f"RTE_LAT_LON_IMPLAUSIBLE:point_{i}:{lat},{lat_dir},{lon},{lon_dir}")
             points.append((lat, lat_dir, lon, lon_dir))
 
         with self._lock:
@@ -741,6 +809,92 @@ class RobotState:
         with self._lock:
             return list(self.route)
 
+    # -- GRT's progress fields: for the /control waypoint-return/GPS-driving
+    # progress bar (2026-10-07) ---------------------------------------------
+    def get_route_progress(self):
+        """Thread-safe atomic read of the currently active route together
+        with how far into it the robot already is and whether it's a
+        waypoint return (BTN_A) rather than an ordinary GPS Driving (RTE)
+        route. Added for robot-webserver's /control progress bar, which
+        needs the REMAINING points only (the caller slices route[
+        route_index:] itself -- this still returns the FULL route, same
+        shape as get_route(), so GRT's existing full-route map markers are
+        unaffected) plus which colour/label to show.
+
+        Returns (route, route_index, route_is_return) as one atomic
+        snapshot under a single lock acquisition -- reading route via
+        get_route() and route_is_return via a second, separate lock
+        acquisition could otherwise observe a route cleared/replaced by a
+        concurrent RTE/NAV/STP in between the two reads (e.g. "route"
+        reflects the old route but "route_is_return" already reflects the
+        new one). Returns a copy of route, not the live list, same
+        reasoning as get_route()."""
+        with self._lock:
+            return list(self.route), self.route_index, self.route_is_return
+
+    # -- RTD: delete one point from the active route (2026-10-06) -----------
+    def delete_route_point(self, index):
+        """Deletes the `index`'th point of the currently active route
+        in-memory (0-based, same order self.route/get_route()/GRT already
+        report) -- backs the /control map's right-click "delete this
+        point" on a red marker, same spirit as delete_waypoint() (blue)
+        and delete_media() (violet) above, extended to the last marker
+        colour that didn't have one yet (explicit user request).
+
+        Unlike delete_waypoint() (a plain text file on disk, untouched by
+        any in-flight driving decision), self.route is live navigation
+        state read on every GPS fix by _advance_route_if_arrived()/
+        _autonomous_pwm_locked() above, so this needs the lock and a bit
+        of index bookkeeping to stay consistent with whatever leg is
+        currently being chased:
+          - a point already behind the robot (index < route_index) is
+            simply dropped; route_index shifts down by one so it still
+            names the same upcoming leg it did before the deletion.
+          - the point currently being chased (index == route_index) is
+            dropped too; nav_target moves on to whatever is now at that
+            same index (the old next point) -- or, if the route is now
+            empty, nav_target is simply left as-is (the just-deleted
+            point's own coordinates), same "done" convention
+            _advance_route_if_arrived() already uses once a route
+            finishes rather than resetting it to None.
+          - a point further ahead (index > route_index) is dropped
+            without touching route_index/nav_target at all -- the robot
+            keeps chasing exactly what it was already chasing.
+        self.autopilot is reset on the middle case only, same "fresh PID
+        state for a new leg" reasoning as _advance_route_if_arrived().
+
+        If this is a waypoint-return route (route_is_return), the
+        matching entry in _return_raw_lines is dropped in lockstep so a
+        later arrival still deletes the right line from waypoints.txt
+        (see _advance_route_if_arrived()) -- deliberately does NOT touch
+        waypoints.txt itself here: this only edits the live route held in
+        memory, the saved waypoint this point came from is left on disk
+        exactly as WPD would leave it (explicit user request -- WPD is
+        the only thing that ever edits that file).
+
+        Raises CommandError("21", "ROUTE_INDEX_OUT_OF_RANGE:<index>") if
+        there's no such point right now (already consumed by the robot
+        arriving at it, already deleted by a concurrent request, or the
+        route was replaced/cleared by a fresh RTE/NAV/STP in the
+        meantime)."""
+        with self._lock:
+            if index < 0 or index >= len(self.route):
+                raise CommandError("21", f"ROUTE_INDEX_OUT_OF_RANGE:{index}")
+            del self.route[index]
+            if self.route_is_return and index < len(self._return_raw_lines):
+                del self._return_raw_lines[index]
+            if index < self.route_index:
+                self.route_index -= 1
+            elif index == self.route_index:
+                self.autopilot.reset()
+                if self.route_index < len(self.route):
+                    self.nav_target = self.route[self.route_index]
+                # else: route now empty -- nav_target left as-is, see
+                # docstring above.
+            # else (index > self.route_index): a point further ahead than
+            # what's currently being chased -- nothing else to update.
+            self.last_command_at = time.time()
+
     # -- gamepad support: save the current GPS fix as a waypoint ------------
     def save_waypoint(self):
         """CAM,X on the gamepad (link/gamepad_handler.py's
@@ -1111,6 +1265,12 @@ class RobotState:
                 # change to this method's shape.
                 "route_total": len(self.route),
                 "route_index": self.route_index,
+                # Now part of GRT's wire sentence (2026-10-07, see
+                # get_route_progress()/server.py's GRT handler) -- kept here
+                # too since every other piece of shared state already goes
+                # through this dict, and tests read it from here rather
+                # than reaching into self.route_is_return directly.
+                "route_is_return": self.route_is_return,
                 # Not (yet) part of the STA wire sentence either -- same
                 # extend-only reasoning as route_total/route_index above.
                 # Exposed here now that REC_START/REC_STOP genuinely track

@@ -186,9 +186,27 @@ CONTROL_HOST=0.0.0.0 CONTROL_PORT=5050 python3 -m link   # port personnalisé
   passage puisque le fichier stocke des degrés décimaux bruts. `GRT`
   répond avec la route actuellement active (`RobotState.get_route()`,
   donc vide tant qu'aucun `RTE` n'a été envoyé, ou après un `STP`/`NAV`
-  qui l'a annulée) — déjà au format ddmm.mmmm, donc renvoyée telle quelle.
-  Ni l'une ni l'autre ne modifie l'état du robot : ce sont de pures
-  lectures, comme `STA`.
+  qui l'a annulée) — déjà au format ddmm.mmmm, donc renvoyée telle quelle,
+  et toujours la liste COMPLÈTE (y compris les points déjà dépassés par le
+  robot), pour que les marqueurs de la carte et les index de `RTD` restent
+  cohérents. Ni l'une ni l'autre ne modifie l'état du robot : ce sont de
+  pures lectures, comme `STA`.
+  `GRT` a reçu deux champs supplémentaires en fin de trame (2026-10-07,
+  extension — un client plus ancien qui ne les connaît pas les ignore
+  simplement, même convention que le champ `dgps` de `STA` et `cpu_temp`
+  de `PWR` ci-dessus) : `route_index` (0-based, jusqu'où le robot est
+  déjà rendu dans la liste de points ci-dessus — `route[route_index:]`
+  est ce qu'il reste réellement à parcourir) et `RETURN`/`DRIVE` (si
+  cette route est un retour aux waypoints déclenché par le bouton `A` de
+  la manette, ou un `RTE` classique envoyé/uploadé). Les deux viennent
+  d'une seule lecture atomique côté robot
+  (`RobotState.get_route_progress()`) pour ne jamais décrire deux routes
+  différentes. Ça alimente la barre de progression affichée sous le
+  bandeau de statut de `/control` tant qu'une route est active : elle se
+  colore et se titre en bleu/« Waypoint return (BTN_A) » ou en rouge/« GPS
+  driving route » selon ce champ, espace les points restants par distance
+  GPS cumulée réelle (pas par simple comptage) et affiche une ETA par
+  point à partir de la vitesse courante du robot (`STA`).
 - `PWR` (2026-10-03, nouvelle trame en requête, sans champ) : ajoutée pour
   la page `/power` dédiée du site web (`robot-webserver`), qui affiche en
   direct les données du boîtier de charge solaire EPever Tracer. Répond
@@ -796,6 +814,63 @@ plus haut) qui exercent directement `PowerHistoryLogger._log_once()`,
 `tests/test_link_server.py` (nouveaux tests `test_his_*` et
 `test_snapshot_is_geotagged_on_successful_cam_snap`, à lancer avec
 `pytest` sur une machine qui peut l'installer).
+
+## Carte d'ensoleillement (`link/solar_map.py`, extension de `link/power_history.py`, 2026-10-07)
+
+Ajouté le 2026-10-07 à la demande explicite de l'utilisateur : une carte de
+la puissance PV moyenne mesurée sur chaque petite zone (~5 m) du terrain,
+affichée en superposition sur la carte GPS de `/control` (case à cocher
+"Solar exposure map"). Construite en trois étapes, toutes sur le Pi #1 :
+
+1. **Échantillonnage en roulant** (`RobotState.update_gps_fix()`) : à
+   chaque nouveau fix GPS — que le robot soit piloté à la manette ou en
+   mode `AUTO` — un échantillon (date/heure, position, puissance PV) est
+   ajouté à un fichier tmp dès que le robot s'est déplacé d'au moins
+   `SOLAR_SURVEY_MIN_DISTANCE_M` (5 m par défaut, `link/solar_map.py`)
+   depuis le dernier point mémorisé. Deux conditions explicitement
+   validées avec l'utilisateur : (a) le fix GPS est toujours valide à cet
+   endroit du code — `link/gps_reader.py` ne transmet jamais de fix
+   invalide à `update_gps_fix()`, donc rien à vérifier en plus ici ; (b)
+   l'échantillon n'est pris que si `self.power_available` est vrai, exactement
+   la même condition que `power_log` dans `link/power_history.py`, pour ne
+   jamais associer une vraie position à une lecture PV à zéro faute de
+   liaison RS485. Fichier configurable via `SOLAR_SURVEY_TMP_PATH`
+   (`data/solar_survey_tmp.jsonl` par défaut).
+
+2. **Vidage du tampon** (`PowerHistoryLogger._log_once()`, même thread de
+   fond que l'historique power/GPS, tous les `POWER_LOG_INTERVAL_S` — 5
+   minutes par défaut) : si le fichier tmp n'est pas vide, son contenu est
+   chargé dans une table brute (`solar_survey_raw`, une ligne par
+   échantillon, avec les indices de cellule de grille déjà calculés) puis
+   le fichier est vidé. Ce vidage est **inconditionnel** — chaque ligne a
+   déjà été filtrée à l'écriture (point 1 ci-dessus), il n'y a plus rien à
+   re-vérifier à ce stade.
+
+3. **Recalcul de la grille** (même tick) : la moyenne de puissance PV par
+   cellule (`solar_map_cells`, table reconstruite entièrement à chaque
+   recalcul à partir de `solar_survey_raw`) n'est recalculée que si le
+   robot est actuellement inactif (`mode == "IDLE"`) — conformément à la
+   demande explicite de calculer la carte "lors des temps de moindre
+   activité CPU". Totalement indépendant de la disponibilité *actuelle* du
+   Tracer : un câble débranché au moment du recalcul ne doit pas empêcher
+   la carte de refléter les échantillons valides déjà accumulés.
+
+**Nouvelle trame `SMP`** (requête, sans conséquence sur l'état du robot) :
+`SMP,<offset>` → renvoie `total_count`, `offset`, le nombre de cellules
+retournées, puis jusqu'à `SOLAR_MAP_CHUNK_ROWS` (100 par défaut) cellules
+aplaties (`lat, lon, avg_pv_power, sample_count, last_ts` — `lat`/`lon` en
+degrés décimaux, le centre de la cellule). Même principe de pagination que
+`HIS`. Codes d'erreur ajoutés : `CommandError("23", "SMP_NEEDS_1_FIELD")`
+et `CommandError("24", "SMP_BAD_OFFSET")`. Côté `robot-webserver`, voir
+`power_history_client.py` (`fetch_solar_map()`, boucle de pagination) et la
+route Flask `GET /api/solar_map`.
+
+**Non testé sur le robot réel** (même réserve que pour le reste du projet,
+en particulier le comportement du tampon tmp en cas de coupure brutale
+d'alimentation). Vérifié dans ce sandbox via `tests/test_solar_map.py`
+(logique pure : seuil des 5 m, aller-retour du fichier tmp, bucketing de la
+grille) et `tests/test_link_server.py` (gating de `update_gps_fix()`,
+`PowerHistoryLogger._log_once()`, trame `SMP` sur un vrai socket TCP).
 
 ## Journalisation GPS pour courbes de réponse à l'échelon (`motor_control/gps_log_on_full_*.py`)
 

@@ -185,13 +185,46 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         # holds each point pre-encoded as (lat, lat_dir, lon, lon_dir)
         # exactly like RTE's own fields, so this just flattens it back out
         # -- no further conversion needed. Empty (count 0, no point
-        # fields) once no route has been sent yet or after STP/a fresh NAV
-        # cleared it (see set_nav_target()/stop()).
-        route = state.get_route()
+        # fields, route_index 0, mode "DRIVE") once no route has been sent
+        # yet or after STP/a fresh NAV cleared it (see
+        # set_nav_target()/stop()).
+        #
+        # Two trailing fields (2026-10-07, extend-only -- an older
+        # robot-webserver that doesn't know about them yet just ignores
+        # them, same convention as STA's DGPS field and PWR's cpu_temp):
+        # route_index (0-based, how far into the route list above the
+        # robot already is -- route[route_index:] is what's actually left
+        # to drive; points before that are already behind the robot but
+        # still listed here so the map's full-route markers are
+        # unaffected) and RETURN/DRIVE (whether this route is a waypoint
+        # return (BTN_A) or an ordinary GPS Driving (RTE) upload -- backs
+        # robot-webserver's /control progress bar, which colours/labels
+        # itself accordingly). Both come from get_route_progress() as one
+        # atomic read so they can never describe two different routes.
+        route, route_index, route_is_return = state.get_route_progress()
         fields = [len(route)]
         for point in route:
             fields.extend(point)
+        fields.append(route_index)
+        fields.append("RETURN" if route_is_return else "DRIVE")
         return build_sentence("GRT", *fields)
+
+    if sentence_type == "RTD":
+        # Command (2026-10-06): deletes one point of the currently active
+        # route by its 0-based position in GRT's own listing -- backs the
+        # /control map's right-click "delete this point" on a red marker,
+        # same spirit as WPD (blue) and MDD (violet) above, the last of
+        # the three marker colours to get one. See
+        # RobotState.delete_route_point() for the live-navigation-state
+        # bookkeeping this needs that WPD (a plain file on disk) doesn't.
+        if len(fields) != 1:
+            raise CommandError("10", "RTD_NEEDS_1_FIELD")
+        try:
+            index = int(fields[0])
+        except (TypeError, ValueError):
+            raise CommandError("21", f"ROUTE_INDEX_OUT_OF_RANGE:{fields[0]}")
+        state.delete_route_point(index)
+        return build_sentence("ACK", "RTD")
 
     if sentence_type == "MED":
         # Query, no fields (2026-10-05): returns every geotagged photo/

@@ -43,10 +43,11 @@ import time
 import urllib.error
 import urllib.request
 
+from link import solar_map
 from link.autopilot import Autopilot, bearing_deg, haversine_distance_m, heading_error_for_pid
 from link.cpu_temp import read_cpu_temperature_c
 from link.nmea import decimal_to_nmea, nmea_to_decimal
-from link.power_history import fetch_media_positions, log_media
+from link.power_history import delete_media_row, fetch_media_positions, log_media
 from link.power_history import resolve_db_path as resolve_history_db_path
 
 log = logging.getLogger("link.robot_state")
@@ -68,6 +69,55 @@ ROUTE_MAX_POINTS = 200
 # deliberately generous rather than tight -- override via the environment
 # if a particular receiver/route needs something stricter or looser.
 ROUTE_ARRIVAL_RADIUS_M = float(os.environ.get("ROUTE_ARRIVAL_RADIUS_M", "5.0"))
+
+# Catches the single most common manual-NAV/RTE mistake (2026-10-07): an
+# operator typing a point in plain decimal degrees -- e.g. copied straight
+# from /control's own "current"/"target" status display, which IS decimal
+# degrees (see robot-webserver's app.py), or from a map -- where this
+# protocol's ddmm.mmmm wire format was expected. Before this existed, that
+# mistake was accepted silently: nmea_to_decimal() has no way to tell "a
+# valid-looking but wrong point" from a genuine one, so e.g. typing
+# "47.391534,N" instead of "4723.492,N" for the SAME intended latitude
+# decoded as roughly 0.79 degrees North -- ~45x off -- with no error
+# anywhere, and nothing but a suspiciously-wrong "target" reading downstream
+# to notice by.
+#
+# The check below is deliberately NOT a "this must be somewhere near
+# France" geography box: this project's own protocol examples and test
+# suite already use points as far as Munich (48.12N, 11.52E) and 6N/20E
+# purely to exercise the sentence format, and a geography-based box would
+# wrongly reject those. Instead it uses a fact that's true regardless of
+# where the robot is: a GENUINE ddmm.mmmm latitude's raw numeric value is
+# at least "degree * 100" -- so for any site more than roughly half a
+# degree from the equator (every real site and every test fixture this
+# project has), the raw value is comfortably >= 50. A raw magnitude below
+# that can only be a plain decimal-degrees latitude (whose maximum
+# possible magnitude is 90) typed where ddmm.mmmm was expected.
+#
+# Longitude can't carry this same check on its own: near the Greenwich
+# meridian (degree 0), this protocol's own ddmm.mmmm longitude is
+# numerically small too (e.g. "00044.340"), indistinguishable from decimal
+# degrees by magnitude alone -- so the format decision for a whole point
+# is made from latitude only and applied to both of its fields together.
+# This never touches the robot's own live GPS fix (link/gps_reader.py's
+# own code path, never this one) -- only an operator's/the website's own
+# typed-in target. GPS Driving's route-file upload and the Distance+angle
+# panel already build correct NMEA fields themselves and will simply
+# never trip this; same mirrored check client-side in robot-webserver's
+# app.py (normalizeGpsCommand) auto-converts the mistake away before it
+# ever reaches here, so this is mainly a safety net for anything that
+# talks to this TCP port directly, bypassing the website.
+RAW_LAT_MAGNITUDE_FLOOR = 90.0
+
+
+def _point_is_plausible(raw_lat):
+    """True if `raw_lat` (the field as typed/received, BEFORE
+    nmea_to_decimal()) has the numeric shape of a genuine ddmm.mmmm
+    latitude rather than a plain decimal-degrees value typed by mistake --
+    see RAW_LAT_MAGNITUDE_FLOOR's honesty note above. Callers already know
+    `raw_lat` parses as a float (the existing BAD_LAT_LON_VALUE-style check
+    runs first)."""
+    return abs(float(raw_lat)) >= RAW_LAT_MAGNITUDE_FLOOR
 
 
 # CAM,SNAP is handled by calling into camera/stream_server.py's own /snap
@@ -179,6 +229,17 @@ class RobotState:
         # only ever show for the former (see pages/protocole_controle.html
         # for the STA field this backs).
         self.is_dgps = None
+        # Solar-exposure survey (2026-10-07, explicit user request):
+        # resolved once here -- not inside update_gps_fix(), which runs
+        # on every single GPS fix -- so the SOLAR_SURVEY_TMP_PATH env
+        # override is only ever read once per process, same reasoning as
+        # DEFAULT_WAYPOINTS_FILE's own one-time resolution elsewhere in
+        # this file. _solar_survey_last_point is the (lat, lon) of the
+        # last point actually buffered (None until the first one), kept
+        # here so update_gps_fix()'s "moved >=5m?" check survives across
+        # calls -- see link.solar_map.should_record_point().
+        self._solar_survey_tmp_path = solar_map.resolve_tmp_path()
+        self._solar_survey_last_point = None
         # CAM,REC_START/REC_STOP (2026-09-18): whether camera/stream_server.
         # py is currently believed to be writing a video file. This is
         # this class's own bookkeeping, not a live query of the camera
@@ -303,6 +364,14 @@ class RobotState:
             float(lon)
         except (TypeError, ValueError):
             raise CommandError("05", f"BAD_LAT_LON_VALUE:{lat},{lon}")
+        # Catches the single most common manual-NAV mistake: typing the
+        # point in plain decimal degrees instead of this protocol's
+        # ddmm.mmmm wire format -- see RAW_LAT_MAGNITUDE_FLOOR's honesty
+        # note above for why this can't just be folded into the
+        # BAD_LAT_LON_VALUE check above (both are "valid floats", just one
+        # is the wrong shape for this field).
+        if not _point_is_plausible(lat):
+            raise CommandError("22", f"NAV_LAT_LON_IMPLAUSIBLE:{lat},{lat_dir},{lon},{lon_dir}")
         with self._lock:
             self.nav_target = (lat, lat_dir, lon, lon_dir)
             # A manual NAV takes back control from an active route -- without
@@ -314,17 +383,21 @@ class RobotState:
             self.route_is_return = False
             self._return_raw_lines = []
             self.last_command_at = time.time()
-            # TODO: hook this into the GPS/PID pipeline (gps/dgps_transfer.py
-            # and pid/pid_controller.py) so AUTO mode actually steers here.
+            # AUTO mode actually steers toward this target -- see
+            # link.autopilot.Autopilot and update_gps_fix() below (2026-09-07,
+            # see this module's own top-of-file docstring); this used to be
+            # a TODO pointing at the old gps/pid_controller.py pipeline,
+            # which this class never ended up calling into.
 
     # -- RTE: set an ordered list of GPS waypoints to chase automatically --
     def set_route(self, fields):
         """fields = [count, lat1, lat_dir1, lon1, lon_dir1, lat2, ...] --
         same per-point encoding as NAV, just repeated `count` times.
         Replaces any previous route and re-arms automatic advancement from
-        the first waypoint. The robot doesn't drive itself yet (same
-        scaffolding caveat as NAV, see module docstring), but nav_target is
-        kept in sync with "the waypoint currently being pursued" so
+        the first waypoint. AUTO mode actually drives toward it (see
+        link.autopilot.Autopilot, same as NAV -- this module's top-of-file
+        docstring has the full story); nav_target is kept in sync with
+        "the waypoint currently being pursued" so
         everything already reading it (STA, /control's status bar) shows
         route progress with no further changes needed on their end."""
         if not fields:
@@ -355,6 +428,13 @@ class RobotState:
                 float(lon)
             except (TypeError, ValueError):
                 raise CommandError("13", f"RTE_BAD_LAT_LON_VALUE:point_{i}:{lat},{lon}")
+            # Same plausibility check as NAV's own (see
+            # RAW_LAT_MAGNITUDE_FLOOR's honesty note above) -- catches a
+            # route file/point typed in plain decimal degrees by mistake,
+            # one point at a time, with the field index (point_{i}) in the
+            # error.
+            if not _point_is_plausible(lat):
+                raise CommandError("13", f"RTE_LAT_LON_IMPLAUSIBLE:point_{i}:{lat},{lat_dir},{lon},{lon_dir}")
             points.append((lat, lat_dir, lon, lon_dir))
 
         with self._lock:
@@ -552,6 +632,10 @@ class RobotState:
     #    attached -------------------------------------------------------
     def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None):
         motor_output = None
+        # (ts, lat, lon, pv_power) to buffer to the solar-survey tmp file
+        # once the lock is released, or None if this fix doesn't qualify
+        # -- see the comment below.
+        solar_survey_sample = None
         with self._lock:
             self.current_lat = lat
             self.current_lon = lon
@@ -567,12 +651,36 @@ class RobotState:
                 motor_output = self._autonomous_pwm_locked()
                 if motor_output is not None:
                     self.left_pwm, self.right_pwm = motor_output
-        # motor_driver.drive() is called outside the lock, same pattern
-        # as drive()/stop()/set_mode() above -- this class's own lock
-        # never needs to be held while calling into MotorDriver (which
-        # takes its own, separate lock).
+
+            # Solar-exposure survey (2026-10-07, explicit user request):
+            # buffer one (ts, lat, lon, pv_power) sample every time the
+            # robot has moved >= link.solar_map.SOLAR_SURVEY_MIN_DISTANCE_M
+            # since the last buffered point -- while driving via the
+            # gamepad (MANUAL) or in AUTO, exactly like every other fix
+            # handled here; no separate "is it actually driving" check is
+            # needed, since this is only ever reached from a real GPS fix.
+            #
+            # Gating (the two explicit refinements the user agreed to):
+            # (1) this fix is always genuinely valid already -- see
+            # link.solar_map's own module docstring for why -- so nothing
+            # extra is needed for that here; (2) only sample while
+            # self.power_available is True, the exact same rule
+            # link.power_history's power_log already applies, so a
+            # disconnected Tracer cable never pairs a real position with
+            # a stale/placeholder pv_power reading.
+            if self.power_available is True and solar_map.should_record_point(
+                self._solar_survey_last_point, lat, lon
+            ):
+                self._solar_survey_last_point = (lat, lon)
+                solar_survey_sample = (self.last_fix_at, lat, lon, self.pv_power)
+        # motor_driver.drive() and the solar-survey tmp-file append both
+        # happen outside the lock, same reasoning as the drive() call
+        # below already had: neither is RobotState's own in-memory state,
+        # and file I/O (like motor I/O) has no business holding this lock.
         if motor_output is not None and self.motor_driver is not None:
             self.motor_driver.drive(*motor_output)
+        if solar_survey_sample is not None:
+            solar_map.append_point(self._solar_survey_tmp_path, *solar_survey_sample)
 
     # -- PWR: latest EPever Tracer reading, set by link.tracer_reader ----
     def update_power_reading(self, available, pv_voltage=None, pv_current=None,
@@ -741,6 +849,92 @@ class RobotState:
         with self._lock:
             return list(self.route)
 
+    # -- GRT's progress fields: for the /control waypoint-return/GPS-driving
+    # progress bar (2026-10-07) ---------------------------------------------
+    def get_route_progress(self):
+        """Thread-safe atomic read of the currently active route together
+        with how far into it the robot already is and whether it's a
+        waypoint return (BTN_A) rather than an ordinary GPS Driving (RTE)
+        route. Added for robot-webserver's /control progress bar, which
+        needs the REMAINING points only (the caller slices route[
+        route_index:] itself -- this still returns the FULL route, same
+        shape as get_route(), so GRT's existing full-route map markers are
+        unaffected) plus which colour/label to show.
+
+        Returns (route, route_index, route_is_return) as one atomic
+        snapshot under a single lock acquisition -- reading route via
+        get_route() and route_is_return via a second, separate lock
+        acquisition could otherwise observe a route cleared/replaced by a
+        concurrent RTE/NAV/STP in between the two reads (e.g. "route"
+        reflects the old route but "route_is_return" already reflects the
+        new one). Returns a copy of route, not the live list, same
+        reasoning as get_route()."""
+        with self._lock:
+            return list(self.route), self.route_index, self.route_is_return
+
+    # -- RTD: delete one point from the active route (2026-10-06) -----------
+    def delete_route_point(self, index):
+        """Deletes the `index`'th point of the currently active route
+        in-memory (0-based, same order self.route/get_route()/GRT already
+        report) -- backs the /control map's right-click "delete this
+        point" on a red marker, same spirit as delete_waypoint() (blue)
+        and delete_media() (violet) above, extended to the last marker
+        colour that didn't have one yet (explicit user request).
+
+        Unlike delete_waypoint() (a plain text file on disk, untouched by
+        any in-flight driving decision), self.route is live navigation
+        state read on every GPS fix by _advance_route_if_arrived()/
+        _autonomous_pwm_locked() above, so this needs the lock and a bit
+        of index bookkeeping to stay consistent with whatever leg is
+        currently being chased:
+          - a point already behind the robot (index < route_index) is
+            simply dropped; route_index shifts down by one so it still
+            names the same upcoming leg it did before the deletion.
+          - the point currently being chased (index == route_index) is
+            dropped too; nav_target moves on to whatever is now at that
+            same index (the old next point) -- or, if the route is now
+            empty, nav_target is simply left as-is (the just-deleted
+            point's own coordinates), same "done" convention
+            _advance_route_if_arrived() already uses once a route
+            finishes rather than resetting it to None.
+          - a point further ahead (index > route_index) is dropped
+            without touching route_index/nav_target at all -- the robot
+            keeps chasing exactly what it was already chasing.
+        self.autopilot is reset on the middle case only, same "fresh PID
+        state for a new leg" reasoning as _advance_route_if_arrived().
+
+        If this is a waypoint-return route (route_is_return), the
+        matching entry in _return_raw_lines is dropped in lockstep so a
+        later arrival still deletes the right line from waypoints.txt
+        (see _advance_route_if_arrived()) -- deliberately does NOT touch
+        waypoints.txt itself here: this only edits the live route held in
+        memory, the saved waypoint this point came from is left on disk
+        exactly as WPD would leave it (explicit user request -- WPD is
+        the only thing that ever edits that file).
+
+        Raises CommandError("21", "ROUTE_INDEX_OUT_OF_RANGE:<index>") if
+        there's no such point right now (already consumed by the robot
+        arriving at it, already deleted by a concurrent request, or the
+        route was replaced/cleared by a fresh RTE/NAV/STP in the
+        meantime)."""
+        with self._lock:
+            if index < 0 or index >= len(self.route):
+                raise CommandError("21", f"ROUTE_INDEX_OUT_OF_RANGE:{index}")
+            del self.route[index]
+            if self.route_is_return and index < len(self._return_raw_lines):
+                del self._return_raw_lines[index]
+            if index < self.route_index:
+                self.route_index -= 1
+            elif index == self.route_index:
+                self.autopilot.reset()
+                if self.route_index < len(self.route):
+                    self.nav_target = self.route[self.route_index]
+                # else: route now empty -- nav_target left as-is, see
+                # docstring above.
+            # else (index > self.route_index): a point further ahead than
+            # what's currently being chased -- nothing else to update.
+            self.last_command_at = time.time()
+
     # -- gamepad support: save the current GPS fix as a waypoint ------------
     def save_waypoint(self):
         """CAM,X on the gamepad (link/gamepad_handler.py's
@@ -865,6 +1059,60 @@ class RobotState:
         with open(path, "w") as f:
             f.writelines(lines)
 
+    # -- WPD: delete one saved waypoint (for robot-webserver's map, 2026-10-05) --
+    def delete_waypoint(self, index):
+        """Deletes the `index`'th saved waypoint (0-based, same order
+        _read_waypoint_entries()/list_waypoints()/WPT already report) from
+        waypoints.txt -- backs the /control map's right-click "delete this
+        point" on a blue marker. Every OTHER line in the file (including
+        comments/blank lines, and any entry that fails to parse) is kept
+        byte-for-byte as-is; only the one PARSED entry at this position is
+        dropped. The map's connecting segments reform on their own once
+        the page re-polls WPT -- removing one entry from the middle of the
+        list just means the next poll's "join consecutive points" loop
+        (robot-webserver's app.py) connects what's now its new neighbour,
+        no special-casing needed here.
+
+        Raises CommandError("18", "WAYPOINT_INDEX_OUT_OF_RANGE:<index>") if
+        there's no such entry -- the file is shorter than the caller
+        thinks (already deleted by a concurrent request, or hand-edited in
+        the meantime). Deliberately does not take self._lock, same
+        reasoning as _read_waypoint_entries()/_remove_waypoint_line()
+        above (file I/O only, no in-memory state)."""
+        path = os.environ.get("WAYPOINTS_FILE", DEFAULT_WAYPOINTS_FILE)
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            raise CommandError("18", f"WAYPOINT_INDEX_OUT_OF_RANGE:{index}")
+
+        # Same tolerant parsing rule as _read_waypoint_entries() above,
+        # kept in sync with it deliberately (both must agree on which
+        # lines count as "entry number N") -- tracks each kept entry's
+        # position in `lines` so exactly one can be removed by index
+        # without touching any other line's text.
+        parsed_line_indices = []
+        for i, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                float(parts[0])
+                float(parts[1])
+            except ValueError:
+                continue
+            parsed_line_indices.append(i)
+
+        if index < 0 or index >= len(parsed_line_indices):
+            raise CommandError("18", f"WAYPOINT_INDEX_OUT_OF_RANGE:{index}")
+
+        del lines[parsed_line_indices[index]]
+        with open(path, "w") as f:
+            f.writelines(lines)
+
     # -- BTN_A (extended 2026-10-05): drive back through saved waypoints --
     def start_waypoint_return(self):
         """Builds a route from every waypoint saved so far (gamepad's X
@@ -976,6 +1224,66 @@ class RobotState:
             for filename, db_kind, lat, lon, ts in rows
         ]
 
+    # -- MDD: delete one photo/video (for robot-webserver's map, 2026-10-05) --
+    def delete_media(self, filename, kind):
+        """Deletes one photo/video from BOTH the camera process's own
+        capped store (camera/snapshots.py's SnapshotStore or
+        camera/recordings.py's VideoRecorder, over a new HTTP DELETE to
+        camera/stream_server.py -- the same cross-process split SNAP/
+        REC_START/REC_STOP already use) AND this process's own geotag
+        row for it (link.power_history) -- backs the /control map's
+        right-click "delete this point" on a violet marker, which the
+        website only sends after the user confirms a popup (robot-
+        webserver's app.py), since unlike a waypoint this also removes
+        the underlying file.
+
+        `kind` is "photo" or "video" (same vocabulary as
+        media_positions()). Raises CommandError("19",
+        "BAD_MEDIA_KIND:<kind>") for anything else.
+
+        The DB row is cleaned up on a best-effort basis regardless of
+        whether the camera reports the file was actually still there --
+        once this call is made, there is deliberately no reason for a
+        geotag row describing a deliberately-deleted file to linger
+        (media_positions() already tolerates a DB row outliving its file,
+        see fetch_media_positions()'s own docstring, but there's no
+        reason to leave one around on purpose). Raises CommandError("20",
+        "MEDIA_NOT_FOUND:<filename>") if the camera process answers but
+        says the file wasn't there (already rotated out by the normal
+        FIFO cap, or already deleted) -- same "best-effort against a
+        store that can empty itself" spirit as _remove_waypoint_line().
+        Raises CommandError("12", "CAMERA_UNAVAILABLE:...") -- same code
+        _request_snapshot()/_request_recording() use -- if the camera
+        process can't be reached at all; the DB row is deliberately left
+        alone in that case, since the file might still genuinely exist."""
+        if kind not in ("photo", "video"):
+            raise CommandError("19", f"BAD_MEDIA_KIND:{kind}")
+
+        host = os.environ.get("CAMERA_HOST", CAMERA_HOST_DEFAULT)
+        port = int(os.environ.get("CAMERA_PORT", CAMERA_PORT_DEFAULT))
+        remote_path = "/snapshots/" if kind == "photo" else "/recordings/"
+        url = f"http://{host}:{port}{remote_path}{filename}"
+        request = urllib.request.Request(url, method="DELETE")
+        try:
+            with urllib.request.urlopen(request, timeout=CAMERA_SNAP_TIMEOUT) as resp:
+                body = json.loads(resp.read())
+            deleted = bool(body.get("ok"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                deleted = False
+            else:
+                raise CommandError("12", f"CAMERA_UNAVAILABLE:{exc.reason}")
+        except urllib.error.URLError as exc:
+            raise CommandError("12", f"CAMERA_UNAVAILABLE:{exc.reason}")
+
+        try:
+            delete_media_row(resolve_history_db_path(), filename)
+        except Exception:
+            log.exception("failed to remove DB row for deleted media %s", filename)
+
+        if not deleted:
+            raise CommandError("20", f"MEDIA_NOT_FOUND:{filename}")
+
     # -- STA: status snapshot for telemetry --------------------------------
     def status(self):
         with self._lock:
@@ -997,6 +1305,12 @@ class RobotState:
                 # change to this method's shape.
                 "route_total": len(self.route),
                 "route_index": self.route_index,
+                # Now part of GRT's wire sentence (2026-10-07, see
+                # get_route_progress()/server.py's GRT handler) -- kept here
+                # too since every other piece of shared state already goes
+                # through this dict, and tests read it from here rather
+                # than reaching into self.route_is_return directly.
+                "route_is_return": self.route_is_return,
                 # Not (yet) part of the STA wire sentence either -- same
                 # extend-only reasoning as route_total/route_index above.
                 # Exposed here now that REC_START/REC_STOP genuinely track

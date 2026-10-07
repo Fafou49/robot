@@ -25,6 +25,7 @@ from link.power_history import (
     HIS_PERIODS,
     PowerHistoryLogger,
     fetch_period_chunk,
+    fetch_solar_map_chunk,
     resolve_db_path,
 )
 from link.robot_state import CommandError, RobotState
@@ -159,6 +160,22 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
             fields.extend([lat_str, lat_dir, lon_str, lon_dir])
         return build_sentence("WPT", *fields)
 
+    if sentence_type == "WPD":
+        # Command (2026-10-05): deletes one saved waypoint by its 0-based
+        # position in WPT's own listing -- backs robot-webserver's
+        # /control map's right-click "delete this point" on a blue
+        # marker. See RobotState.delete_waypoint() for why index rather
+        # than lat/lon (no float round-trip to go wrong against what's
+        # actually in waypoints.txt).
+        if len(fields) != 1:
+            raise CommandError("10", "WPD_NEEDS_1_FIELD")
+        try:
+            index = int(fields[0])
+        except (TypeError, ValueError):
+            raise CommandError("18", f"WAYPOINT_INDEX_OUT_OF_RANGE:{fields[0]}")
+        state.delete_waypoint(index)
+        return build_sentence("ACK", "WPD")
+
     if sentence_type == "GRT":
         # Query, no fields: returns the currently active route (the last
         # RTE upload, i.e. "GPS Driving", OR an in-progress waypoint
@@ -169,13 +186,46 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         # holds each point pre-encoded as (lat, lat_dir, lon, lon_dir)
         # exactly like RTE's own fields, so this just flattens it back out
         # -- no further conversion needed. Empty (count 0, no point
-        # fields) once no route has been sent yet or after STP/a fresh NAV
-        # cleared it (see set_nav_target()/stop()).
-        route = state.get_route()
+        # fields, route_index 0, mode "DRIVE") once no route has been sent
+        # yet or after STP/a fresh NAV cleared it (see
+        # set_nav_target()/stop()).
+        #
+        # Two trailing fields (2026-10-07, extend-only -- an older
+        # robot-webserver that doesn't know about them yet just ignores
+        # them, same convention as STA's DGPS field and PWR's cpu_temp):
+        # route_index (0-based, how far into the route list above the
+        # robot already is -- route[route_index:] is what's actually left
+        # to drive; points before that are already behind the robot but
+        # still listed here so the map's full-route markers are
+        # unaffected) and RETURN/DRIVE (whether this route is a waypoint
+        # return (BTN_A) or an ordinary GPS Driving (RTE) upload -- backs
+        # robot-webserver's /control progress bar, which colours/labels
+        # itself accordingly). Both come from get_route_progress() as one
+        # atomic read so they can never describe two different routes.
+        route, route_index, route_is_return = state.get_route_progress()
         fields = [len(route)]
         for point in route:
             fields.extend(point)
+        fields.append(route_index)
+        fields.append("RETURN" if route_is_return else "DRIVE")
         return build_sentence("GRT", *fields)
+
+    if sentence_type == "RTD":
+        # Command (2026-10-06): deletes one point of the currently active
+        # route by its 0-based position in GRT's own listing -- backs the
+        # /control map's right-click "delete this point" on a red marker,
+        # same spirit as WPD (blue) and MDD (violet) above, the last of
+        # the three marker colours to get one. See
+        # RobotState.delete_route_point() for the live-navigation-state
+        # bookkeeping this needs that WPD (a plain file on disk) doesn't.
+        if len(fields) != 1:
+            raise CommandError("10", "RTD_NEEDS_1_FIELD")
+        try:
+            index = int(fields[0])
+        except (TypeError, ValueError):
+            raise CommandError("21", f"ROUTE_INDEX_OUT_OF_RANGE:{fields[0]}")
+        state.delete_route_point(index)
+        return build_sentence("ACK", "RTD")
 
     if sentence_type == "MED":
         # Query, no fields (2026-10-05): returns every geotagged photo/
@@ -197,6 +247,27 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
             wire_kind = "SNAP" if kind == "photo" else "VID"
             fields.extend([filename, wire_kind, lat_str, lat_dir, lon_str, lon_dir, ts])
         return build_sentence("MED", *fields)
+
+    if sentence_type == "MDD":
+        # Command (2026-10-05): deletes one photo/video, identified by its
+        # exact MED filename and kind (SNAP/VID, this protocol's existing
+        # vocabulary) -- backs the /control map's right-click "delete this
+        # point" on a violet marker (the website only sends this after the
+        # user confirms a popup, since it removes the actual file, not
+        # just a map marker). See RobotState.delete_media() for what this
+        # actually touches (the camera process's own capped store AND the
+        # geotag DB row).
+        if len(fields) != 2:
+            raise CommandError("10", "MDD_NEEDS_2_FIELDS")
+        filename, wire_kind = fields
+        if wire_kind == "SNAP":
+            kind = "photo"
+        elif wire_kind == "VID":
+            kind = "video"
+        else:
+            raise CommandError("19", f"BAD_MEDIA_KIND:{wire_kind}")
+        state.delete_media(filename, kind)
+        return build_sentence("ACK", "MDD")
 
     if sentence_type == "STA":
         s = state.status()
@@ -323,6 +394,36 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         total_count, rows = fetch_period_chunk(resolve_db_path(), period, offset)
         flat_rows = [value for row in rows for value in row]
         return build_sentence("HIS", period, total_count, offset, len(rows), *flat_rows)
+
+    if sentence_type == "SMP":
+        # Query (2026-10-07, explicit user request): one page of the
+        # solar-exposure map grid computed by link.power_history.
+        # recompute_solar_map() (see link.solar_map for the full
+        # buffering/gating/gridding design), for robot-webserver's
+        # /control map overlay. Paginated the same way as HIS above (see
+        # link.power_history.SOLAR_MAP_CHUNK_ROWS) -- caller
+        # (robot-webserver's power_history_client.py) loops, bumping
+        # `offset`, until it has every cell.
+        #
+        # Fields in: offset (0-based row index -- no period field, the
+        # grid itself has no time window, see fetch_solar_map_chunk()'s
+        # own docstring).
+        # Fields out: total_count (cells known right now), offset
+        # (echoed), returned_count, then `returned_count` rows flattened
+        # back-to-back -- each row is (lat, lon, avg_pv_power,
+        # sample_count, last_ts).
+        if len(fields) != 1:
+            raise CommandError("23", "SMP_NEEDS_1_FIELD")
+        try:
+            offset = int(fields[0])
+        except ValueError:
+            raise CommandError("24", f"SMP_BAD_OFFSET:{fields[0]}")
+        if offset < 0:
+            raise CommandError("24", f"SMP_BAD_OFFSET:{offset}")
+
+        total_count, rows = fetch_solar_map_chunk(resolve_db_path(), offset)
+        flat_rows = [value for row in rows for value in row]
+        return build_sentence("SMP", total_count, offset, len(rows), *flat_rows)
 
     raise CommandError("11", f"UNKNOWN_SENTENCE_TYPE:{sentence_type}")
 

@@ -220,6 +220,45 @@ def test_nav_cancels_an_active_route():
     assert state.route_index == 0
 
 
+# --- NAV/RTE plausibility check (2026-10-07) --------------------------------
+# Catches the "typed in plain decimal degrees instead of this protocol's
+# ddmm.mmmm wire format" mistake -- see RAW_LAT_MAGNITUDE_FLOOR's honesty
+# note in robot_state.py. Both are "valid floats" so the older
+# BAD_LAT_LON_VALUE check alone never caught this.
+
+def test_set_nav_target_rejects_plain_decimal_degrees():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        # 47.391534 is the SAME point as 4723.492 above, just typed as
+        # decimal degrees -- a raw magnitude of 47 is far below
+        # RAW_LAT_MAGNITUDE_FLOOR (90), so this must be rejected rather
+        # than silently decoding to ~0.79 degrees North.
+        state.set_nav_target("47.391534", "N", "0.739006", "W")
+    assert exc_info.value.code == "22"
+    assert "NAV_LAT_LON_IMPLAUSIBLE" in str(exc_info.value)
+    # Rejected before anything else changes -- no half-applied NAV.
+    assert state.nav_target is None
+
+
+def test_set_nav_target_accepts_genuine_ddmm_values_far_from_france():
+    # Sanity check that the floor doesn't reject real points -- including
+    # ones from well outside this project's own usual area (same Munich
+    # example the over-the-wire tests already use), confirming this is a
+    # format check, not a "near France" geography check.
+    state = RobotState()
+    state.set_nav_target("4807.038", "N", "1131.000", "E")
+    assert state.nav_target == ("4807.038", "N", "1131.000", "E")
+
+
+def test_set_route_rejects_plain_decimal_degrees_point():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.set_route(["1", "47.391534", "N", "0.739006", "W"])
+    assert exc_info.value.code == "13"
+    assert "RTE_LAT_LON_IMPLAUSIBLE" in str(exc_info.value)
+    assert state.route == []
+
+
 def test_stop_cancels_an_active_route():
     state = RobotState()
     state.set_route(["1", "4723.492", "N", "00044.340", "W"])
@@ -587,6 +626,38 @@ def test_get_route_returns_a_copy_not_the_live_list():
     assert snapshot == [("4807.038", "N", "1131.000", "E")]
 
 
+def test_get_route_progress_reflects_index_and_return_flag(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.0,20.0,t1\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+
+    # No route yet.
+    route, index, is_return = state.get_route_progress()
+    assert (route, index, is_return) == ([], 0, False)
+
+    # An ordinary GPS Driving route.
+    state.set_route(["2", "4807.038", "N", "1131.000", "E", "4823.192", "N", "1152.500", "E"])
+    route, index, is_return = state.get_route_progress()
+    assert route == [("4807.038", "N", "1131.000", "E"), ("4823.192", "N", "1152.500", "E")]
+    assert (index, is_return) == (0, False)
+
+    # A waypoint return overrides it.
+    state.update_gps_fix(10.0, 20.0)
+    state.start_waypoint_return()
+    route, index, is_return = state.get_route_progress()
+    assert len(route) == 1
+    assert (index, is_return) == (0, True)
+
+
+def test_get_route_progress_returns_a_copy_not_the_live_list():
+    state = RobotState()
+    state.set_route(["1", "4807.038", "N", "1131.000", "E"])
+    snapshot, _, _ = state.get_route_progress()
+    state.stop()
+    assert snapshot == [("4807.038", "N", "1131.000", "E")]
+
+
 # --- End-to-end socket tests ------------------------------------------------
 
 @pytest.fixture()
@@ -697,6 +768,17 @@ def test_sta_after_nav_reports_that_target(running_server):
     assert fields[10:14] == ["4807.038", "N", "1131.0", "E"]
 
 
+def test_nav_rejects_plain_decimal_degrees_over_real_socket(running_server):
+    # Same mistake as test_set_nav_target_rejects_plain_decimal_degrees
+    # (unit-level), checked end-to-end over the actual TCP socket this
+    # time -- see RAW_LAT_MAGNITUDE_FLOOR's honesty note in robot_state.py.
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("NAV", 47.391534, "N", 0.739006, "W"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "ERR"
+    assert fields[0] == "22"
+
+
 def test_sta_reports_a_real_gps_fix_once_one_arrives(running_server):
     # Simulates what link.gps_reader.GPSReader would do once a receiver is
     # attached and gets a fix -- this project's robot operates just west
@@ -786,7 +868,10 @@ def test_grt_over_real_socket_returns_no_points_when_no_route_sent(running_serve
     response = _send_and_receive(port, build_sentence("GRT"))
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "GRT"
-    assert fields == ["0"]
+    # Trailing route_index/mode fields (2026-10-07): 0 and "DRIVE" are
+    # arbitrary-but-consistent defaults here since count is already 0 --
+    # see get_route_progress()/server.py's GRT handler.
+    assert fields == ["0", "0", "DRIVE"]
 
 
 def test_grt_over_real_socket_returns_the_active_route_after_rte(running_server):
@@ -800,6 +885,50 @@ def test_grt_over_real_socket_returns_the_active_route_after_rte(running_server)
     assert fields[0] == "2"
     assert fields[1:5] == ["4807.038", "N", "1131.0", "E"]
     assert fields[5:9] == ["4823.192", "N", "1152.5", "E"]
+    # Trailing route_index/mode fields (2026-10-07): a fresh RTE upload is
+    # a "GPS Driving" route, not yet advanced past its first point.
+    assert fields[9] == "0"
+    assert fields[10] == "DRIVE"
+
+
+def test_grt_over_real_socket_reports_return_mode_after_waypoint_return(
+    running_server, tmp_path, monkeypatch
+):
+    # Isolate WAYPOINTS_FILE (same reasoning as
+    # test_wpt_over_real_socket_returns_saved_waypoints above) -- without
+    # this, save_waypoint() below appends to the real default
+    # waypoints/waypoints.txt, which other running_server-based tests in
+    # this same file may have already written to, making the "exactly 1
+    # waypoint" assumption below flaky depending on test order.
+    monkeypatch.setenv("WAYPOINTS_FILE", str(tmp_path / "waypoints.txt"))
+    port = running_server.server_address[1]
+    running_server.state.update_gps_fix(10.0, 20.0)
+    running_server.state.save_waypoint()
+    running_server.state.start_waypoint_return()
+
+    response = _send_and_receive(port, build_sentence("GRT"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "GRT"
+    assert fields[0] == "1"
+    assert fields[-2:] == ["0", "RETURN"]
+
+
+def test_grt_over_real_socket_reports_route_index_as_robot_advances(running_server):
+    port = running_server.server_address[1]
+    p1 = ("4723.492", "N", "00044.340", "W")   # ~ 47.391533, -0.739
+    p2 = ("4723.532", "N", "00044.292", "W")   # ~ 95m away
+    _send_and_receive(port, build_sentence("RTE", 2, *p1, *p2))
+
+    response = _send_and_receive(port, build_sentence("GRT"))
+    _, fields = parse_sentence(response)
+    assert fields[-2:] == ["0", "DRIVE"]  # not yet arrived at p1
+
+    running_server.state.update_gps_fix(47.391533, -0.739)  # on top of p1
+
+    response = _send_and_receive(port, build_sentence("GRT"))
+    _, fields = parse_sentence(response)
+    assert fields[0] == "2"  # both points still listed -- the map's full route is unaffected
+    assert fields[-2:] == ["1", "DRIVE"]  # but route_index advanced to the next leg
 
 
 def test_rte_over_real_socket_returns_ack(running_server):
@@ -1309,3 +1438,529 @@ def test_a_fresh_rte_after_a_return_clears_route_is_return(tmp_path, monkeypatch
 
     state.set_route([1, "0600.000", "N", "02000.000", "E"])
     assert state.route_is_return is False
+
+
+# --- WPD / MDD: the /control map's right-click "delete this point"
+# (2026-10-05), for blue waypoints and violet photos/videos ----------------
+
+def test_delete_waypoint_removes_only_the_targeted_entry(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text(
+        "# a comment, must survive\n"
+        "10.000000,20.000000,t1\n"
+        "\n"
+        "10.001000,20.001000,t2\n"
+        "10.002000,20.002000,t3\n"
+    )
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+
+    state.delete_waypoint(1)  # the middle real entry (t2)
+
+    lines = waypoints_file.read_text().splitlines()
+    assert "# a comment, must survive" in lines
+    assert "" in lines
+    assert "10.000000,20.000000,t1" in lines
+    assert "10.002000,20.002000,t3" in lines
+    assert not any("10.001000" in l for l in lines)
+
+
+def test_delete_waypoint_out_of_range_raises(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.0,20.0,t1\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+
+    with pytest.raises(CommandError) as exc_info:
+        state.delete_waypoint(5)
+    assert exc_info.value.code == "18"
+
+
+def test_delete_waypoint_on_a_missing_file_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYPOINTS_FILE", str(tmp_path / "does_not_exist.txt"))
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.delete_waypoint(0)
+    assert exc_info.value.code == "18"
+
+
+def test_wpd_sentence_deletes_over_a_real_socket(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("11.0,21.0,t1\n11.1,21.1,t2\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        response = _send_and_receive(port, build_sentence("WPD", 0))
+        resp_type, fields = parse_sentence(response)
+        assert resp_type == "ACK"
+        assert fields == ["WPD"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    remaining = [l for l in waypoints_file.read_text().splitlines() if l.strip()]
+    assert remaining == ["11.1,21.1,t2"]
+
+
+def test_wpd_sentence_rejects_wrong_field_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("WAYPOINTS_FILE", str(tmp_path / "waypoints.txt"))
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        response = _send_and_receive(port, build_sentence("WPD"))
+        resp_type, fields = parse_sentence(response)
+        assert resp_type == "ERR"
+        assert fields[0] == "10"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_delete_media_removes_camera_file_and_db_row(history_server, monkeypatch):
+    import json
+
+    from link import power_history as ph
+    ph.log_media(ph.resolve_db_path(), "snap_del.jpg", "photo", 5.0, 6.0)
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        calls.append((request.full_url, request.get_method()))
+        return FakeResponse(json.dumps({"ok": True, "file": "snap_del.jpg"}).encode())
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", fake_urlopen)
+
+    history_server.state.delete_media("snap_del.jpg", "photo")
+
+    assert calls[-1][1] == "DELETE"
+    assert calls[-1][0].endswith("/snapshots/snap_del.jpg")
+
+    import sqlite3
+    conn = sqlite3.connect(ph.resolve_db_path())
+    row = conn.execute("SELECT filename FROM snapshots WHERE filename=?", ("snap_del.jpg",)).fetchone()
+    assert row is None
+
+
+def test_delete_media_404_from_camera_raises_but_still_cleans_db(history_server, monkeypatch):
+    import urllib.error
+
+    from link import power_history as ph
+    ph.log_media(ph.resolve_db_path(), "snap_gone.jpg", "photo", 1.0, 1.0)
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(CommandError) as exc_info:
+        history_server.state.delete_media("snap_gone.jpg", "photo")
+    assert exc_info.value.code == "20"
+
+    import sqlite3
+    conn = sqlite3.connect(ph.resolve_db_path())
+    row = conn.execute("SELECT filename FROM snapshots WHERE filename=?", ("snap_gone.jpg",)).fetchone()
+    assert row is None
+
+
+def test_delete_media_camera_unreachable_leaves_db_row_alone(history_server, monkeypatch):
+    import urllib.error
+
+    from link import power_history as ph
+    ph.log_media(ph.resolve_db_path(), "snap_unreachable.jpg", "photo", 2.0, 2.0)
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(CommandError) as exc_info:
+        history_server.state.delete_media("snap_unreachable.jpg", "photo")
+    assert exc_info.value.code == "12"
+
+    import sqlite3
+    conn = sqlite3.connect(ph.resolve_db_path())
+    row = conn.execute("SELECT filename FROM snapshots WHERE filename=?", ("snap_unreachable.jpg",)).fetchone()
+    assert row is not None
+
+
+def test_delete_media_rejects_bad_kind():
+    state = RobotState()
+    with pytest.raises(CommandError) as exc_info:
+        state.delete_media("whatever.jpg", "audio")
+    assert exc_info.value.code == "19"
+
+
+def test_mdd_sentence_over_real_socket(history_server, monkeypatch):
+    import json
+
+    from link import power_history as ph
+    ph.log_media(ph.resolve_db_path(), "snap_mdd.jpg", "photo", 9.0, 9.0)
+
+    class FakeResponse:
+        def read(self):
+            return json.dumps({"ok": True, "file": "snap_mdd.jpg"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", lambda *a, **k: FakeResponse())
+
+    port = history_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("MDD", "snap_mdd.jpg", "SNAP"))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ACK"
+    assert fields == ["MDD"]
+
+
+def test_mdd_sentence_rejects_bad_wire_kind(history_server):
+    port = history_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("MDD", "x.jpg", "AUDIO"))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ERR"
+    assert fields[0] == "19"
+
+
+# -- RTD: delete one point from the active route (2026-10-06) ---------------
+def _route_point(i):
+    return (f"47{i:02d}.000", "N", f"000{i:02d}.000", "W")
+
+
+def test_delete_route_point_ahead_of_current_target_leaves_index_untouched():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2), _route_point(3)]
+    state.route_index = 0
+    state.nav_target = state.route[0]
+
+    state.delete_route_point(2)
+
+    assert state.route == [_route_point(1), _route_point(2)]
+    assert state.route_index == 0
+    assert state.nav_target == _route_point(1)
+
+
+def test_delete_route_point_behind_current_target_shifts_index_down():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2), _route_point(3)]
+    state.route_index = 2
+    state.nav_target = state.route[2]
+
+    state.delete_route_point(0)
+
+    assert state.route == [_route_point(2), _route_point(3)]
+    assert state.route_index == 1
+    assert state.nav_target == _route_point(3)  # untouched -- index 0 < route_index 2
+
+
+def test_delete_route_point_currently_chased_advances_nav_target():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2), _route_point(3)]
+    state.route_index = 1
+    state.nav_target = state.route[1]
+
+    state.delete_route_point(1)
+
+    assert state.route == [_route_point(1), _route_point(3)]
+    assert state.route_index == 1
+    assert state.nav_target == _route_point(3)
+
+
+def test_delete_last_route_point_while_current_target_empties_route():
+    state = RobotState()
+    state.route = [_route_point(1)]
+    state.route_index = 0
+    state.nav_target = state.route[0]
+
+    state.delete_route_point(0)
+
+    assert state.route == []
+    assert state.route_index == 0
+    # Left as-is (the just-deleted point's own coordinates), same "done"
+    # convention _advance_route_if_arrived() already uses once a route
+    # finishes on its own -- see delete_route_point()'s docstring.
+    assert state.nav_target == _route_point(1)
+
+
+def test_delete_route_point_out_of_range_raises():
+    state = RobotState()
+    state.route = [_route_point(1)]
+    with pytest.raises(CommandError) as exc_info:
+        state.delete_route_point(5)
+    assert exc_info.value.code == "21"
+
+
+def test_delete_route_point_keeps_return_raw_lines_in_lockstep():
+    state = RobotState()
+    state.route = [_route_point(1), _route_point(2)]
+    state.route_index = 0
+    state.nav_target = state.route[0]
+    state.route_is_return = True
+    state._return_raw_lines = ["line1\n", "line2\n"]
+
+    state.delete_route_point(0)
+
+    assert state._return_raw_lines == ["line2\n"]
+    assert state.route == [_route_point(2)]
+    assert state.nav_target == _route_point(2)
+
+
+def test_rtd_sentence_deletes_over_a_real_socket(running_server):
+    port = running_server.server_address[1]
+    _send_and_receive(
+        port,
+        build_sentence("RTE", "2", "4723.492", "N", "00044.340", "W", "4724.010", "N", "00044.500", "W"),
+    )
+    response = _send_and_receive(port, build_sentence("RTD", 0))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ACK"
+    assert fields == ["RTD"]
+
+    grt_response = _send_and_receive(port, build_sentence("GRT"))
+    _, grt_fields = parse_sentence(grt_response)
+    assert grt_fields[0] == "1"
+    assert grt_fields[1:5] == ["4724.010", "N", "00044.500", "W"]
+
+
+def test_rtd_sentence_rejects_wrong_field_count(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("RTD"))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ERR"
+    assert fields[0] == "10"
+
+
+def test_rtd_sentence_out_of_range_over_real_socket_returns_err(running_server):
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("RTD", 0))
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ERR"
+    assert fields[0] == "21"
+
+
+# --- Solar-exposure survey/map (2026-10-07, explicit user request) --------
+# update_gps_fix()'s own buffering gate is tested directly against
+# RobotState (no real socket needed, same as the RobotState unit tests at
+# the top of this file); the DB/wire side (log_solar_survey_batch/
+# recompute_solar_map/fetch_solar_map_chunk/SMP) reuses the HIS section's
+# own history_server fixture above.
+
+def test_update_gps_fix_does_not_buffer_without_a_power_reading(tmp_path, monkeypatch):
+    # power_available defaults to None (no Tracer reading has ever come
+    # in) -- must not buffer anything, same gating rule as
+    # link.power_history's power_log.
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    state = RobotState()
+    state.update_gps_fix(47.391533, -0.739000)
+    from link import solar_map
+    assert solar_map.drain_points(state._solar_survey_tmp_path) == []
+
+
+def test_update_gps_fix_does_not_buffer_while_tracer_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    state = RobotState()
+    state.update_power_reading(available=False)
+    state.update_gps_fix(47.391533, -0.739000)
+    from link import solar_map
+    assert solar_map.drain_points(state._solar_survey_tmp_path) == []
+
+
+def test_update_gps_fix_buffers_first_point_once_tracer_is_available(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    state = RobotState()
+    state.update_power_reading(available=True, pv_power=42.5)
+    state.update_gps_fix(47.391533, -0.739000)
+    from link import solar_map
+    points = solar_map.drain_points(state._solar_survey_tmp_path)
+    assert len(points) == 1
+    ts, lat, lon, pv_power = points[0]
+    assert (lat, lon, pv_power) == (47.391533, -0.739000, 42.5)
+
+
+def test_update_gps_fix_does_not_rebuffer_under_5_metres(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    state = RobotState()
+    state.update_power_reading(available=True, pv_power=10.0)
+    state.update_gps_fix(47.391533, -0.739000)
+    # ~1m away -- well under SOLAR_SURVEY_MIN_DISTANCE_M (5m).
+    state.update_gps_fix(47.391542, -0.739000)
+    from link import solar_map
+    assert len(solar_map.drain_points(state._solar_survey_tmp_path)) == 1
+
+
+def test_update_gps_fix_buffers_again_past_5_metres(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    state = RobotState()
+    state.update_power_reading(available=True, pv_power=10.0)
+    state.update_gps_fix(47.391533, -0.739000)
+    # ~90m north -- comfortably past the 5m threshold.
+    state.update_gps_fix(47.392343, -0.739000)
+    from link import solar_map
+    assert len(solar_map.drain_points(state._solar_survey_tmp_path)) == 2
+
+
+def test_power_history_logger_flushes_solar_survey_even_when_tracer_unavailable(
+    history_server, tmp_path, monkeypatch,
+):
+    # The tmp-buffer flush is unconditional (each line was already gated
+    # at write time) -- distinct from power_log's own row, which test_
+    # power_history_logger_skips_writes_when_tracer_unavailable above
+    # confirms IS still gated on power_status()["available"].
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    from link import power_history as ph
+    from link import solar_map
+
+    solar_map.append_point(solar_map.resolve_tmp_path(), time.time(), 47.4, -0.74, 15.0)
+    history_server.power_history_logger._log_once()
+
+    total, rows = ph.fetch_solar_map_chunk(ph.resolve_db_path(), 0)
+    # mode defaults to "IDLE" (RobotState.__init__), so this same tick
+    # also recomputes the grid -- one buffered point makes one cell.
+    assert total == 1
+    assert rows[0][2] == 15.0  # avg_pv_power
+    assert rows[0][3] == 1     # sample_count
+
+
+def test_power_history_logger_only_recomputes_solar_map_while_idle(
+    history_server, tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    from link import power_history as ph
+    from link import solar_map
+
+    solar_map.append_point(solar_map.resolve_tmp_path(), time.time(), 47.4, -0.74, 15.0)
+    history_server.state.set_mode("MANUAL")
+    history_server.power_history_logger._log_once()
+
+    # The raw sample was still flushed (unconditional)...
+    db_path = ph.resolve_db_path()
+    with ph._connect(db_path) as conn:
+        raw_count = conn.execute("SELECT COUNT(*) FROM solar_survey_raw").fetchone()[0]
+    assert raw_count == 1
+    # ...but the grid itself was NOT recomputed, since mode != "IDLE".
+    total_cells, _ = ph.fetch_solar_map_chunk(ph.resolve_db_path(), 0)
+    assert total_cells == 0
+
+
+def test_recompute_solar_map_drops_cells_whose_raw_rows_were_pruned(history_server):
+    from link import power_history as ph
+
+    db_path = ph.resolve_db_path()
+    ph.log_solar_survey_batch(db_path, [(1, 47.4, -0.74, 20.0)])
+    ph.recompute_solar_map(db_path)
+    total, _ = ph.fetch_solar_map_chunk(db_path, 0)
+    assert total == 1
+
+    # Prune with a retention window that excludes ts=1 entirely, then
+    # recompute again -- the now-empty group must disappear, not linger
+    # as a stale cell.
+    ph.prune_old_solar_survey_rows(db_path, retention_days=0)
+    ph.recompute_solar_map(db_path)
+    total_after, _ = ph.fetch_solar_map_chunk(db_path, 0)
+    assert total_after == 0
+
+
+def test_smp_sentence_rejects_wrong_field_count(history_server):
+    port = history_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("SMP"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "ERR"
+    assert fields[0] == "23"
+
+
+def test_smp_sentence_rejects_bad_offset(history_server):
+    port = history_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("SMP", "not-a-number"))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "ERR"
+    assert fields[0] == "24"
+
+
+def test_smp_sentence_empty_map_returns_zero_rows(history_server):
+    port = history_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("SMP", 0))
+    sentence_type, fields = parse_sentence(response)
+    assert sentence_type == "SMP"
+    assert fields[:3] == ["0", "0", "0"]
+
+
+def test_smp_sentence_returns_cells_paginated(tmp_path, monkeypatch):
+    # Deliberately `running_server` (start_history=False), not
+    # `history_server`: this test seeds solar_survey_raw/solar_map_cells
+    # directly, and a live PowerHistoryLogger thread ticking in the
+    # background would race its own recompute_solar_map() call against
+    # this one against the same database -- the SMP sentence handler
+    # itself only ever reads via fetch_solar_map_chunk(), which doesn't
+    # need a running logger at all.
+    monkeypatch.setenv("POWER_HISTORY_DB_PATH", str(tmp_path / "power_history.db"))
+    from link import power_history as ph
+
+    db_path = ph.resolve_db_path()
+    # 5 distinct cells, far enough apart (~1 degree) to never collide.
+    points = [(i, 47.0 + i, -1.0 - i, float(i) * 10.0) for i in range(5)]
+    ph.log_solar_survey_batch(db_path, points)
+    ph.recompute_solar_map(db_path)
+
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+
+        # Same "patch the chunk size down" trick as test_his_returns_
+        # logged_rows_paginated above, to actually exercise the
+        # pagination loop.
+        monkeypatch.setattr(ph, "SOLAR_MAP_CHUNK_ROWS", 2)
+
+        collected = []
+        offset = 0
+        while True:
+            response = _send_and_receive(port, build_sentence("SMP", offset))
+            sentence_type, fields = parse_sentence(response)
+            assert sentence_type == "SMP"
+            total_count, resp_offset, returned_count = (
+                int(fields[0]), int(fields[1]), int(fields[2]),
+            )
+            assert total_count == 5
+            assert resp_offset == offset
+            row_fields = fields[3:]
+            assert len(row_fields) == returned_count * 5  # 5 fields/row
+            collected.extend(row_fields)
+            offset += returned_count
+            if returned_count == 0 or offset >= total_count:
+                break
+
+        assert len(collected) == 5 * 5
+    finally:
+        server.shutdown()
+        server.server_close()
