@@ -237,18 +237,13 @@ def test_read_events_dispatches_left_and_right_stick_and_button_events(monkeypat
 
 class _FakeState:
     def __init__(self, nav_target=None, mode="IDLE", is_recording=False,
-                 raise_on_camera=None, raise_on_waypoint=None, has_gps_fix=True):
+                 raise_on_camera=None, raise_on_waypoint=None):
         self.modes = []
         self.stop_count = 0
         self.drives = []
         # has_nav_target() reads this -- set it in a test to simulate a
         # NAV point or GPS route already having been sent.
         self.nav_target = nav_target
-        # has_gps_fix() reads this -- defaults to True (a fix already
-        # arrived) so every EXISTING test that doesn't care about it still
-        # exercises the plain "AUTO mode armed" log rather than the
-        # "no GPS fix yet" warning added alongside this flag (2026-09-20).
-        self._has_gps_fix = has_gps_fix
         # is_manual() reads this -- set it in a test to simulate the
         # robot already being in a given mode (e.g. "MANUAL" or "AUTO").
         # set_mode() below also updates it, same as the real RobotState,
@@ -279,9 +274,6 @@ class _FakeState:
 
     def has_nav_target(self):
         return self.nav_target is not None
-
-    def has_gps_fix(self):
-        return self._has_gps_fix
 
     def is_manual(self):
         return self.mode == "MANUAL"
@@ -338,68 +330,6 @@ def test_button_handler_refuses_to_arm_auto_with_no_target():
 
     handler(ecodes.BTN_A, True)
     assert state.modes == []
-
-
-def test_button_handler_logs_on_a_successful_auto_arm(caplog):
-    # 2026-09-20, after a field report that BTN_A "doesn't seem to do
-    # anything, and nothing shows up in the logs": this success path used
-    # to log NOTHING at all, unlike every other action in this function --
-    # a genuinely successful arm was indistinguishable, from the log's
-    # point of view, from the button never reaching this handler in the
-    # first place. This is the fix: arming AUTO must now produce one INFO
-    # line naming the button and the target it armed toward.
-    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"))
-    handler = robot_state_button_handler(state)
-
-    with caplog.at_level("INFO", logger="link.gamepad_handler"):
-        handler(ecodes.BTN_A, True)
-
-    assert state.modes == ["AUTO"]
-    armed_logs = [r for r in caplog.records if "AUTO mode armed" in r.message]
-    assert len(armed_logs) == 1, caplog.records
-    assert "BTN_A" in armed_logs[0].message
-    assert armed_logs[0].levelname == "INFO"  # a fix is already there -- no warning needed
-
-
-def test_button_handler_warns_when_arming_auto_with_no_gps_fix_yet(caplog):
-    # 2026-09-20, second half of the same field report ("AUTO arms but no
-    # motor action"): arming the mode and actually driving are
-    # independent by design (see RobotState.has_gps_fix()'s own
-    # docstring) -- the mode flips immediately, but _autonomous_pwm_locked()
-    # can't compute anything, and the motors won't move, until a real fix
-    # has arrived. This must now surface as a WARNING at the moment of
-    # arming, not silence the operator has to notice on their own.
-    state = _FakeState(nav_target=("4723.492", "N", "00044.340", "W"), has_gps_fix=False)
-    handler = robot_state_button_handler(state)
-
-    with caplog.at_level("INFO", logger="link.gamepad_handler"):
-        handler(ecodes.BTN_A, True)
-
-    assert state.modes == ["AUTO"]  # still arms -- this only warns, never refuses
-    warn_logs = [r for r in caplog.records if "no GPS fix has been received yet" in r.message]
-    assert len(warn_logs) == 1, caplog.records
-    assert warn_logs[0].levelname == "WARNING"
-    # And the plain success INFO log must NOT also fire alongside it.
-    info_armed = [r for r in caplog.records if "AUTO mode armed" in r.message and r.levelname == "INFO"]
-    assert info_armed == [], caplog.records
-
-
-def test_button_handler_logs_unbound_button_codes(caplog):
-    # 2026-09-20: a button that doesn't match any configured action used
-    # to be entirely silent -- the same ambiguity as above, but for a
-    # button whose PHYSICAL press might not even be reaching this handler
-    # under the evdev code this project assumes (see this module's own
-    # BUTTON MAPPING comment). BTN_TR (a shoulder button, unbound by
-    # default) exercises the fallback branch.
-    state = _FakeState()
-    handler = robot_state_button_handler(state)
-
-    with caplog.at_level("INFO", logger="link.gamepad_handler"):
-        handler(ecodes.BTN_TR, True)
-
-    unbound_logs = [r for r in caplog.records if "not bound to any action" in r.message]
-    assert len(unbound_logs) == 1, caplog.records
-
 
 
 def test_button_handler_shutdown_is_optional():

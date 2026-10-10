@@ -998,7 +998,7 @@ def test_control_server_starts_fine_without_tracer_hardware(monkeypatch):
         )
         sentence_type, fields = parse_sentence(response)
         assert sentence_type == "PWR"
-        assert fields[-1] == "0"  # available=0 -- no Tracer ever read
+        assert fields[13] == "0"  # available=0 -- no Tracer ever read
     finally:
         server.shutdown()
         server.server_close()
@@ -1021,8 +1021,14 @@ def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_ser
     assert sentence_type == "PWR"
     # 9 Tracer flow fields + battery_soc/battery_temp/controller_temp +
     # cpu_temp (also "0.0" here -- the monkeypatched reader returned None)
-    # + the trailing available flag.
-    assert fields == ["0.0"] * 9 + ["0.0", "0.0", "0.0"] + ["0.0", "0"]
+    # + the available flag. onboard_time/onboard_time_source/uptime_s
+    # (2026-10-10) are checked separately below -- none of them is ever a
+    # fixed value.
+    assert fields[:13] == ["0.0"] * 9 + ["0.0", "0.0", "0.0"] + ["0.0"]
+    assert fields[13] == "0"
+    assert fields[14].isdigit()
+    assert fields[15] == "SYS"  # no GPS fix either -- falls back to the system clock
+    assert fields[16].isdigit()
 
 
 def test_pwr_over_real_socket_reports_a_real_reading(running_server, monkeypatch):
@@ -1044,6 +1050,9 @@ def test_pwr_over_real_socket_reports_a_real_reading(running_server, monkeypatch
     assert fields[9:12] == ["87.0", "24.3", "28.1"]
     assert fields[12] == "46.5"  # cpu_temp -- independent of the Tracer's own available flag
     assert fields[13] == "1"
+    assert fields[14].isdigit()  # onboard_time -- whole-second Unix timestamp
+    assert fields[15] == "SYS"
+    assert fields[16].isdigit()  # uptime_s
 
 
 def test_pwr_cpu_temp_is_reported_even_when_tracer_is_unavailable(running_server, monkeypatch):
@@ -1055,7 +1064,7 @@ def test_pwr_cpu_temp_is_reported_even_when_tracer_is_unavailable(running_server
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "PWR"
     assert fields[12] == "52.1"
-    assert fields[-1] == "0"  # Tracer itself still correctly reported as unavailable
+    assert fields[13] == "0"  # Tracer itself still correctly reported as unavailable
 
 
 def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values(running_server, monkeypatch):
@@ -1067,7 +1076,69 @@ def test_pwr_reports_unavailable_again_after_a_failed_poll_but_keeps_last_values
     sentence_type, fields = parse_sentence(response)
     assert sentence_type == "PWR"
     assert fields[0] == "15.82"  # last known-good value, not reset to 0.0
-    assert fields[-1] == "0"     # but correctly flagged as stale/unavailable
+    assert fields[13] == "0"     # but correctly flagged as stale/unavailable
+
+
+def test_pwr_onboard_time_is_a_live_unix_timestamp_independent_of_tracer(running_server, monkeypatch):
+    # Same spirit as cpu_temp above: Pi #1's own system clock has nothing
+    # to do with the Tracer, so it's reported -- and advances -- whether
+    # or not the Tracer is available. Explicit user request (2026-10-10):
+    # the /power page shows this next to the operator's own watch to spot
+    # a drifted Pi #1 clock.
+    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+    port = running_server.server_address[1]
+    before = time.time()
+    response = _send_and_receive(port, build_sentence("PWR"))
+    after = time.time()
+    _, fields = parse_sentence(response)
+    onboard_time = int(fields[14])
+    assert int(before) - 1 <= onboard_time <= int(after) + 1
+
+
+def test_pwr_falls_back_to_gps_time_when_the_system_clock_is_implausible(running_server, monkeypatch):
+    # Explicit user request (2026-10-10): "si le onboard time n'est pas
+    # réglé par le Wifi, prends celui du GPS" -- once a GPS fix has
+    # arrived, its own UTC time is correct independently of WiFi/NTP, so
+    # it's used in place of the (here, deliberately implausible) system
+    # clock, and onboard_time_source is labelled accordingly so /power
+    # can show the operator which source is live.
+    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+    monkeypatch.setattr(time, "time", lambda: 1000.0)  # 1970-01-01ish -- implausible
+    running_server.state.update_gps_fix(47.392343, -0.739000, gps_utc_ts=1780000000.0)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("PWR"))
+    _, fields = parse_sentence(response)
+    assert fields[14] == "1780000000"
+    assert fields[15] == "GPS"
+
+
+def test_pwr_falls_back_to_the_system_clock_when_no_gps_fix_has_ever_arrived(running_server, monkeypatch):
+    # Same implausible clock as above, but no GPS fix at all -- there is
+    # nothing better to fall back to, so onboard_time still reports the
+    # (known wrong) system clock, correctly labelled "SYS" either way --
+    # a plausible clock and "no better option" both report the same
+    # source label, only the plausibility check differs.
+    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("PWR"))
+    _, fields = parse_sentence(response)
+    assert fields[14] == "1000"
+    assert fields[15] == "SYS"
+
+
+def test_pwr_uptime_s_reports_the_mocked_read_uptime_s_value(running_server, monkeypatch):
+    # uptime_s (2026-10-10, explicit user request -- the /power page's
+    # small "lifetime" readout) comes from link.uptime.read_uptime_s(),
+    # read fresh outside RobotState's lock the same way cpu_temp is --
+    # mocked the same way (patched where robot_state looks it up, not
+    # where it's defined).
+    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+    monkeypatch.setattr("link.robot_state.read_uptime_s", lambda: 12345)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("PWR"))
+    _, fields = parse_sentence(response)
+    assert fields[16] == "12345"
 
 
 # --- BTN_START -> ControlServer._shutdown_pi (2026-09-12) -------------------
@@ -1238,6 +1309,60 @@ def test_snapshot_is_geotagged_on_successful_cam_snap(history_server, monkeypatc
         "SELECT filename, lat, lon FROM snapshots WHERE filename=?", ("snap_0001.jpg",)
     ).fetchone()
     assert row == ("snap_0001.jpg", 48.8566, 2.3522)
+
+
+def test_log_media_skips_db_write_while_clock_is_implausible(history_server, monkeypatch):
+    # Same clock-plausibility gate as PowerHistoryLogger._log_once() and
+    # RobotState.update_gps_fix()'s solar-survey buffering (2026-10-10,
+    # explicit user request) -- no racing background thread involved
+    # here, log_media() is only ever called synchronously from
+    # camera_command(), never from the logger's own background tick.
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    from link import power_history as ph
+    ph.log_media(ph.resolve_db_path(), "snap_implausible.jpg", "photo", 1.0, 1.0)
+
+    conn = __import__("sqlite3").connect(ph.resolve_db_path())
+    row = conn.execute(
+        "SELECT filename FROM snapshots WHERE filename=?", ("snap_implausible.jpg",)
+    ).fetchone()
+    assert row is None
+
+
+def test_snapshot_is_not_geotagged_while_clock_is_implausible(history_server, monkeypatch):
+    # End-to-end version of the test above, through camera_command("SNAP")
+    # -- the file itself would still exist on disk (camera/stream_server.py
+    # is the one actually writing it, mocked out here), only the map
+    # geotag is skipped.
+    import json
+
+    class FakeResponse:
+        status = 200
+
+        def read(self):
+            return json.dumps({"ok": True, "file": "snap_0002.jpg"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("link.robot_state.urllib.request.urlopen", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+
+    state = history_server.state
+    with state._lock:
+        state.current_lat = 48.8566
+        state.current_lon = 2.3522
+    state.camera_command("SNAP")
+
+    from link import power_history as ph
+    import sqlite3
+    conn = sqlite3.connect(ph.resolve_db_path())
+    row = conn.execute(
+        "SELECT filename FROM snapshots WHERE filename=?", ("snap_0002.jpg",)
+    ).fetchone()
+    assert row is None
 
 
 # --- MED: geotagged photos/videos for the /control map's violet markers,
@@ -1438,6 +1563,89 @@ def test_a_fresh_rte_after_a_return_clears_route_is_return(tmp_path, monkeypatch
 
     state.set_route([1, "0600.000", "N", "02000.000", "E"])
     assert state.route_is_return is False
+
+
+# --- BTN_A/MANUAL bug fix (2026-10-10): a return route must be fully
+# re-armable after the operator takes back manual control mid-route --
+# https://github.com/Fafou49/robot issue reported 2026-10-10: pressing
+# BTN_A again after switching back to MANUAL used to leave the waypoints
+# stuck "NAV" (route_is_return still True) and unreachable. ------------------
+
+def test_returning_to_manual_clears_an_active_return_route(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.0,20.0,t1\n10.001,20.001,t2\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+    state.update_gps_fix(10.0, 20.0)
+    state.start_waypoint_return()
+    assert state.route_is_return is True
+    assert state.route != []
+
+    state.set_mode("MANUAL")
+    assert state.route_is_return is False
+    assert state.route == []
+    assert state.route_index == 0
+
+
+def test_returning_to_idle_also_clears_an_active_return_route(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.0,20.0,t1\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+    state.update_gps_fix(10.0, 20.0)
+    state.start_waypoint_return()
+
+    state.set_mode("IDLE")
+    assert state.route_is_return is False
+    assert state.route == []
+
+
+def test_manual_driving_no_longer_silently_consumes_return_waypoints(tmp_path, monkeypatch):
+    # Before the fix, _advance_route_if_arrived() kept running on every GPS
+    # fix regardless of mode, so simply driving the robot manually near the
+    # (now-abandoned) return route's next target would delete it from
+    # waypoints.txt even though the robot never actually auto-navigated
+    # there. Clearing the route on leaving AUTO (set_mode) makes this a
+    # no-op once back in MANUAL.
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.000000,20.000000,t1\n10.001000,20.001000,t2\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+    state.update_gps_fix(10.0, 20.0)
+    state.start_waypoint_return()  # chases t2 (last-saved) first
+
+    state.set_mode("MANUAL")
+    # Manually drive right on top of the point the route used to be
+    # chasing -- must NOT advance/consume anything now that the route has
+    # been cleared.
+    state.update_gps_fix(10.001, 20.001)
+    remaining = [l for l in waypoints_file.read_text().splitlines() if l.strip()]
+    assert remaining == ["10.000000,20.000000,t1", "10.001000,20.001000,t2"]
+
+
+def test_fresh_btn_a_after_returning_to_manual_rebuilds_the_route(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.000000,20.000000,t1\n10.001000,20.001000,t2\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+    state.update_gps_fix(10.0, 20.0)
+    state.start_waypoint_return()
+
+    state.set_mode("MANUAL")
+    count = state.start_waypoint_return()
+    assert count == 2
+    assert state.route_is_return is True
+    assert state.mode == "AUTO"
+
+
+def test_set_mode_to_manual_does_not_clear_a_lone_nav_target(tmp_path, monkeypatch):
+    # nav_target is deliberately left alone (matches stop()'s own
+    # precedent, see test_has_nav_target_false_again_after_stop above) --
+    # only the route/route_is_return bookkeeping is cleared.
+    state = RobotState()
+    state.set_nav_target("4723.492", "N", "00044.340", "W")
+    state.set_mode("MANUAL")
+    assert state.has_nav_target() is True
 
 
 # --- WPD / MDD: the /control map's right-click "delete this point"
@@ -1825,6 +2033,106 @@ def test_update_gps_fix_buffers_again_past_5_metres(tmp_path, monkeypatch):
     assert len(solar_map.drain_points(state._solar_survey_tmp_path)) == 2
 
 
+# --- Clock-plausibility gate (2026-10-10, explicit user request) ----------
+# This Pi has no RTC battery -- right after boot, before NTP has had a
+# chance to correct the clock, time.time() can read months/years off (see
+# link.power_history.system_clock_is_plausible's own docstring). Patching
+# the shared stdlib `time` module's own `time` attribute affects every
+# module that did `import time; time.time()` (link.robot_state AND
+# link.power_history both do), which is exactly what these tests need.
+
+def test_system_clock_is_plausible_true_for_a_real_timestamp(monkeypatch):
+    from link import power_history as ph
+    monkeypatch.setattr(time, "time", lambda: 1780000000.0)  # 2026-05-28ish
+    assert ph.system_clock_is_plausible() is True
+
+
+def test_system_clock_is_plausible_false_before_the_floor(monkeypatch):
+    from link import power_history as ph
+    monkeypatch.setattr(time, "time", lambda: 1000.0)  # 1970-01-01ish
+    assert ph.system_clock_is_plausible() is False
+
+
+def test_update_gps_fix_does_not_buffer_while_clock_is_implausible(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    state = RobotState()
+    state.update_power_reading(available=True, pv_power=42.5)
+    state.update_gps_fix(47.391533, -0.739000)
+    from link import solar_map
+    assert solar_map.drain_points(state._solar_survey_tmp_path) == []
+
+
+def test_update_gps_fix_buffers_again_once_the_clock_recovers(tmp_path, monkeypatch):
+    # Also confirms _solar_survey_last_point was NOT updated by the
+    # skipped fix above -- a point that lands close to that same skipped
+    # position still gets recorded once the clock is plausible again,
+    # rather than being treated as "under 5m from the last point".
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    state = RobotState()
+    state.update_power_reading(available=True, pv_power=42.5)
+    state.update_gps_fix(47.391533, -0.739000)  # skipped -- clock implausible
+
+    monkeypatch.setattr(time, "time", lambda: 1780000000.0)
+    state.update_gps_fix(47.391533, -0.739000)  # same spot, now plausible
+    from link import solar_map
+    points = solar_map.drain_points(state._solar_survey_tmp_path)
+    assert len(points) == 1
+
+
+def test_power_history_logger_skips_power_log_while_clock_is_implausible(tmp_path, monkeypatch):
+    # Deliberately NOT the history_server fixture here -- same race as
+    # test_power_history_logger_only_recomputes_solar_map_while_idle
+    # above: its PowerHistoryLogger starts a real background thread whose
+    # automatic first tick runs with the REAL (plausible) clock, before
+    # this test's own monkeypatch.setattr(time, "time", ...) below ever
+    # takes effect -- which would write the very row this test asserts
+    # never gets written. A manually-constructed, never-started
+    # PowerHistoryLogger has nothing ticking except this test's own
+    # explicit _log_once() call.
+    monkeypatch.setenv("POWER_HISTORY_DB_PATH", str(tmp_path / "power_history.db"))
+    from link import power_history as ph
+
+    state = RobotState()
+    state.update_power_reading(available=True, pv_voltage=15.82)
+    logger = ph.PowerHistoryLogger(state)
+
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    logger._log_once()
+
+    db_path = ph.resolve_db_path()
+    with ph._connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM power_log").fetchone()[0]
+    assert count == 0
+
+
+def test_power_history_logger_skips_solar_survey_db_write_while_clock_is_implausible(
+    tmp_path, monkeypatch,
+):
+    # Same reasoning as the test just above for not using history_server.
+    # The buffered point is neither written to the DB nor dropped -- it's
+    # still sitting in the tmp file, waiting for a tick where the clock
+    # looks plausible.
+    monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    monkeypatch.setenv("POWER_HISTORY_DB_PATH", str(tmp_path / "power_history.db"))
+    from link import power_history as ph
+    from link import solar_map
+
+    state = RobotState()
+    logger = ph.PowerHistoryLogger(state)
+
+    solar_map.append_point(solar_map.resolve_tmp_path(), 1000.0, 47.4, -0.74, 15.0)
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    logger._log_once()
+
+    with ph._connect(ph.resolve_db_path()) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM solar_survey_raw").fetchone()[0]
+    assert count == 0
+    remaining = solar_map.drain_points(solar_map.resolve_tmp_path())
+    assert len(remaining) == 1
+
+
 def test_power_history_logger_flushes_solar_survey_even_when_tracer_unavailable(
     history_server, tmp_path, monkeypatch,
 ):
@@ -1847,16 +2155,28 @@ def test_power_history_logger_flushes_solar_survey_even_when_tracer_unavailable(
     assert rows[0][3] == 1     # sample_count
 
 
-def test_power_history_logger_only_recomputes_solar_map_while_idle(
-    history_server, tmp_path, monkeypatch,
-):
+def test_power_history_logger_only_recomputes_solar_map_while_idle(tmp_path, monkeypatch):
+    # Deliberately NOT the history_server fixture (same reasoning as
+    # test_smp_sentence_returns_cells_paginated above): that fixture's
+    # PowerHistoryLogger starts its own background thread immediately,
+    # which fires an automatic first tick of its own -- a real race
+    # against this test's own set_mode("MANUAL")/_log_once() sequence
+    # (the automatic tick could land while mode is still the default
+    # "IDLE", recomputing the grid before this test ever gets to assert
+    # that it shouldn't be). A manually-constructed, never-started
+    # PowerHistoryLogger removes that race entirely: nothing ticks except
+    # this test's own explicit _log_once() call.
     monkeypatch.setenv("SOLAR_SURVEY_TMP_PATH", str(tmp_path / "solar_survey_tmp.jsonl"))
+    monkeypatch.setenv("POWER_HISTORY_DB_PATH", str(tmp_path / "power_history.db"))
     from link import power_history as ph
     from link import solar_map
 
+    state = RobotState()
+    state.set_mode("MANUAL")
+    logger = ph.PowerHistoryLogger(state)
+
     solar_map.append_point(solar_map.resolve_tmp_path(), time.time(), 47.4, -0.74, 15.0)
-    history_server.state.set_mode("MANUAL")
-    history_server.power_history_logger._log_once()
+    logger._log_once()
 
     # The raw sample was still flushed (unconditional)...
     db_path = ph.resolve_db_path()

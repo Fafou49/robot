@@ -15,42 +15,17 @@ Honesty note (same caveat as the rest of this project's hardware-facing
 code): written against cv2.VideoWriter's documented, stable API (already
 used successfully elsewhere for reading -- cv2.VideoCapture, in
 stream_server.py's FrameGrabber -- but this is this project's first use
-of VideoWriter) but not run against a real camera/codec combination.
-
-UPDATE (2026-09-21) -- real bug found and fixed, field report "the 2
-videos I recorded don't play": the FOURCC this module used to hardcode,
-"mp4v" (MPEG-4 Part 2), is one of the few codecs that reliably opens with
-OpenCV's own bundled FFmpeg build with no extra system codec package --
-which is exactly why recording itself worked (files were written, showed
-up in the Recordings panel's list, non-empty) -- but it is NOT one of the
-codecs any mainstream browser's native <video> element can decode
-(Chrome/Firefox/Safari all need H.264/H.265, VP8/VP9, or AV1 -- MPEG-4
-Part 2 is none of those). The file was perfectly valid, just not
-browser-playable, which reads exactly like "the video won't launch" in
-robot-webserver's Media page. Two changes fix this:
-
-1. write() below now tries a short list of FourCC codes in order
-   (PREFERRED_FOURCCS), H.264 aliases first, "mp4v" last as a final
-   fallback so recording still produces SOME file rather than nothing if
-   the Pi's OpenCV/FFmpeg build has no H.264 encoder available (pip's
-   opencv-python wheels usually don't, for libx264 licensing reasons; a
-   system apt-installed python3-opencv often does).
-2. stop() now calls _maybe_transcode_to_h264() as a safety net: if the
-   codec that actually ended up opening wasn't already H.264, and the
-   `ffmpeg` command-line tool is available on the Pi's PATH (a much more
-   commonly available H.264 encoder than OpenCV's own bundled one --
-   Raspberry Pi OS "with desktop" typically has it, or `sudo apt install
-   ffmpeg` for one line), it re-encodes the file in place to real H.264
-   before it's ever exposed as a "finished" recording. This is what
-   actually guarantees browser playback regardless of which FourCC
-   OpenCV itself could open -- if ffmpeg isn't installed, the original
-   file is kept as-is (unplayable in-browser, but still a valid file a
-   desktop player like VLC can open, same as before this fix).
+of VideoWriter) but not run against a real camera/codec combination. The
+FOURCC codec (default "mp4v") is deliberately picked for being one of the
+very few that ship working with OpenCV's own bundled FFmpeg build on most
+Linux distros with no extra system codec package -- if recordings come
+out empty, or VideoWriter.isOpened() is False on the Pi, that's the first
+thing to check (try fourcc="MJPG" with a .avi extension instead, which
+needs no external codec at all, before assuming the rest of this code is
+at fault).
 """
 import itertools
 import os
-import shutil
-import subprocess
 import time
 
 import cv2
@@ -73,95 +48,6 @@ DEFAULT_RECORDING_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT_FOURCC = "mp4v"
 DEFAULT_EXTENSION = "mp4"
 DEFAULT_FPS = 15.0  # matches this project's own CAMERA_FPS default
-
-# FourCC codes tried in order when opening the VideoWriter (2026-09-21,
-# see this module's own docstring for the full story): H.264 aliases
-# first -- genuinely browser-playable if OpenCV's FFmpeg build supports
-# them -- "mp4v" (DEFAULT_FOURCC) last, as a fallback that's virtually
-# guaranteed to open but needs _maybe_transcode_to_h264() below to become
-# browser-playable after the fact. A caller passing an explicit fourcc=
-# to VideoRecorder() (e.g. this module's own earlier troubleshooting
-# suggestion, fourcc="MJPG") still gets exactly that single codec tried,
-# no fallback list -- see __init__ below.
-PREFERRED_FOURCCS = ("avc1", "h264", DEFAULT_FOURCC)
-
-# FourCC codes considered ALREADY browser-playable -- write() recording
-# with one of these skips _maybe_transcode_to_h264() entirely on stop(),
-# since there's nothing to fix.
-_BROWSER_SAFE_FOURCCS = {"avc1", "h264", "x264", "avc3"}
-
-
-def _maybe_transcode_to_h264(path, opened_fourcc, timeout=120):
-    """Best-effort, in-place re-encode of `path` to real H.264 via the
-    `ffmpeg` command-line tool, if `opened_fourcc` (whichever FourCC
-    write() actually managed to open the file with, see PREFERRED_FOURCCS
-    above) isn't already one browsers can decode natively. Called from
-    stop() below, once, after the file is fully written and closed.
-
-    Deliberately shells out to the `ffmpeg` BINARY rather than trying to
-    get OpenCV itself to write H.264 in the first place: whether
-    cv2.VideoWriter can open an H.264 FourCC depends on how OpenCV's own
-    bundled FFmpeg was built (pip's opencv-python wheels are usually built
-    WITHOUT libx264, a GPL-licensed encoder, so "avc1"/"h264" often fail
-    to open even when the FourCC is spelled correctly) -- whereas a
-    system `ffmpeg` install (apt, or already present on Raspberry Pi OS
-    "with desktop") almost always DOES ship libx264, since Debian's ffmpeg
-    package isn't subject to the same distribution constraint OpenCV's
-    upstream project holds itself to.
-
-    Silent no-op (returns without touching the file) if: the FourCC that
-    was actually used is already browser-safe (nothing to do), or `ffmpeg`
-    isn't on PATH (nothing this process can do about it -- same "degrade
-    to whatever's actually available" spirit as the rest of this
-    project's hardware-facing code; the file stays exactly as
-    VideoWriter left it, playable in a desktop player like VLC even if
-    not in a browser). Never raises: a transcode failure (bad input,
-    ffmpeg crash, timeout) leaves the original file untouched rather than
-    losing a recording the operator may have no way to re-shoot."""
-    if opened_fourcc in _BROWSER_SAFE_FOURCCS:
-        return
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        return
-
-    transcoded_path = path + ".h264.tmp"
-    try:
-        result = subprocess.run(
-            [
-                ffmpeg_bin, "-y", "-i", path,
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                # Moves the moov atom to the front of the file (rather
-                # than FFmpeg's default of writing it last, once the full
-                # length is known) so a browser can start playing before
-                # the whole file has downloaded -- standard practice for
-                # any MP4 served progressively, which is exactly how
-                # robot-webserver's media_recording_file() proxy serves
-                # these.
-                "-movflags", "+faststart",
-                # No audio track exists on this project's camera pipeline
-                # (frames only, see FrameGrabber) -- explicit -an rather
-                # than relying on ffmpeg to notice there's nothing to
-                # copy, so a future frame source that DOES carry audio
-                # doesn't silently start including it here unnoticed.
-                "-an",
-                transcoded_path,
-            ],
-            capture_output=True,
-            timeout=timeout,
-        )
-        if result.returncode != 0 or not os.path.isfile(transcoded_path):
-            return  # leave the original file as-is -- still a valid, if not browser-playable, recording
-        os.replace(transcoded_path, path)
-    except (OSError, subprocess.SubprocessError):
-        return
-    finally:
-        # Cleans up a half-written temp file on failure/timeout -- os.replace()
-        # above already consumed it on the success path, so this is a no-op then.
-        if os.path.isfile(transcoded_path):
-            try:
-                os.remove(transcoded_path)
-            except OSError:
-                pass
 
 
 class VideoRecorder:
@@ -187,22 +73,15 @@ class VideoRecorder:
     reports no file was written -- there's nothing to encode."""
 
     def __init__(self, directory=DEFAULT_RECORDING_DIR, max_recordings=MAX_RECORDINGS,
-                 fourcc=None, fps=DEFAULT_FPS):
+                 fourcc=DEFAULT_FOURCC, fps=DEFAULT_FPS):
         self.directory = directory
         self.max_recordings = max_recordings
-        # fourcc=None (2026-09-21, new default -- was DEFAULT_FOURCC):
-        # tries PREFERRED_FOURCCS in order (H.264 first, "mp4v" as a last
-        # resort), see this module's own docstring. An explicit fourcc=
-        # (this module's own earlier troubleshooting suggestion, e.g.
-        # fourcc="MJPG") is still honored as-is -- a single candidate, no
-        # fallback list, same as before this change.
-        self._fourcc_candidates = PREFERRED_FOURCCS if fourcc is None else (fourcc,)
+        self.fourcc = fourcc
         self.fps = fps
         os.makedirs(self.directory, exist_ok=True)
         self._armed = False
         self._writer = None
         self._filename = None
-        self._opened_fourcc = None
 
     @property
     def is_recording(self):
@@ -229,25 +108,9 @@ class VideoRecorder:
             height, width = frame.shape[:2]
             filename = f"rec_{time.strftime('%Y%m%d_%H%M%S')}_{next(_sequence):06d}.{DEFAULT_EXTENSION}"
             path = os.path.join(self.directory, filename)
-            # Tries each candidate FourCC in turn (2026-09-21, was a
-            # single hardcoded attempt) -- see PREFERRED_FOURCCS/this
-            # module's own docstring for why H.264 is tried first and
-            # "mp4v" last. Each failed candidate is release()d before
-            # trying the next (a VideoWriter that failed to open still
-            # holds no real resource worth keeping around, but calling
-            # release() on it is cheap and avoids relying on that being
-            # true for every OpenCV/FFmpeg build).
-            writer = None
-            opened_fourcc = None
-            for candidate in self._fourcc_candidates:
-                fourcc_code = cv2.VideoWriter_fourcc(*candidate)
-                candidate_writer = cv2.VideoWriter(path, fourcc_code, self.fps, (width, height))
-                if candidate_writer.isOpened():
-                    writer = candidate_writer
-                    opened_fourcc = candidate
-                    break
-                candidate_writer.release()
-            if writer is None:
+            fourcc_code = cv2.VideoWriter_fourcc(*self.fourcc)
+            writer = cv2.VideoWriter(path, fourcc_code, self.fps, (width, height))
+            if not writer.isOpened():
                 # Same "never crash the capture thread over a hardware/
                 # codec quirk" reasoning as everywhere else in this
                 # project -- stop() below reports this cleanly (no file
@@ -257,7 +120,6 @@ class VideoRecorder:
                 return
             self._writer = writer
             self._filename = filename
-            self._opened_fourcc = opened_fourcc
         self._writer.write(frame)
 
     def stop(self):
@@ -267,23 +129,13 @@ class VideoRecorder:
         real possibility this handles cleanly). Returns the filename that
         was written, or None if nothing was. Prunes down to
         max_recordings the same way camera/snapshots.py's SnapshotStore
-        does for its own files.
-
-        2026-09-21: also runs _maybe_transcode_to_h264() on the just-closed
-        file before pruning -- see that function's own docstring. This
-        makes stop() block for as long as the transcode takes (a no-op,
-        instant check if the FourCC that actually opened was already
-        H.264, or if `ffmpeg` isn't installed) -- acceptable for this
-        project's short field-test clips, called once per REC_STOP, not
-        per frame."""
+        does for its own files."""
         self._armed = False
         filename = self._filename
         if self._writer is not None:
             self._writer.release()
             self._writer = None
             self._filename = None
-            _maybe_transcode_to_h264(os.path.join(self.directory, filename), self._opened_fourcc)
-            self._opened_fourcc = None
             self._prune()
         return filename
 
@@ -304,6 +156,21 @@ class VideoRecorder:
 
     def count(self) -> int:
         return len(self._existing_files())
+
+    def delete(self, filename) -> bool:
+        """Deletes one recording by name ahead of its natural FIFO
+        rotation -- same reasoning and same validation-against-
+        list_files() as camera/snapshots.py's SnapshotStore.delete()
+        above; backs camera/stream_server.py's DELETE
+        /recordings/<filename>. Returns True if a file was actually
+        removed, False otherwise (name not currently present)."""
+        if filename not in self.list_files():
+            return False
+        try:
+            os.remove(os.path.join(self.directory, filename))
+            return True
+        except OSError:
+            return False
 
     def list_files(self):
         """Recording filenames currently on disk, newest first -- mirrors

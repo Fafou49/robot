@@ -757,6 +757,87 @@ Tracer, `cpu_temp` ne dépend pas du flag `available` de `PWR` : il est
 renvoyé même si le câble RS485 est débranché, puisque rien n'empêche de
 lire le CPU du Pi dans ce cas.
 
+## Heure de bord (champ `onboard_time` de `PWR`, 2026-10-10)
+
+Demande explicite de l'utilisateur : la page `/power` affiche maintenant
+une petite case « Onboard time (Pi #1) » au-dessus du panneau Battery, pour
+repérer en un coup d'œil une horloge système du Pi #1 décalée (pas de pile
+RTC, NTP injoignable...). `link/server.py` ajoute un **15ᵉ champ,
+extensible en fin de trame** (même convention que le champ `dgps` de `STA`
+et le champ `cpu_temp` de `PWR` lui-même) : l'horodatage Unix (secondes
+entières) de l'horloge système du Pi #1 au moment de la requête
+(`int(time.time())`). Comme `cpu_temp`, ce champ ne dépend absolument pas
+du Tracer/du flag `available` — c'est l'heure du Pi lui-même, renvoyée même
+câble RS485 débranché.
+
+**Garde-fou ajouté le même jour (question explicite de l'utilisateur) :**
+ce Pi n'a pas de pile RTC. Au démarrage, avant que `systemd-timesyncd` ne
+corrige l'horloge via NTP (dès que le WiFi est disponible, en général en
+quelques secondes, mais sans aucune garantie de délai), `time.time()` peut
+renvoyer une valeur fausse de plusieurs mois/années (dernière valeur
+sauvegardée par `fake-hwclock`, ou date de build de l'image sur une carte
+SD neuve). Écrire une ligne dans la base d'historique avec un tel
+horodatage la fige définitivement avec un `ts` faux, impossible à corriger
+après coup une fois l'horloge recalée. `link.power_history.
+system_clock_is_plausible()` (seuil : `time.time() >= 2026-01-01`, même
+principe que le seuil de plausibilité déjà utilisé pour les coordonnées
+GPS — `RAW_LAT_MAGNITUDE_FLOOR`) bloque maintenant toute écriture tant que
+l'horloge n'a pas l'air plausible :
+- `PowerHistoryLogger._log_once()` n'écrit ni la ligne `power_log`, ni le
+  lot `solar_survey_raw` tant que ce n'est pas le cas (le tampon
+  solar-survey n'est pas vidé non plus — il attend simplement le prochain
+  passage) ;
+- `RobotState.update_gps_fix()` ne bufferise même pas un point
+  solar-survey dans ce cas, pour ne pas figer un mauvais horodatage dès la
+  capture (le correctif côté lecture seul ne suffirait pas, puisque le
+  `ts` est déjà fixé au moment de la bufferisation) ;
+- `log_media()` (géotags photo/vidéo, section ci-dessous) saute aussi
+  complètement l'écriture dans ce cas — demande explicite de
+  l'utilisateur, ajoutée le même jour. Contrairement à `power_log`/
+  solar-survey (qui retentent au prochain passage du logger, 5 minutes
+  plus tard), il n'y a ici aucune seconde chance : `log_media()` n'est
+  appelée qu'une seule fois par capture (à `CAM,SNAP`, ou à `CAM,REC_STOP`
+  pour un enregistrement). Une photo/vidéo prise pendant cette fenêtre
+  reste donc simplement absente de la carte `/control` (aucune ligne de
+  géotag) plutôt que géotaguée avec un horodatage faux — le fichier
+  lui-même n'est pas affecté, seule cette métadonnée est sautée.
+
+### Lifetime (`uptime_s`) + bascule sur l'heure GPS (`onboard_time_source`, 2026-10-10)
+
+Demande explicite de l'utilisateur : « ajoutes le life time qui
+chronomètre la durée d'éveil de la pi (en petit a côté de l'heure de
+bord). si le onboard time n'est pas réglé par le Wifi, prends celui du
+GPS ». Deux nouveaux champs, extensibles en fin de trame `PWR` (même
+convention que ci-dessus) :
+
+- **`uptime_s`** (17ᵉ champ) : durée depuis le dernier démarrage du Pi #1,
+  en secondes entières, lue depuis `/proc/uptime` (nouveau module
+  `link/uptime.py`, `read_uptime_s()` — même schéma « lecture fraîche hors
+  du verrou, dans `RobotState.power_status()` » déjà utilisé pour
+  `cpu_temp`). C'est le compteur de démarrage du noyau Linux, pas
+  l'horloge système : totalement insensible au problème de plausibilité
+  d'horloge ci-dessus, il reste correct même juste après un démarrage à
+  froid sans réseau. Affiché en petit sur `/power`, juste à côté de la
+  case « Onboard time (Pi #1) ».
+- **`onboard_time_source`** (16ᵉ champ, juste avant `uptime_s`) : `SYS` ou
+  `GPS`. Tant que `system_clock_is_plausible()` est vrai, `onboard_time`
+  continue de venir de l'horloge système du Pi (`SYS`, le cas normal).
+  Dès que cette horloge n'a pas encore l'air plausible (voir le
+  garde-fou ci-dessus) et qu'un fix GPS a déjà transmis sa propre
+  date/heure UTC (`RobotState.last_gps_utc_ts`, alimenté par
+  `GPSReader`/`parse_fix()` dans `link/gps_reader.py` à partir du champ
+  date+heure d'une trame GPRMC — une trame GGA seule ne porte pas la
+  date, donc ne peut jamais servir ici), `onboard_time` bascule sur cette
+  heure GPS à la place et le champ passe à `GPS` : l'heure d'un fix GPS
+  est correcte dès son acquisition, indépendamment du WiFi/NTP. S'il n'y
+  a ni horloge plausible ni fix GPS avec une heure utilisable,
+  `onboard_time` continue de renvoyer l'horloge système (fausse, mais
+  c'est la seule valeur disponible), toujours étiquetée `SYS`. Le site
+  `robot-webserver` affiche une petite étiquette « GPS » à côté de
+  l'heure de bord uniquement dans ce cas (normalement limité aux
+  premières minutes après un démarrage, avant que NTP n'ait corrigé
+  l'horloge).
+
 ## Historique power/GPS/snapshots (`link/power_history.py`)
 
 Ajouté le 2026-10-05 pour les deux nouveaux graphes "History" de la page
@@ -1398,6 +1479,44 @@ Vérifié ici avec une simulation fidèle de l'API v2 (construction du chip
 avec chemin complet, requête des 4 lignes moteur, appels `set_value` sur
 plusieurs cycles PWM) — non testable de bout en bout faute de GPIO/manette
 réels dans cet environnement de développement, à confirmer sur la Pi.
+
+## Corrections apportées (2026-10-10) — retour aux waypoints (BTN_A) bloqué après repassage en manuel
+
+Bug remonté par l'utilisateur : après un appui sur **A** de la manette
+(`start_waypoint_return()`, voir `link/robot_state.py`), les points
+sauvegardés passent en route de retour (affichés en rouge/« NAV » sur la
+carte de `/control`, côté robot-webserver). Si l'opérateur reprend ensuite
+la main en mode manuel (joystick, ou `MOD,MANUAL`/`DRV` depuis le site), les
+points restaient bloqués dans cet état « NAV » et un nouvel appui sur A ne
+permettait plus de les atteindre.
+
+Cause : `set_mode()` ne réinitialisait jamais `self.route` /
+`self.route_index` / `self.route_is_return` en quittant le mode AUTO (seul
+`stop()` le faisait). Deux conséquences cumulées :
+
+- la carte continuait d'afficher l'ancienne route de retour comme active,
+  puisque `route_is_return` restait `True` ;
+- `_advance_route_if_arrived()` (appelée sur **chaque** fix GPS, quel que
+  soit le mode) continuait à faire avancer `route_index` et à supprimer des
+  waypoints de `waypoints.txt` à mesure que l'opérateur conduisait
+  manuellement à proximité des points restants — alors qu'aucune navigation
+  autonome n'était plus en cours. Au moment d'un nouvel appui sur A, les
+  waypoints restants avaient donc déjà été partiellement/totalement
+  consommés, ou la route semblait déjà terminée (`route_index == len(route)`),
+  et `start_waypoint_return()` n'avait plus rien de valable à reconstruire.
+
+Correctif : `set_mode()` vide maintenant `route`/`route_index`/
+`route_is_return`/`_return_raw_lines` chaque fois que le mode cible n'est
+pas `AUTO` (même convention « dernière commande gagne » que `NAV`/`RTE`/
+`STP` utilisent déjà ailleurs dans cette classe). `nav_target` est
+volontairement laissé inchangé (même précédent que `stop()`). Résultat : un
+retour au mode manuel annule proprement la route de retour en cours (la
+carte revient à de simples points bleus), et un nouvel appui sur A relance
+une route de retour toute neuve à partir des waypoints réellement non
+atteints. 5 nouveaux tests dans `tests/test_link_server.py` couvrent ce cas
+(retour en MANUAL/IDLE, non-consommation silencieuse des waypoints pendant
+la conduite manuelle, reconstruction de la route par un nouvel appui, et la
+non-régression sur `nav_target`).
 
 ## Documentation réseau et architecture
 

@@ -69,6 +69,24 @@ class SnapshotStore:
     def count(self) -> int:
         return len(self._existing_files())
 
+    def delete(self, filename) -> bool:
+        """Deletes one snapshot by name ahead of its natural FIFO rotation
+        -- backs camera/stream_server.py's DELETE /snapshots/<filename>
+        (2026-10-05), itself called when a violet marker on robot-
+        webserver's /control map is right-click-deleted. `filename` is
+        validated against list_files() first, same path-traversal-safe
+        check _handle_file() already uses for reads -- this both rejects
+        a bogus name and means a stale/already-gone name is simply
+        reported as "nothing to delete" rather than raising. Returns True
+        if a file was actually removed, False otherwise."""
+        if filename not in self.list_files():
+            return False
+        try:
+            os.remove(os.path.join(self.directory, filename))
+            return True
+        except OSError:
+            return False
+
     def list_files(self):
         """Snapshot filenames currently on disk, newest first -- the order
         a UI listing (the web server's Media page) wants, as opposed to

@@ -32,6 +32,7 @@ pynmea2 installed) before relying on this. The graceful-degradation
 paths (device absent, and even the libraries themselves missing) ARE
 exercised for real here and confirmed not to crash the control server.
 """
+import datetime
 import logging
 import threading
 import time
@@ -58,12 +59,29 @@ KNOTS_TO_KMH = 1.852
 
 def parse_fix(line: str):
     """Parses one raw NMEA line. Returns a dict {lat, lon, speed_kmh, cap,
-    quality} (speed_kmh/cap are None for a GGA sentence, which doesn't
-    carry them; quality is None for an RMC sentence, which doesn't carry
-    THAT -- see the `quality` key below) for a sentence with a valid fix,
-    or None for anything else (wrong sentence type, checksum/parse
-    failure, no fix yet -- RMC status "V", GGA quality 0, or pynmea2 not
-    installed).
+    quality, gps_utc_ts} (speed_kmh/cap are None for a GGA sentence, which
+    doesn't carry them; quality is None for an RMC sentence, which doesn't
+    carry THAT -- see the `quality` key below; gps_utc_ts is None for a
+    GGA sentence too, see its own paragraph below) for a sentence with a
+    valid fix, or None for anything else (wrong sentence type, checksum/
+    parse failure, no fix yet -- RMC status "V", GGA quality 0, or
+    pynmea2 not installed).
+
+    `gps_utc_ts` (2026-10-10, explicit user request) is the GPRMC
+    sentence's own UTC date+time, as a Unix timestamp -- used by
+    link/server.py's PWR handler as a fallback for the onboard_time field
+    whenever Pi #1's own system clock still looks unset (no RTC battery,
+    NTP not reached yet -- see link.power_history.
+    system_clock_is_plausible): a GPS fix's UTC time is correct the
+    moment a fix is acquired, independent of WiFi/NTP entirely. Built
+    from pynmea2's documented, stable `.datestamp`/`.timestamp`
+    attributes on an RMC message (date and time ship as two separate
+    fields on the wire, GGA carries neither) -- combined here as a
+    timezone-aware UTC datetime. Same "written against the documented
+    API, not yet run against the real library" honesty caveat as this
+    whole module's docstring already gives .spd_over_grnd/.true_course/
+    .status/.gps_qual above; None if either sub-field is somehow still
+    unset despite status=="A" (defensive, shouldn't normally happen).
 
     `quality` (added 2026-09-18) is the raw GGA fix-quality indicator
     (standard NMEA values: 1 = plain autonomous GPS fix, 2 = DGPS-
@@ -96,14 +114,19 @@ def parse_fix(line: str):
             return None
         speed_kmh = float(msg.spd_over_grnd) * KNOTS_TO_KMH if msg.spd_over_grnd else 0.0
         cap = float(msg.true_course) if msg.true_course else None
+        gps_utc_ts = None
+        if msg.datestamp is not None and msg.timestamp is not None:
+            gps_utc_ts = datetime.datetime.combine(
+                msg.datestamp, msg.timestamp, tzinfo=datetime.timezone.utc
+            ).timestamp()
         return {"lat": msg.latitude, "lon": msg.longitude, "speed_kmh": speed_kmh,
-                "cap": cap, "quality": None}
+                "cap": cap, "quality": None, "gps_utc_ts": gps_utc_ts}
 
     if isinstance(msg, pynmea2.types.talker.GGA):
         if not msg.gps_qual or int(msg.gps_qual) == 0:
             return None
         return {"lat": msg.latitude, "lon": msg.longitude, "speed_kmh": None,
-                "cap": None, "quality": int(msg.gps_qual)}
+                "cap": None, "quality": int(msg.gps_qual), "gps_utc_ts": None}
 
     return None
 
@@ -199,7 +222,7 @@ class GPSReader:
                 is_dgps = fix["quality"] == DGPS_QUALITY if fix["quality"] is not None else None
                 self.state.update_gps_fix(
                     fix["lat"], fix["lon"], speed_kmh=fix["speed_kmh"], cap=fix["cap"],
-                    is_dgps=is_dgps,
+                    is_dgps=is_dgps, gps_utc_ts=fix.get("gps_utc_ts"),
                 )
                 if fix["quality"] is not None:
                     if self._last_is_dgps is None:

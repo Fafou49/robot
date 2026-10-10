@@ -345,160 +345,82 @@ def test_recording_file_is_served_with_video_content_type(monkeypatch, tmp_path)
     assert body == b"fake-mp4-bytes"
 
 
-# --- _handle_file: Range requests (2026-09-21, for real <video> seeking/
-# Safari playback -- see _handle_file()'s own docstring) -------------------
+# --- StreamHandler: DELETE /snapshots/<filename>, /recordings/<filename> (2026-10-05) ----
 
-def test_whole_file_response_advertises_accept_ranges(monkeypatch, tmp_path):
-    filename = "rec_20260921_090000_000001.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
+def test_delete_snapshot_removes_a_known_file(monkeypatch):
+    fake_store = MagicMock()
+    fake_store.delete.return_value = True
+    monkeypatch.setattr(stream_server, "snapshot_store", fake_store)
 
     server, thread = _start_test_server()
     try:
         port = server.server_address[1]
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/recordings/{filename}", timeout=2) as resp:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/snapshots/snap_x.jpg", method="DELETE")
+        with urllib.request.urlopen(req, timeout=2) as resp:
             assert resp.status == 200
-            assert resp.headers["Accept-Ranges"] == "bytes"
-            assert resp.headers["Content-Length"] == "10"
-            body = resp.read()
+            body = json.loads(resp.read())
     finally:
         server.shutdown()
         server.server_close()
 
-    assert body == b"0123456789"
+    assert body == {"ok": True, "file": "snap_x.jpg"}
+    fake_store.delete.assert_called_once_with("snap_x.jpg")
 
 
-def test_range_request_returns_206_with_just_that_slice(monkeypatch, tmp_path):
-    filename = "rec_20260921_090001_000002.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")  # bytes 2-4 == b"234"
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
+def test_delete_snapshot_404s_when_the_file_is_not_present(monkeypatch):
+    fake_store = MagicMock()
+    fake_store.delete.return_value = False
+    monkeypatch.setattr(stream_server, "snapshot_store", fake_store)
 
     server, thread = _start_test_server()
     try:
         port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=2-4"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 206
-            assert resp.headers["Content-Range"] == "bytes 2-4/10"
-            assert resp.headers["Content-Length"] == "3"
-            assert resp.headers["Accept-Ranges"] == "bytes"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"234"
-
-
-def test_open_ended_range_request_returns_through_eof(monkeypatch, tmp_path):
-    filename = "rec_20260921_090002_000003.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=7-"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 206
-            assert resp.headers["Content-Range"] == "bytes 7-9/10"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"789"
-
-
-def test_suffix_range_request_returns_last_n_bytes(monkeypatch, tmp_path):
-    filename = "rec_20260921_090003_000004.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=-3"}
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            assert resp.status == 206
-            assert resp.headers["Content-Range"] == "bytes 7-9/10"
-            body = resp.read()
-    finally:
-        server.shutdown()
-        server.server_close()
-
-    assert body == b"789"
-
-
-def test_out_of_range_request_returns_416_with_content_range(monkeypatch, tmp_path):
-    filename = "rec_20260921_090004_000005.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")  # 10 bytes -- asking for byte 100 is unsatisfiable
-    fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
-    monkeypatch.setattr(stream_server, "recorder", fake_recorder)
-
-    server, thread = _start_test_server()
-    try:
-        port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=100-200"}
-        )
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/snapshots/gone.jpg", method="DELETE")
         try:
             urllib.request.urlopen(req, timeout=2)
-            raise AssertionError("expected an HTTPError (416)")
+            raise AssertionError("expected an HTTPError (404)")
         except urllib.error.HTTPError as exc:
-            status = exc.code
-            content_range = exc.headers.get("Content-Range")
+            assert exc.code == 404
+            body = json.loads(exc.read())
     finally:
         server.shutdown()
         server.server_close()
 
-    assert status == 416
-    assert content_range == "bytes */10"
+    assert body == {"ok": False, "file": "gone.jpg"}
 
 
-def test_multi_range_request_falls_back_to_the_whole_file(monkeypatch, tmp_path):
-    # No mainstream browser <video> element actually sends this, but a
-    # multi-range Range header must degrade to "ignore it, send
-    # everything" rather than erroring or misbehaving -- see
-    # _parse_range_header()'s own docstring.
-    filename = "rec_20260921_090005_000006.mp4"
-    (tmp_path / filename).write_bytes(b"0123456789")
+def test_delete_recording_removes_a_known_file(monkeypatch):
     fake_recorder = MagicMock()
-    fake_recorder.list_files.return_value = [filename]
-    fake_recorder.directory = str(tmp_path)
+    fake_recorder.delete.return_value = True
     monkeypatch.setattr(stream_server, "recorder", fake_recorder)
 
     server, thread = _start_test_server()
     try:
         port = server.server_address[1]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/recordings/{filename}", headers={"Range": "bytes=0-1,3-4"}
-        )
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/recordings/rec_x.mp4", method="DELETE")
         with urllib.request.urlopen(req, timeout=2) as resp:
             assert resp.status == 200
-            body = resp.read()
+            body = json.loads(resp.read())
     finally:
         server.shutdown()
         server.server_close()
 
-    assert body == b"0123456789"
+    assert body == {"ok": True, "file": "rec_x.mp4"}
+    fake_recorder.delete.assert_called_once_with("rec_x.mp4")
+
+
+def test_delete_on_an_unknown_path_is_404(monkeypatch):
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/not-a-real-path", method="DELETE")
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            raise AssertionError("expected an HTTPError (404)")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 404

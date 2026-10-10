@@ -74,6 +74,11 @@ def test_parse_fix_valid_rmc_with_speed_and_course():
     assert fix["lon"] == pytest.approx(-0.7390, abs=1e-3)
     assert fix["speed_kmh"] == pytest.approx(2.0 * 1.852, abs=1e-3)
     assert fix["cap"] == pytest.approx(284.5, abs=1e-3)
+    # gps_utc_ts (2026-10-10): "123519" (12:35:19 UTC) + "230394"
+    # (23 March 1994) -> 1994-03-23T12:35:19Z.
+    import datetime
+    expected = datetime.datetime(1994, 3, 23, 12, 35, 19, tzinfo=datetime.timezone.utc).timestamp()
+    assert fix["gps_utc_ts"] == pytest.approx(expected, abs=1e-6)
 
 
 def test_parse_fix_void_rmc_returns_none():
@@ -89,6 +94,9 @@ def test_parse_fix_valid_gga_has_no_speed_or_course():
     assert fix["lon"] == pytest.approx(-0.7390, abs=1e-3)
     assert fix["speed_kmh"] is None
     assert fix["cap"] is None
+    # GGA carries a time-of-day but no date -- can't build a full
+    # timestamp from it alone, unlike RMC above.
+    assert fix["gps_utc_ts"] is None
 
 
 def test_parse_fix_gga_no_fix_returns_none():
@@ -110,8 +118,8 @@ class _FakeState:
     def __init__(self):
         self.fixes = []
 
-    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None):
-        self.fixes.append((lat, lon, speed_kmh, cap, is_dgps))
+    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None, gps_utc_ts=None):
+        self.fixes.append((lat, lon, speed_kmh, cap, is_dgps, gps_utc_ts))
 
 
 def _run_loop_with_fixes(monkeypatch, fixes, return_state=False):
@@ -225,3 +233,34 @@ def test_gps_reader_forwards_is_dgps_false_for_a_non_dgps_gga_fix(monkeypatch):
         {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 1},
     ], return_state=True)
     assert state.fixes[0][4] is False
+
+
+# --- GPSReader._loop(): gps_utc_ts forwarded to RobotState.update_gps_fix()
+# (2026-10-10, explicit user request -- PWR's onboard_time GPS fallback)
+
+def test_gps_reader_forwards_gps_utc_ts_from_an_rmc_fix(monkeypatch):
+    calls, state = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": 5.0, "cap": 90.0, "quality": None,
+         "gps_utc_ts": 1760000000.0},
+    ], return_state=True)
+    assert state.fixes[0][5] == 1760000000.0  # gps_utc_ts
+
+
+def test_gps_reader_forwards_none_gps_utc_ts_for_a_gga_only_fix(monkeypatch):
+    # GGA carries no date -- parse_fix() always reports gps_utc_ts=None
+    # for it (see its own docstring/tests in this file).
+    calls, state = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 1,
+         "gps_utc_ts": None},
+    ], return_state=True)
+    assert state.fixes[0][5] is None
+
+
+def test_gps_reader_forwards_none_gps_utc_ts_when_the_fix_dict_omits_it(monkeypatch):
+    # Defensive: a `fix` dict missing the key entirely (shouldn't happen
+    # with the real parse_fix(), which always includes it, but costs
+    # nothing to handle via .get() in link.gps_reader's own _loop()).
+    calls, state = _run_loop_with_fixes(monkeypatch, [
+        {"lat": 1.0, "lon": 1.0, "speed_kmh": None, "cap": None, "quality": 1},
+    ], return_state=True)
+    assert state.fixes[0][5] is None

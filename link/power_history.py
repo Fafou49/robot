@@ -221,7 +221,26 @@ def log_media(db_path: str, filename: str, kind: str, lat, lon) -> None:
     but only written once REC_STOP hands back the actual filename -- see
     that method's own comment for why) -- see the `snapshots` table's own
     comment above for why this isn't gated on Tracer availability the way
-    power_log is."""
+    power_log is.
+
+    Clock-plausibility gate (2026-10-10, explicit user request, same
+    reasoning/helper as PowerHistoryLogger._log_once() and
+    RobotState.update_gps_fix()'s own solar-survey gating): skipped
+    entirely while the system clock still looks like a pre-NTP-sync
+    fallback value (see system_clock_is_plausible()'s own docstring)
+    rather than permanently burning in a `ts` that's about to be wrong by
+    months. Unlike the power_log/solar-survey ticks, there's no later
+    retry for this one specific file -- log_media() only ever runs once
+    per capture (at SNAP, or at REC_STOP for a recording) -- so a photo
+    or video taken during that window simply stays off the /control map
+    (no geotag row at all) rather than being geotagged with a wrong
+    timestamp; the file itself is untouched either way, only this map
+    metadata is skipped."""
+    if not system_clock_is_plausible():
+        log.warning(
+            "skipping geotag DB write for %r -- system clock looks unset", filename,
+        )
+        return
     ensure_schema(db_path)
     with _connect(db_path) as conn:
         conn.execute(
@@ -271,6 +290,57 @@ def delete_media_row(db_path: str, filename: str) -> None:
     ensure_schema(db_path)
     with _connect(db_path) as conn:
         conn.execute("DELETE FROM snapshots WHERE filename = ?", (filename,))
+
+
+# A Raspberry Pi with no RTC battery (this project has none, see the
+# "Heure de bord" section of the README) has no real clock of its own: on
+# boot it starts from whatever Raspberry Pi OS's `fake-hwclock` mechanism
+# last saved to disk (close to the previous shutdown time, itself not
+# guaranteed correct) or, on a brand-new SD card image with no saved file
+# yet, essentially the image's own build date -- in both cases a value
+# that can easily be months or years behind the real time. systemd-
+# timesyncd then corrects it automatically as soon as the Pi reaches an
+# NTP server over WiFi, normally within seconds of getting a network
+# link, but there's no bound on how long that can take (or whether it
+# ever happens, if the robot is run somewhere with no internet access).
+#
+# MIN_PLAUSIBLE_EPOCH_S is a deliberately conservative floor (comfortably
+# before this project's own 2026 timeline) below which `time.time()` is
+# almost certainly still that pre-sync fallback rather than a real
+# reading -- same "a valid number, just the wrong shape/scale" reasoning
+# as link.robot_state's own RAW_LAT_MAGNITUDE_FLOOR check for lat/lon.
+# 2026-01-01T00:00:00Z.
+MIN_PLAUSIBLE_EPOCH_S = 1767225600
+
+_clock_implausible_warned = False
+
+
+def system_clock_is_plausible() -> bool:
+    """False while Pi #1's system clock still looks like a pre-NTP-sync
+    fallback value (see MIN_PLAUSIBLE_EPOCH_S above) rather than a real
+    reading. Callers use this to skip writing any timestamped row to the
+    history DB until the clock has had a chance to correct itself --
+    explicit user request (2026-10-10, prompted by the new PWR
+    onboard_time field): a row permanently burned in with a wrong `ts`
+    can't be fixed up later just because the clock corrects itself a
+    minute after boot. Logs one warning the first time this is found
+    False (not every tick -- this can legitimately stay False for a
+    while right after boot) and one info line once it recovers."""
+    global _clock_implausible_warned
+    plausible = time.time() >= MIN_PLAUSIBLE_EPOCH_S
+    if not plausible and not _clock_implausible_warned:
+        log.warning(
+            "system clock looks unset (reads before %s) -- most likely "
+            "this Pi has no RTC battery and hasn't reached an NTP server "
+            "yet since boot; skipping history DB writes until it "
+            "corrects itself",
+            time.strftime("%Y-%m-%d", time.gmtime(MIN_PLAUSIBLE_EPOCH_S)),
+        )
+        _clock_implausible_warned = True
+    elif plausible and _clock_implausible_warned:
+        log.info("system clock now looks plausible -- resuming history DB writes")
+        _clock_implausible_warned = False
+    return plausible
 
 
 def insert_sample(db_path: str, sample: dict) -> None:
@@ -472,14 +542,31 @@ class PowerHistoryLogger:
     def _log_once(self):
         status = self.state.status()
 
+        # Clock-plausibility gate (2026-10-10, explicit user request): if
+        # Pi #1's system clock still looks unset (see
+        # system_clock_is_plausible()'s own docstring above), this whole
+        # tick is skipped -- nothing gets written to the history DB (not
+        # power_log, not the solar-survey raw table) rather than
+        # permanently burning in rows keyed on a `ts` that's about to be
+        # wrong by months once NTP corrects the clock. The solar-map
+        # recompute below is skipped too, but harmlessly so: with no new
+        # raw rows landing while this gate is closed, there's nothing new
+        # for it to aggregate anyway. The tmp buffer is deliberately NOT
+        # drained here: the already-buffered points (gated at capture
+        # time in RobotState.update_gps_fix(), same reasoning) simply
+        # wait for a later tick once the clock has recovered, rather than
+        # being lost.
+        if not system_clock_is_plausible():
+            return
+
         # Solar-exposure survey (2026-10-07, explicit user request) --
-        # unconditional: each buffered line was already individually
-        # gated (valid GPS fix + Tracer available) at write time by
-        # RobotState.update_gps_fix(), so there's nothing left to
-        # re-check here. An empty buffer (nothing moved >=5m since the
-        # last tick, or the Tracer's been down the whole time) is the
-        # common case, and drain_points() is a cheap no-op then -- see
-        # link.solar_map.
+        # unconditional (beyond the clock gate just above): each buffered
+        # line was already individually gated (valid GPS fix + Tracer
+        # available) at write time by RobotState.update_gps_fix(), so
+        # there's nothing left to re-check here. An empty buffer (nothing
+        # moved >=5m since the last tick, or the Tracer's been down the
+        # whole time) is the common case, and drain_points() is a cheap
+        # no-op then -- see link.solar_map.
         points = solar_map.drain_points(solar_map.resolve_tmp_path())
         if points:
             log_solar_survey_batch(self.db_path, points)

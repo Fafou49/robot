@@ -46,9 +46,11 @@ import urllib.request
 from link import solar_map
 from link.autopilot import Autopilot, bearing_deg, haversine_distance_m, heading_error_for_pid
 from link.cpu_temp import read_cpu_temperature_c
+from link.uptime import read_uptime_s
 from link.nmea import decimal_to_nmea, nmea_to_decimal
 from link.power_history import delete_media_row, fetch_media_positions, log_media
 from link.power_history import resolve_db_path as resolve_history_db_path
+from link.power_history import system_clock_is_plausible
 
 log = logging.getLogger("link.robot_state")
 
@@ -229,6 +231,17 @@ class RobotState:
         # only ever show for the former (see pages/protocole_controle.html
         # for the STA field this backs).
         self.is_dgps = None
+        # Last UTC date/time reported by the GPS receiver's own GPRMC
+        # sentence, as a Unix timestamp -- None until at least one GPRMC
+        # sentence with a valid fix has arrived (see link/gps_reader.py's
+        # parse_fix(), which only fills this in for RMC, not GGA: GGA
+        # carries a time-of-day but no date, so it alone can't produce a
+        # full timestamp). Explicit user request (2026-10-10): PWR's
+        # onboard_time field falls back to this whenever Pi #1's own
+        # system clock still looks unset (see link.power_history.
+        # system_clock_is_plausible) -- a GPS fix's UTC time is correct
+        # from the moment a fix is acquired, independent of WiFi/NTP.
+        self.last_gps_utc_ts = None
         # Solar-exposure survey (2026-10-07, explicit user request):
         # resolved once here -- not inside update_gps_fix(), which runs
         # on every single GPS fix -- so the SOLAR_SURVEY_TMP_PATH env
@@ -345,6 +358,39 @@ class RobotState:
                 # doesn't produce a derivative-kick-style jolt on the
                 # first tick of this one.
                 self.autopilot.reset()
+            else:
+                # Bug fix (2026-10-10): leaving AUTO -- back to MANUAL (a
+                # gamepad stick push, see
+                # link.gamepad_handler.robot_state_drive_handler, or a
+                # website DRV) or to IDLE via a plain MOD command -- now
+                # cancels any route in progress, same "newest command
+                # wins" convention NAV/RTE/STP already use elsewhere in
+                # this class (see set_nav_target()/set_route()/stop()
+                # above). Without this, a BTN_A waypoint-return route
+                # (start_waypoint_return() below) kept reporting itself
+                # as an active route (route_is_return stayed True, so
+                # robot-webserver's /control map kept drawing the
+                # waypoints as an active NAV/route rather than plain blue
+                # points) AND kept being silently chased by
+                # _advance_route_if_arrived() -- that method runs on
+                # every GPS fix regardless of mode, so it went right on
+                # advancing route_index and deleting "arrived" waypoints
+                # from waypoints.txt even while the operator had already
+                # taken back manual control. By the time BTN_A was
+                # pressed again, the saved waypoints were already
+                # partially or fully consumed, or the route already
+                # looked exhausted, so start_waypoint_return() either had
+                # nothing left to build a route from or simply re-armed
+                # AUTO on a target already reached -- the robot never
+                # actually moved. Clearing the route here (nav_target is
+                # deliberately left alone, matching stop()'s own
+                # precedent) means a fresh BTN_A press after returning to
+                # MANUAL always starts a brand new return route from
+                # whatever waypoints are still genuinely unvisited.
+                self.route = []
+                self.route_index = 0
+                self.route_is_return = False
+                self._return_raw_lines = []
             self.last_command_at = time.time()
         # Leaving MANUAL always stops the motors first -- driving only
         # resumes once update_gps_fix()'s autonomous tick has a fresh GPS
@@ -630,7 +676,7 @@ class RobotState:
 
     # -- GPS: live fix from link.gps_reader.GPSReader, if a receiver is
     #    attached -------------------------------------------------------
-    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None):
+    def update_gps_fix(self, lat, lon, speed_kmh=None, cap=None, is_dgps=None, gps_utc_ts=None):
         motor_output = None
         # (ts, lat, lon, pv_power) to buffer to the solar-survey tmp file
         # once the lock is released, or None if this fix doesn't qualify
@@ -645,6 +691,8 @@ class RobotState:
                 self.cap = cap
             if is_dgps is not None:
                 self.is_dgps = is_dgps
+            if gps_utc_ts is not None:
+                self.last_gps_utc_ts = gps_utc_ts
             self.last_fix_at = time.time()
             self._advance_route_if_arrived()
             if self.mode == "AUTO":
@@ -667,9 +715,26 @@ class RobotState:
             # self.power_available is True, the exact same rule
             # link.power_history's power_log already applies, so a
             # disconnected Tracer cable never pairs a real position with
-            # a stale/placeholder pv_power reading.
-            if self.power_available is True and solar_map.should_record_point(
-                self._solar_survey_last_point, lat, lon
+            # a stale/placeholder pv_power reading. (3) the system clock
+            # must look plausible (2026-10-10, explicit user request) --
+            # this Pi has no RTC battery, so right after boot and before
+            # NTP has had a chance to correct the clock, time.time() can
+            # read months/years off; buffering (and, in link.power_history,
+            # eventually writing to the DB) a sample timestamped with that
+            # fallback value would permanently burn in a wrong `ts` that
+            # can never be fixed up once the clock corrects itself a
+            # moment later. See link.power_history.system_clock_is_plausible
+            # for the actual check -- same gate that module's own
+            # _log_once() applies to power_log. Deliberately NOT updating
+            # _solar_survey_last_point in that case either: the "moved
+            # >=5m" distance gate should still measure from the last
+            # point that was ACTUALLY buffered (or nothing, from the very
+            # start) once the clock recovers, not from a point that was
+            # silently skipped.
+            if (
+                self.power_available is True
+                and system_clock_is_plausible()
+                and solar_map.should_record_point(self._solar_survey_last_point, lat, lon)
             ):
                 self._solar_survey_last_point = (lat, lon)
                 solar_survey_sample = (self.last_fix_at, lat, lon, self.pv_power)
@@ -1330,6 +1395,11 @@ class RobotState:
         # do here, on every PWR request. Read outside the lock since it's
         # a plain file read with nothing to do with RobotState itself.
         cpu_temp = read_cpu_temperature_c()
+        # uptime_s (2026-10-10, explicit user request): same "fresh read,
+        # outside the lock" treatment as cpu_temp above -- see link.uptime
+        # for why this is immune to the clock-not-synced problem
+        # onboard_time (below) can hit.
+        uptime_s = read_uptime_s()
         with self._lock:
             return {
                 "pv_voltage": self.pv_voltage,
@@ -1346,4 +1416,15 @@ class RobotState:
                 "controller_temp": self.controller_temp,
                 "cpu_temp": cpu_temp,
                 "available": self.power_available,
+                "uptime_s": uptime_s,
+                # Last known UTC date/time reported by the GPS receiver's
+                # own RMC sentence (set in update_gps_fix() below) --
+                # explicit user request (2026-10-10): link/server.py's PWR
+                # handler falls back to this for onboard_time whenever
+                # system_clock_is_plausible() says Pi #1's own system
+                # clock still looks unset, since a GPS fix's UTC time is
+                # correct the moment a fix is acquired, with no dependency
+                # on WiFi/NTP at all. None until at least one GPRMC
+                # sentence with a valid fix has been seen.
+                "gps_utc_ts": self.last_gps_utc_ts,
             }

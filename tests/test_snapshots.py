@@ -63,3 +63,33 @@ def test_list_files_reflects_pruning(tmp_path):
 def test_list_files_empty_when_nothing_saved(tmp_path):
     store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
     assert store.list_files() == []
+
+
+# --- delete() (2026-10-05, backs the /control map's right-click delete) ----
+
+def test_delete_removes_the_file_and_returns_true(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    filename = store.save(b"jpeg-bytes")
+    assert store.delete(filename) is True
+    assert not os.path.isfile(os.path.join(str(tmp_path), filename))
+    assert filename not in store.list_files()
+
+
+def test_delete_an_already_gone_file_returns_false(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    filename = store.save(b"jpeg-bytes")
+    store.delete(filename)
+    assert store.delete(filename) is False
+
+
+def test_delete_a_name_that_was_never_saved_returns_false(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    assert store.delete("snap_never_existed.jpg") is False
+
+
+def test_delete_leaves_other_files_untouched(tmp_path):
+    store = SnapshotStore(directory=str(tmp_path), max_snapshots=5)
+    keep = store.save(b"keep-me")
+    drop = store.save(b"drop-me")
+    store.delete(drop)
+    assert store.list_files() == [keep]

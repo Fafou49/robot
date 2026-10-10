@@ -15,6 +15,7 @@ import os
 import shlex
 import socketserver
 import subprocess
+import time
 
 from link.gamepad_handler import GamepadReader, robot_state_button_handler, robot_state_drive_handler
 from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
@@ -27,6 +28,7 @@ from link.power_history import (
     fetch_period_chunk,
     fetch_solar_map_chunk,
     resolve_db_path,
+    system_clock_is_plausible,
 )
 from link.robot_state import CommandError, RobotState
 from link.tracer_reader import (
@@ -347,6 +349,54 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         # still reported even when the Tracer cable is unplugged. See
         # link.cpu_temp for why it falls back to the same 0.0 placeholder
         # as every other field here rather than needing its own flag.
+        # onboard_time (15th field, 2026-10-10, extend-only -- an older
+        # robot-webserver that doesn't know about it yet just ignores the
+        # extra field, same convention as STA's dgps field and this same
+        # sentence's own cpu_temp field above): Pi #1's own system clock,
+        # as a whole-second Unix timestamp. Explicit user request -- the
+        # /power page shows it as a small "onboard time" readout above the
+        # Battery panel, specifically so a drifted/wrong Pi #1 clock (no
+        # RTC battery, NTP not reachable, ...) is visible at a glance next
+        # to the operator's own watch. Like cpu_temp, this is Pi #1 itself
+        # and has nothing to do with the Tracer, so it is NOT gated by
+        # `available` either.
+        #
+        # GPS fallback (2026-10-10, explicit user request): whenever the
+        # system clock itself still looks unset (system_clock_is_plausible()
+        # -- same check link.power_history's logger uses before writing
+        # anything to the history DB), fall back to the last UTC date/time
+        # the GPS receiver's own GPRMC sentence reported (RobotState.
+        # last_gps_utc_ts, see link/gps_reader.py) -- a GPS fix's UTC time
+        # is correct the instant a fix is acquired, with no dependency on
+        # WiFi/NTP at all. onboard_time_source (16th field, a trailing
+        # enum, same convention as STA's own dgps field) tells the website
+        # which one it's actually looking at: "SYS" (the system clock,
+        # trusted) or "GPS" (system clock not trusted, GPS time used
+        # instead). If NEITHER is available yet (system clock unset AND no
+        # GPS fix with a valid date has ever arrived), this falls back to
+        # the system clock anyway, still labelled "SYS" -- reporting
+        # *something* rather than a placeholder the wire format has no
+        # clean way to express, same reasoning PWR already uses elsewhere
+        # (see the 0.0-placeholder note above); the website's own display
+        # of this value is what makes a still-wrong reading visible to the
+        # operator.
+        #
+        # uptime_s (17th field, 2026-10-10, extend-only): Pi #1's own
+        # uptime in whole seconds since boot (link.uptime), shown as a
+        # small "lifetime" readout right next to onboard_time on /power.
+        # Deliberately independent of the clock-plausibility question
+        # above -- see link.uptime's own docstring for why a monotonic
+        # boot-time counter has nothing to lose from an unset wall clock.
+        if system_clock_is_plausible():
+            onboard_time = int(time.time())
+            onboard_time_source = "SYS"
+        elif p.get("gps_utc_ts") is not None:
+            onboard_time = int(p["gps_utc_ts"])
+            onboard_time_source = "GPS"
+        else:
+            onboard_time = int(time.time())
+            onboard_time_source = "SYS"
+        uptime_s = p.get("uptime_s")
         return build_sentence(
             "PWR",
             round(float(p["pv_voltage"] or 0.0), 2), round(float(p["pv_current"] or 0.0), 2),
@@ -360,6 +410,9 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
             round(float(p["battery_temp"] or 0.0), 1), round(float(p["controller_temp"] or 0.0), 1),
             round(float(p["cpu_temp"] or 0.0), 1),
             1 if available else 0,
+            onboard_time,
+            onboard_time_source,
+            uptime_s if uptime_s is not None else 0,
         )
 
     if sentence_type == "HIS":

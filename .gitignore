@@ -47,5 +47,6 @@ data/*
 # Fichiers sp�cifiques aux IDE
 .idea/
 .vscode/
-ch343ser_linux/
-ch343ser_linux/
+
+#Fichier Driver ch343ser_linux
+ch343ser_linux
