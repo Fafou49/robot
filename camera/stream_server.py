@@ -77,6 +77,33 @@ starts and stays up with no camera attached at all: /stream.mjpg opens the
 connection and simply waits (same as the existing "opened but no frame
 yet" case), /snap answers HTTP 503 (see StreamHandler._handle_snap), and
 the feed picks up on its own as soon as a camera is plugged in.
+
+UPDATE (2026-10-10): reactive/eco power mode, explicit user request --
+"je souhaites la reactivite lorsque le panneau solaire charge ou que j'ai
+assez d'energie pour passer la nuit. En cas d'incertitude on passe en
+mode eco". The actual REACTIVE/ECO decision is made elsewhere (Pi #1's
+other process, link/server.py, via link/camera_power_policy.py -- it
+looks at solar/battery telemetry this process has no access to) and
+pushed here over a new POST /power_mode endpoint (see
+StreamHandler._handle_power_mode and FrameGrabber.set_mode), the same
+cross-process HTTP pattern /snap, /rec/start, /rec/stop already use, just
+in the other direction.
+
+In REACTIVE mode (the default, and the ONLY mode before this update)
+FrameGrabber behaves exactly as before: continuous capture regardless of
+viewers. In ECO mode, FrameGrabber releases the camera device (stops
+drawing power/CPU on it) whenever nobody is actually watching: no
+/stream.mjpg viewer currently connected (see FrameGrabber.viewer_
+connected/viewer_disconnected, called from the streaming handler below)
+AND no recording in progress (camera/recordings.py's VideoRecorder.
+is_recording -- an eco-mode release must never cut off an active
+recording) AND no recent /snap or /rec/start wake request still pending
+(FrameGrabber.request_active -- see _handle_snap/_handle_rec_start/
+_wait_for_frame below: those must still work on demand even in eco mode,
+just with a short delay to let the camera reopen and deliver a frame,
+rather than always answering 503 the moment eco mode is on). Switching
+back to REACTIVE, or any one of those three conditions becoming false,
+makes the capture loop reopen the device on its very next iteration.
 """
 import json
 import os
@@ -119,6 +146,23 @@ NO_FRAME_DIAGNOSTIC_INTERVAL = 5.0
 # controller -- a device that isn't there yet is a normal, recoverable
 # state, not a reason to crash the process.
 CAMERA_RETRY_INTERVAL = 5.0
+
+# Eco mode (2026-10-10): how often FrameGrabber polls for a reason to wake
+# back up (a viewer connecting, a recording starting, a mode switch, or a
+# pending wake request) while idle, instead of reading/encoding frames.
+ECO_IDLE_POLL_INTERVAL_S = 1.0
+
+# Eco mode: how long a single /snap or /rec/start wake request keeps the
+# camera open for (FrameGrabber.request_active) -- long enough to cover
+# the time it takes _open_capture() to run and the first frame to arrive,
+# with a little slack for a second request arriving just after.
+CAMERA_WAKE_DURATION_S = 5.0
+# Eco mode: how long /snap or /rec/start are willing to wait for a fresh
+# frame after waking the camera up before giving up and answering 503
+# (same "no frame yet" response either mode already used for "no camera
+# plugged in at all").
+CAMERA_WAKE_TIMEOUT_S = 3.0
+CAMERA_WAKE_POLL_INTERVAL_S = 0.1
 
 
 class FrameGrabber:
@@ -179,9 +223,73 @@ class FrameGrabber:
         self._latest_jpeg = None
         self._running = False
 
+        # Eco mode (2026-10-10) -- see this module's own docstring.
+        # "reactive" is the default and matches this class's behaviour
+        # before eco mode existed: continuous capture regardless of
+        # viewers.
+        self.mode = "reactive"
+        self._active_viewers = 0
+        self._force_active_until = 0.0
+
     def start(self):
         self._running = True
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def set_mode(self, mode):
+        """Switches between "reactive" (continuous capture, the
+        pre-eco-mode default) and "eco" (release the device whenever
+        nobody needs it, see _should_release_for_eco_mode below). Called
+        from StreamHandler._handle_power_mode, itself called by link/
+        camera_power_policy.py's CameraPowerPolicy over HTTP. Raises
+        ValueError on anything else -- the caller (the POST /power_mode
+        handler) turns that into a clean HTTP 400 rather than silently
+        accepting a typo'd mode."""
+        if mode not in ("reactive", "eco"):
+            raise ValueError(f"invalid camera mode: {mode!r}")
+        with self._lock:
+            self.mode = mode
+
+    def viewer_connected(self):
+        """Call when a /stream.mjpg viewer connects -- see StreamHandler's
+        do_GET. Counted rather than boolean so two simultaneous viewers
+        (e.g. the web server's own proxy plus a direct request) don't
+        have the first one's disconnect make the loop think nobody is
+        watching anymore while the second still is."""
+        with self._lock:
+            self._active_viewers += 1
+
+    def viewer_disconnected(self):
+        with self._lock:
+            self._active_viewers = max(0, self._active_viewers - 1)
+
+    def request_active(self, duration=CAMERA_WAKE_DURATION_S):
+        """Keeps the camera open (or wakes it back up on the loop's next
+        iteration if it was idle) for at least `duration` more seconds --
+        called by StreamHandler._wait_for_frame before /snap or
+        /rec/start, so those keep working on demand even in eco mode with
+        no live viewer. max() with any existing deadline rather than a
+        plain assignment so two overlapping requests extend the window
+        instead of one shortening it."""
+        with self._lock:
+            self._force_active_until = max(self._force_active_until, time.time() + duration)
+
+    def _should_release_for_eco_mode(self):
+        """True when the capture loop should release the device and stop
+        reading/encoding frames: eco mode is on, AND nobody is watching
+        the live stream, AND nothing recently asked for a frame via
+        request_active(), AND no recording is in progress (checked last,
+        and outside the lock, since VideoRecorder.is_recording is its own
+        property with its own locking -- see camera/recordings.py)."""
+        with self._lock:
+            if self.mode != "eco":
+                return False
+            if self._active_viewers > 0:
+                return False
+            if time.time() < self._force_active_until:
+                return False
+        if self.recorder is not None and self.recorder.is_recording:
+            return False
+        return True
 
     def _open_capture(self):
         """One attempt at opening self.device. Returns True and leaves
@@ -220,8 +328,31 @@ class FrameGrabber:
         last_diagnostic_at = 0.0
         last_open_attempt_at = 0.0
         started_at = time.time()
+        was_idle_for_eco = False
 
         while self._running:
+            if self._should_release_for_eco_mode():
+                if self._capture is not None:
+                    self._capture.release()
+                    self._capture = None
+                    print(
+                        "Camera: eco mode engaged (no viewers, no pending "
+                        "wake request, no recording in progress) -- "
+                        f"releasing device {self.device!r} until needed again."
+                    )
+                was_idle_for_eco = True
+                time.sleep(ECO_IDLE_POLL_INTERVAL_S)
+                continue
+
+            if was_idle_for_eco:
+                # Just came out of eco-mode idling (a viewer connected, a
+                # recording started, mode switched back to reactive, or a
+                # /snap-/rec/start wake request came in) -- reopen right
+                # away rather than waiting out the rest of retry_interval,
+                # which exists for a genuinely MISSING camera, not this.
+                was_idle_for_eco = False
+                last_open_attempt_at = 0.0
+
             if self._capture is None:
                 now = time.time()
                 if now - last_open_attempt_at < self.retry_interval:
@@ -340,6 +471,14 @@ class StreamHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=FRAME")
         self.end_headers()
 
+        # Eco mode (2026-10-10): a connected /stream.mjpg viewer is exactly
+        # what should keep (or wake) the camera active -- see
+        # FrameGrabber._should_release_for_eco_mode. viewer_disconnected()
+        # in the finally below runs on every exit path (clean close,
+        # BrokenPipeError/ConnectionResetError, or any other exception),
+        # so the count can never get stuck incremented by a viewer that's
+        # actually gone.
+        grabber.viewer_connected()
         try:
             while True:
                 frame = grabber.latest_jpeg()
@@ -357,6 +496,78 @@ class StreamHandler(BaseHTTPRequestHandler):
             # Normal: the viewer (or the web server proxying us) closed the
             # connection -- nothing to log, just stop this handler's loop.
             pass
+        finally:
+            grabber.viewer_disconnected()
+
+    def do_POST(self):
+        if self.path == "/power_mode":
+            self._handle_power_mode()
+            return
+        self.send_error(404)
+
+    def _wait_for_frame(self):
+        """Eco mode (2026-10-10): wakes the camera up (FrameGrabber.
+        request_active -- a no-op if it's already active, e.g. reactive
+        mode or an existing viewer) and, ONLY while actually in eco mode,
+        waits up to CAMERA_WAKE_TIMEOUT_S for a frame to arrive, polling
+        every CAMERA_WAKE_POLL_INTERVAL_S -- releasing and reopening the
+        device takes a moment, so a /snap or /rec/start right after
+        switching to eco (or after a long idle stretch) deserves a short
+        grace period instead of an instant 503.
+
+        In reactive mode, this returns immediately on the very first
+        check, same as the plain `grabber.latest_jpeg()` call this
+        replaces in _handle_snap/_handle_rec_start used to: reactive mode
+        already captures continuously, so if there's no frame right now
+        (no camera plugged in at all, or not opened yet) waiting around
+        wouldn't make one appear any sooner -- same immediate "no frame
+        yet" 503 as before eco mode existed, not a new multi-second delay
+        for what is usually just "no camera connected".
+
+        Returns None (never raises) if no frame is available (immediately
+        in reactive mode, or after the grace period in eco mode) -- the
+        caller's existing 503 handling covers both the same way."""
+        if grabber is None:
+            return None
+        grabber.request_active(CAMERA_WAKE_DURATION_S)
+        frame = grabber.latest_jpeg()
+        if frame is not None or grabber.mode != "eco":
+            return frame
+        deadline = time.time() + CAMERA_WAKE_TIMEOUT_S
+        while frame is None and time.time() < deadline:
+            time.sleep(CAMERA_WAKE_POLL_INTERVAL_S)
+            frame = grabber.latest_jpeg()
+        return frame
+
+    def _handle_power_mode(self):
+        """POST /power_mode: sets FrameGrabber's reactive/eco mode. This
+        is what link/camera_power_policy.py's CameraPowerPolicy calls
+        over plain HTTP -- same cross-process pattern as /snap,
+        /rec/start, /rec/stop, just in the other direction (link/
+        server.py's process pushing a decision here, rather than asking
+        this process to do something). Body: {"mode": "reactive"|"eco"}.
+        Answers 400 on a missing/invalid mode or malformed body, 503 if
+        main() hasn't constructed `grabber` yet (shouldn't happen once
+        actually serving requests -- same defensive check every other
+        handler here already has)."""
+        if grabber is None:
+            self.send_error(503)
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            body = json.loads(self.rfile.read(length)) if length else {}
+            mode = body.get("mode")
+            grabber.set_mode(mode)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": True, "mode": mode}).encode("utf-8"))
 
     def _handle_snap(self):
         """GET /snap: saves the current frame into the capped snapshot
@@ -364,8 +575,12 @@ class StreamHandler(BaseHTTPRequestHandler):
         later processing, and reports which file was written. This is
         what link/robot_state.py's camera_command("SNAP") calls over
         plain HTTP -- see that module for why (CAM,SNAP arrives on the
-        NMEA link, a separate process from this one)."""
-        frame = grabber.latest_jpeg() if grabber else None
+        NMEA link, a separate process from this one). Eco mode
+        (2026-10-10): uses _wait_for_frame() instead of a plain
+        grabber.latest_jpeg() so a /snap while idle wakes the camera and
+        gives it a moment to deliver a frame, rather than always
+        answering 503 whenever eco mode happens to be on."""
+        frame = self._wait_for_frame() if grabber else None
         if frame is None:
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
@@ -392,8 +607,9 @@ class StreamHandler(BaseHTTPRequestHandler):
         opened yet): REC_START refusing cleanly here, rather than arming a
         recorder with nothing to encode, is exactly what "record a video
         if the camera is present" (this feature's original request) means
-        in practice."""
-        frame = grabber.latest_jpeg() if grabber else None
+        in practice. Eco mode (2026-10-10): uses _wait_for_frame() for the
+        same reason _handle_snap() above does."""
+        frame = self._wait_for_frame() if grabber else None
         if frame is None:
             self.send_response(503)
             self.send_header("Content-Type", "application/json")

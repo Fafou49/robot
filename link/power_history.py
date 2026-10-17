@@ -612,3 +612,40 @@ class PowerHistoryLogger:
         }
         insert_sample(self.db_path, sample)
         prune_old_rows(self.db_path, self.retention_days)
+# NE PAS remplacer link/power_history.py avec ce fichier !
+# Ce n'est qu'un EXTRAIT a ajouter A LA FIN de ton power_history.py existant
+# (ton fichier actuel fonctionne deja, il lui manque juste cette fonction).
+#
+# Sur la Pi :
+#   cat power_history_APPEND_ONLY.py >> ~/Desktop/coderobot/link/power_history.py
+# (verifie avant avec: grep -n "def fetch_recent_pv_readings" ~/Desktop/coderobot/link/power_history.py
+#  -- si une ligne sort, ne fais rien, c'est deja present)
+
+
+def fetch_recent_pv_readings(db_path: str, n: int = 3):
+    """Returns the `n` most recent (ts, pv_power) rows from power_log,
+    newest first -- added 2026-10-12 for link.camera_power_policy's new
+    "PV < 7W sustained for 15 minutes" day-mode rule (explicit user
+    request: "depuis 15minutes (3 enregistrements en BD)" -- the user
+    was explicit this has to read the actual logged history, not the
+    policy's own short in-process sampling buffer, so a brief dip that
+    recovers before the next 5-minute log tick doesn't force Eco, and a
+    policy/control-server restart doesn't lose the last ~15 minutes of
+    context the way an in-memory buffer would).
+
+    pv_power can be NULL in principle (same nullable column as the rest
+    of power_log, though in practice insert_sample() always writes a
+    number here when a row is written at all) -- turned into 0.0 on the
+    way out, same NULL convention fetch_period_chunk() already uses for
+    this table, so callers never have to special-case None."""
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT ts, pv_power FROM power_log ORDER BY ts DESC LIMIT ?",
+            (n,),
+        )
+        return [
+            (row[0], 0.0 if row[1] is None else row[1])
+            for row in cursor.fetchall()
+        ]
+

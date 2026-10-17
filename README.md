@@ -357,6 +357,11 @@ schéma ci-dessous) :
   ```
   (remplacer `robot` par le nom d'utilisateur réel, et adapter le chemin
   si `SHUTDOWN_CMD` est personnalisé -- `which poweroff` pour le vérifier).
+  Ce même `_shutdown_pi()`/`SHUTDOWN_CMD` est aussi ce qu'appellent,
+  depuis le 2026-10-12, la commande `SHD` (bouton d'arrêt manuel du site
+  web) et `link/shutdown_policy.py` (arrêt automatique avant fin de
+  batterie) — voir la section dédiée plus bas, aucun second mécanisme
+  d'extinction n'a été ajouté.
 
 ```mermaid
 flowchart TB
@@ -895,6 +900,491 @@ plus haut) qui exercent directement `PowerHistoryLogger._log_once()`,
 `tests/test_link_server.py` (nouveaux tests `test_his_*` et
 `test_snapshot_is_geotagged_on_successful_cam_snap`, à lancer avec
 `pytest` sur une machine qui peut l'installer).
+
+## LEDs de statut éteintes la nuit (`link/led_control.py`, 2026-10-10)
+
+Demande explicite de l'utilisateur : « je souhaites que si le panneau
+solaire ne capte qu'une tension inférieure à 15Volt pendant plus de 10
+minutes alors les deux Leds doivent s'éteindre et lorsque le soleil
+revient alors les leds redeviennent actives ».
+
+Nouveau module `link/led_control.py`, démarré par `link/server.py` en
+même temps que les autres threads d'arrière-plan (GPS, moteur, manette,
+Tracer, historique) — `ControlServer(..., start_led_control=True)` par
+défaut, désactivable via la variable d'environnement
+`LED_CONTROL_ENABLED=false`, même principe que `TRACER_ENABLED`/
+`POWER_LOG_ENABLED`. `LedController` échantillonne `RobotState.
+power_status()` toutes les `LED_CHECK_INTERVAL_S` secondes (10s par
+défaut) :
+
+- dès que `pv_voltage` est resté strictement en dessous de **15V** pendant
+  plus de **10 minutes** d'affilée, les deux LEDs du Pi #1 (`ACT`/verte et
+  `PWR`/rouge) sont éteintes (`trigger` mis à `none` et `brightness` à
+  `0` via `/sys/class/leds/<led>/...`) ;
+- dès qu'une lecture repasse à 15V ou plus, les deux LEDs sont
+  immédiatement rallumées (trigger restauré à son comportement d'origine
+  — `mmc0` pour `ACT`, `default-on` pour `PWR` — et `brightness` remis à
+  `1`), sans délai de confirmation supplémentaire (pas demandé).
+
+Un relevé pendant lequel le Tracer lui-même est indisponible (câble
+RS485 débranché, `power_status()["available"]` à `False`) ne compte ni
+ne remet à zéro le chronomètre des 10 minutes en cours — sans lecture
+fiable, le plus honnête est d'attendre plutôt que de deviner (deviner
+« faible » risquerait d'éteindre les LEDs à cause d'un câble débranché
+plutôt qu'un panneau réellement dans le noir ; deviner « ok » perdrait un
+chronomètre peut-être déjà à quelques minutes de la limite).
+
+Noms de LEDs (`led0`/`led1`, la convention universelle sur toute image
+Raspberry Pi OS — les alias `ACT`/`PWR` créés par udev n'existent pas sur
+toutes les images) et triggers de restauration configurables via
+`ACT_LED_NAME`/`PWR_LED_NAME`/`ACT_LED_RESTORE_TRIGGER`/
+`PWR_LED_RESTORE_TRIGGER` si `ls /sys/class/leds/` sur le Pi réel montre
+autre chose. Seuil et durée également réglables (`LED_LOW_VOLTAGE_
+THRESHOLD_V`, `LED_LOW_VOLTAGE_DURATION_S`).
+
+**Non testé sur le matériel réel** (même réserve que pour le reste du
+projet) : aucun `/sys/class/leds/` n'existe dans ce bac à sable. Chaque
+écriture sysfs est protégée individuellement (`try`/`except OSError`,
+avertissement loggé une seule fois par fichier puis silence) pour ne
+jamais faire planter le serveur de commandes si un nom de LED est faux ou
+le chemin absent — ce chemin de dégradation est lui testé (sysfs factice
+sous `tmp_path`). La logique de minuterie/transition (démarrage du
+chronomètre, non-déclenchement avant 10 minutes, extinction à l'échéance,
+rallumage immédiat au retour du soleil, non-remise à zéro par un relevé
+indisponible) est entièrement couverte par `tests/test_led_control.py`
+(construction manuelle du contrôleur, jamais de vrai thread, horloge
+`time.monotonic()` simulée via `monkeypatch` — même approche que les
+tests de `PowerHistoryLogger`). Vérifier `ls /sys/class/leds/` sur le Pi
+réel avant de s'y fier, et ajuster `ACT_LED_NAME`/`PWR_LED_NAME` si les
+noms diffèrent.
+
+## Mode caméra réactif/éco (`link/camera_power_policy.py`, `link/sunrise.py`, `link/power_history.py`, `camera/stream_server.py`, 2026-10-10, comportement revu le 2026-10-12)
+
+Demande explicite initiale de l'utilisateur (2026-10-10) : « je souhaites
+la réactivité lorsque le panneau solaire charge ou que j'ai assez
+d'énergie pour passer la nuit. En cas d'incertitude on passe en mode
+éco », précisée ensuite ainsi : « à faire à bord de la Pi toutes les 5
+minutes : utilise la consommation moyenne des dernières 5 minutes et
+fais une projection avec les réserves de la batterie et l'heure
+actuelle ».
+
+**Révision du 2026-10-12**, également à la demande explicite de
+l'utilisateur, qui remplace entièrement la règle de décision ci-dessous
+(voir la nouvelle liste numérotée plus bas) : « la caméra doit être en
+éco la nuit quelque soit l'état de la batterie. Elle sort du mode éco la
+nuit si un snap ou une vidéo est lancée. Elle retourne en mode éco si la
+batterie ne peut pas atteindre la fin de la journée solaire suivante. Si
+le jour est calculé et que le panneau solaire ne fournit pas 7W ou plus
+depuis 15 minutes (3 enregistrements en BD), alors la caméra passe en
+éco. » Deux points ont été confirmés avec l'utilisateur plutôt que
+devinés avant de coder : la cible de la projection de réserve reste le
+**prochain lever de soleil**, inchangée par rapport à la règle d'origine
+(une fois la nuit traitée à part en éco inconditionnel, « atteindre la
+fin de la journée solaire suivante » revient à « est-ce que la réserve
+tiendra jusqu'au matin ? ») ; et l'ancien raccourci « batterie en charge
+→ réactif immédiat » est bien **supprimé**, pas conservé en plus de la
+nouvelle règle.
+
+Contexte : `camera/stream_server.py` capturait et encodait une image en
+continu, 24h/24, qu'il y ait ou non un visiteur sur `/control` — c'est,
+avec la Pi n°1 elle-même, la seule vraie marge de manœuvre identifiée
+pour réduire la consommation nocturne (le flux PWR/STA entre les deux Pi
+est lui déjà piloté par le JavaScript du site, donc nul sans visiteur ;
+voir aussi la section LEDs ci-dessus pour l'autre économie déjà en place).
+Cette fonctionnalité ajoute un mode **éco** : caméra coupée tant que
+personne ne regarde et qu'aucun enregistrement n'est en cours, qui se
+réactive automatiquement (sur connexion d'un visiteur, un `CAM,SNAP`,
+un `CAM,REC_START`, ou un retour en mode réactif).
+
+### Décision : `link/camera_power_policy.py`
+
+Nouveau module, démarré par `link/server.py` en même temps que les
+autres threads d'arrière-plan — `ControlServer(...,
+start_camera_power_policy=True)` par défaut, désactivable via
+`CAMERA_POWER_POLICY_ENABLED=false` (même principe que `TRACER_ENABLED`/
+`LED_CONTROL_ENABLED`). Toutes les `CAMERA_POWER_SAMPLE_INTERVAL_S`
+secondes (15s par défaut), il échantillonne `RobotState.power_status()`
+(`load_power`, `pv_power`) ; toutes les `CAMERA_POWER_PROJECTION_
+INTERVAL_S` secondes (**5 minutes**, comme demandé), il moyenne ces
+échantillons, relit les dernières lignes de `link/power_history.py` (la
+vraie base, pas son propre tampon d'échantillonnage — voir plus bas), et
+décide (règle revue le 2026-10-12) :
+
+1. données Tracer indisponibles → **éco** ;
+2. pas de position GPS (`current_lat`/`current_lon`) → **éco** (impossible
+   de déterminer jour/nuit ou de calculer lever/coucher de soleil locaux
+   sans position) ;
+3. lever **et** coucher de soleil tous les deux incalculables (nuit/jour
+   polaire à cette latitude) → **éco** ;
+4. c'est actuellement la **nuit** (déterminé en comparant le prochain
+   lever et le prochain coucher de soleil : si le lever arrive avant le
+   coucher, c'est la nuit) → **éco**, **quel que soit l'état de la
+   batterie** — demande explicite de l'utilisateur, ce n'est plus une
+   simple branche "en cas d'incertitude" mais une règle inconditionnelle.
+   Un `CAM,SNAP`/`CAM,REC_START` nocturne continue de réveiller
+   ponctuellement la caméra malgré ce mode éco : voir la section
+   `camera/stream_server.py` plus bas, ce mécanisme-là ne change pas ;
+5. c'est le jour, et la puissance PV est restée sous
+   `CAMERA_POWER_LOW_PV_THRESHOLD_W` (**7W**, valeur explicite de
+   l'utilisateur) sur les `CAMERA_POWER_LOW_PV_RECORDS` dernières lignes
+   de la base `power_history` (**3 enregistrements**, soit 15 minutes au
+   rythme de journalisation de 5 min — valeurs explicites de
+   l'utilisateur : « depuis 15minutes (3 enregistrements en BD) ») →
+   **éco**, même si la projection de réserve ci-dessous serait par
+   ailleurs confortable. Une base trop récente (moins de 3 lignes) ou
+   dont les 3 dernières lignes remontent à plus de 20 minutes (un trou
+   de journalisation, un redémarrage — marge de sécurité choisie ici,
+   pas demandée par l'utilisateur) ne déclenche pas cette règle, elle
+   retombe simplement sur l'étape suivante ;
+6. c'est le jour, et SoC batterie, tension batterie ou puissances
+   moyennées manquantes → **éco** ;
+7. sinon : projection du nombre d'heures que la réserve de batterie
+   (`battery_soc`% de `CAMERA_POWER_BATTERY_CAPACITY_AH`, 35Ah — valeur
+   déjà utilisée côté `robot-webserver`, `pages/power.html`) peut
+   encore tenir au rythme de décharge nette actuel (`load_power -
+   pv_power`), comparée aux heures restantes avant le **prochain lever
+   de soleil** (cible confirmée avec l'utilisateur, inchangée par
+   rapport à la règle d'origine — survivre à la nuit) plus une marge de
+   sécurité (`CAMERA_POWER_SAFETY_MARGIN_HOURS`, 1h par défaut — valeur
+   prudente choisie par défaut, pas demandée explicitement, à ajuster
+   après quelques nuits réelles) : **réactif** si la réserve tient au
+   moins jusque-là, **éco** sinon.
+
+Chaque branche manquante retombe sur **éco** — « en cas d'incertitude on
+passe en mode éco » reste la règle de l'utilisateur, appliquée
+littéralement à chaque étape plutôt que de deviner. L'ancien raccourci
+« batterie en charge → réactif immédiat » (de la règle d'origine) a été
+**supprimé** — confirmé avec l'utilisateur plutôt que conservé en plus
+de la nouvelle règle de jour.
+
+La décision n'est poussée à `camera/stream_server.py` (processus séparé
+sur la Pi n°1, voir la section caméra plus bas) que lorsqu'elle change
+réellement, par un `POST /power_mode` en HTTP local — même principe de
+communication inter-processus que `CAM,SNAP`/`CAM,REC_START`/
+`CAM,REC_STOP` (`link/robot_state.py`), juste dans l'autre sens. Si cette
+notification échoue (processus caméra pas encore démarré, en train de
+redémarrer...), rien n'est perdu : le mode souhaité est simplement
+retenté au tick suivant (5 minutes plus tard), jusqu'à ce qu'il soit
+effectivement appliqué.
+
+### Heure du lever du soleil : `link/sunrise.py`, calculée localement
+
+Réponse à la question posée en même temps : calcul **local**, sans appel
+réseau, plutôt qu'une API en ligne (sunrise-sunset.org ou équivalent)
+pourtant envisagée — c'est précisément quand la batterie est déjà
+limite que le WiFi d'un robot extérieur a le plus de chances d'être
+capricieux, c'est-à-dire exactement le moment où cette information
+compte le plus. Une API en ligne échouerait silencieusement au pire
+moment, juste quand « en cas d'incertitude on passe en mode éco » a le
+plus besoin d'une vraie réponse plutôt que d'un timeout réseau.
+
+`link/sunrise.py` réimplémente l'algorithme public du NOAA Solar
+Calculator (domaine public, les mêmes formules que la plupart des
+calculateurs de lever/coucher de soleil, dont le paquet `astral`) en
+pur Python (`math`/`datetime`, aucune dépendance tierce). Précision à
+quelques minutes, largement suffisante pour une marge de sécurité de
+projection déjà elle-même exprimée en heures entières.
+
+### Comportement de `camera/stream_server.py` en mode éco
+
+`FrameGrabber` (le thread d'arrière-plan qui capture et encode les
+images) prend un mode `"reactive"` (défaut, comportement inchangé
+depuis toujours : capture continue) ou `"eco"` (défini via `POST
+/power_mode`). En mode éco, la caméra est relâchée (`cv2.VideoCapture.
+release()`) dès qu'aucune des trois conditions suivantes n'est plus
+vraie : un visiteur regarde `/stream.mjpg` en direct, un enregistrement
+est en cours (`CAM,REC_START` déjà lancé — une bascule en éco ne coupe
+jamais un enregistrement en cours), ou une demande de réveil récente
+(`CAM,SNAP`/`CAM,REC_START`) est encore valide. Dès qu'une de ces trois
+conditions redevient vraie, la caméra est réouverte au tour suivant de
+la boucle de capture.
+
+`CAM,SNAP` et `CAM,REC_START` continuent donc de fonctionner même en
+mode éco sans visiteur : ils réveillent la caméra et patientent jusqu'à
+`CAMERA_WAKE_TIMEOUT_S` (3 secondes par défaut) qu'une image arrive,
+avant de retomber sur le même code d'erreur `NO_FRAME_YET` (503)
+qu'avant cette fonctionnalité si la caméra est réellement absente — en
+mode réactif (le cas le plus courant quand il n'y a vraiment pas de
+caméra branchée), cette attente n'existe pas : l'absence de caméra
+reste signalée instantanément comme avant, aucun délai supplémentaire
+n'a été introduit pour ce cas déjà existant.
+
+### Variables d'environnement
+
+`CAMERA_POWER_POLICY_ENABLED` (désactivation complète, défaut activé),
+`CAMERA_POWER_PROJECTION_INTERVAL_S` (5 min), `CAMERA_POWER_SAMPLE_
+INTERVAL_S` (15s), `CAMERA_POWER_BATTERY_CAPACITY_AH` (35), `CAMERA_
+POWER_SAFETY_MARGIN_HOURS` (1h), `CAMERA_POWER_LOW_PV_THRESHOLD_W` (7W,
+ajouté le 2026-10-12 — valeur explicite de l'utilisateur),
+`CAMERA_POWER_LOW_PV_RECORDS` (3, ajouté le 2026-10-12 — valeur
+explicite de l'utilisateur, en nombre de lignes `power_history`, pas en
+minutes), `CAMERA_POWER_MODE_PATH` (chemin HTTP du côté caméra,
+`/power_mode` par défaut) — mêmes `CAMERA_HOST`/`CAMERA_PORT` déjà
+utilisés par `CAM,SNAP`/`CAM,REC_START`/`CAM,REC_STOP`, et même
+`POWER_HISTORY_DB_PATH` déjà utilisé par `link/power_history.py` pour la
+lecture du seuil PV bas (pas de variable séparée : c'est volontairement
+la même base que celle déjà journalisée par ce process).
+
+**Non testé sur le matériel réel** (même réserve que pour le reste du
+projet) : écrit et relu attentivement contre les API OpenCV/http.server/
+sqlite3/le reste de ce dépôt, mais jamais exécuté avec un vrai panneau
+solaire, une vraie batterie ni une vraie webcam dans ce bac à sable. La
+logique de décision pure (`decide_camera_mode`, `is_sustained_low_pv`,
+aucune branche non couverte, y compris la nouvelle détermination jour/
+nuit et la règle PV basse), le calcul du lever **et** du coucher de
+soleil (invariants physiques vérifiables sans accès réseau : à
+l'équateur toute l'année, à tout équinoxe à toute latitude, coucher
+toujours après lever le même jour) et la lecture réelle de
+`power_history` par `CameraPowerPolicy._check_sustained_low_pv` (base
+sqlite temporaire, pas de mock) sont entièrement testés
+(`tests/test_camera_power_policy.py`, `tests/test_sunrise.py`), ainsi
+que le comportement éco/réactif de `FrameGrabber` et le point d'entrée
+`POST /power_mode` (`tests/test_stream_server.py`) — ce dernier
+mécanisme (réveil ponctuel sur `CAM,SNAP`/`CAM,REC_START` même la nuit
+en éco) n'a pas eu besoin d'être modifié par la révision du 2026-10-12,
+il était déjà indépendant du mode poussé par la politique. À surveiller
+en conditions réelles : la marge de sécurité par défaut (1h), la marge
+anti-trou-de-journalisation de la règle PV basse (20 min, pas demandée
+par l'utilisateur), et le temps de réveil (`CAMERA_WAKE_TIMEOUT_S`, 3s)
+sur la webcam réellement utilisée.
+
+## Arrêt automatique de la Pi #1 avant fin de batterie (`link/shutdown_policy.py`, `link/power_projection.py`, 2026-10-12)
+
+Demande explicite de l'utilisateur, verbatim : « je veux un arrêt
+automatique de PI1 1h avant la fin de la batterie pour éteindre
+proprement [...] Si l'arrêt programmé par la Pi1 elle-même est calculé
+pendant la nuit, on éteint dès la tombée de la nuit pour garder de la
+batterie pour le redémarrage. » Fait directement suite au mode
+caméra réactif/éco ci-dessus (même projection de réserve, même
+philosophie de code — décision pure séparée de l'exécution) et au
+bandeau d'alerte du site web (`robot-webserver`, voir son propre
+README) : les deux fonctionnalités partagent désormais une seule
+réponse, calculée ici, à « est-ce que la batterie va tenir jusqu'à la
+prochaine journée de charge ? ».
+
+### Refactor préalable : `link/power_projection.py`
+
+La formule de projection linéaire (`remaining_ah / discharge_current_a`)
+qui était jusqu'ici codée en dur à la fin de `camera_power_policy.
+decide_camera_mode()` a été extraite dans ce nouveau module partagé, en
+même temps qu'un petit accumulateur de moyenne glissante réutilisable,
+`PowerAverager` (`sample(load, pv)` / `average()`). `link/
+camera_power_policy.py` importe maintenant les deux depuis là
+(comportement strictement inchangé — les 36 tests existants de
+`tests/test_camera_power_policy.py` passent toujours sans modification)
+plutôt que de dupliquer cette formule pour la nouvelle politique
+d'arrêt. Volontairement **pas** partagé en revanche : chaque politique
+garde sa **propre** instance de `PowerAverager`/ses propres échantillons
+— même principe déjà appliqué dans ce projet à chaque thread
+d'arrière-plan (caméra, LEDs, historique...), chacun indépendant des
+autres plutôt que de partager un état mutable commun.
+
+### Décision : `link/shutdown_policy.py`
+
+Même séparation « fonction pure de décision » / « classe qui échantillonne
+et agit en arrière-plan » que `camera_power_policy.py`, avec UN
+renversement délibéré de philosophie : pour la caméra, « en cas
+d'incertitude on passe en éco » (se tromper côté éco ne coûte qu'une
+image) ; ici, déclencher un vrai `poweroff` à tort est bien plus grave
+que de ne PAS en déclencher un à tort, donc chaque cas incertain/
+manquant ci-dessous retombe sur **aucun arrêt programmé** (`None`),
+l'image inverse de la règle caméra.
+
+`compute_scheduled_shutdown_ts()` (pure, aucune I/O) :
+
+1. données Tracer indisponibles, ou pas de position GPS, ou lever/coucher
+   de soleil tous les deux incalculables (nuit/jour polaire) → **aucun
+   arrêt programmé** ;
+2. SoC batterie, tension batterie ou puissances moyennées manquantes →
+   **aucun arrêt programmé** ;
+3. projection du nombre d'heures de réserve au rythme de décharge nette
+   actuel (`link.power_projection.project_remaining_hours`, la même
+   formule que ci-dessus) ; si le panneau PV couvre déjà la charge
+   (pas de décharge nette) → **aucun arrêt programmé** ;
+4. si cette réserve tient jusqu'au **prochain lever de soleil** plus la
+   marge de sécurité (`SHUTDOWN_SAFETY_MARGIN_HOURS`, reprise de `link.
+   power_projection`, 1h par défaut) → **aucun arrêt programmé** (même
+   condition d'alarme que le bandeau du site web — « ne pas atteindre la
+   prochaine journée de charge » — pour que les deux fonctionnalités
+   s'accordent toujours) ;
+5. sinon (la réserve ne tiendra pas) :
+   - s'il est actuellement **nuit** → **bascule « tombée de la nuit »**
+     (demande explicite de l'utilisateur) : plutôt que d'attendre l'heure
+     « naturellement » calculée ci-dessous (potentiellement encore
+     plusieurs heures dans la nuit, à consommer de la réserve pour rien),
+     l'arrêt est programmé **immédiatement** (`now`) — chaque minute
+     supplémentaire sans aucune charge solaire à venir ne fait que
+     grignoter la réserve nécessaire au redémarrage du matin ;
+   - sinon (il fait jour) → l'heure « naturellement » calculée :
+     `SHUTDOWN_LEAD_HOURS` (**1h**, valeur explicite de l'utilisateur)
+     avant le moment où la batterie est projetée vide au rythme actuel ;
+     jamais avant « maintenant » (si ce moment projeté est déjà très
+     proche ou déjà passé, l'arrêt est programmé pour tout de suite).
+
+`should_shutdown_now(scheduled_ts, now_ts)` est le test booléen qui
+déclenche réellement l'extinction une fois cette heure atteinte.
+
+`ShutdownPolicy` (classe, même rythme que `CameraPowerPolicy` —
+`SHUTDOWN_SAMPLE_INTERVAL_S`/15s pour l'échantillonnage, `SHUTDOWN_
+PROJECTION_INTERVAL_S`/5min pour la décision) écrit l'horodatage calculé
+dans `RobotState` à chaque tick (`RobotState.set_shutdown_eta()`, lu par
+le champ `PWR` ci-dessous) et, **une seule fois** (garde-fou interne,
+`sudo poweroff` n'étant pas instantané), appelle son callback
+`on_shutdown` dès que `should_shutdown_now()` devient vrai. Démarrée par
+`link/server.py` comme les autres threads d'arrière-plan —
+`ControlServer(..., start_shutdown_policy=True)` par défaut,
+désactivable via `SHUTDOWN_POLICY_ENABLED=false` (même principe que
+`CAMERA_POWER_POLICY_ENABLED`) — avec `on_shutdown=self._shutdown_pi`,
+**le même mécanisme d'extinction déjà existant et déjà testé** que le
+bouton `START` de la manette (voir section "Pilotage moteur et
+manette" ci-dessus) : aucun nouveau code d'extinction n'a été écrit, ce
+module se contente d'appeler `_shutdown_pi()` depuis son propre thread
+d'arrière-plan — un thread différent de celui qui exécute
+`serve_forever()`, exactement ce que `_shutdown_pi()` exige déjà (voir
+son docstring).
+
+### Nouveau champ `PWR` : `shutdown_eta_ts` (18ᵉ champ, extension)
+
+Extension en fin de trame existante (même convention que tous les
+ajouts précédents à `PWR` ci-dessus — un `robot-webserver` plus ancien
+qui ne le connaît pas encore l'ignore simplement) : `0` si aucun arrêt
+n'est actuellement programmé, sinon l'horodatage Unix (secondes
+entières) — la réponse unique et autoritaire à « quand la Pi #1 va-t-elle
+s'éteindre ». C'est ce champ qui alimente le bandeau d'alerte
+rouge/jaune du site web (`robot-webserver`, voir son propre README) :
+le site n'a plus besoin de recalculer lui-même jour/nuit/lever de
+soleil, la Pi #1 reste la seule source de vérité.
+
+### Nouvelle commande `SHD` : bouton d'arrêt manuel côté site web
+
+Demande explicite de l'utilisateur : un bouton d'arrêt placé juste sous
+le bouton STOP de `/control` (voir `robot-webserver`), qui éteint la Pi
+#1 à la demande. Côté `link/server.py`, `SHD` (sans champ) appelle
+directement `ControlServer._shutdown_pi()` — encore une fois le même
+mécanisme déjà existant/testé que `START` sur la manette, pas de
+nouveau code d'extinction. `_handle_sentence()` reçoit maintenant
+l'instance `ControlServer` elle-même (`server=self.server`, passé par
+`ControlHandler.handle()`) en plus de `state` pour pouvoir l'appeler ;
+aucun test n'appelait `_handle_sentence()` directement par le passé (ils
+passent tous par un vrai socket), donc ce changement de signature est
+sans risque de régression. Pas de restriction de rôle supplémentaire à
+ajouter côté `robot-webserver` : `SHD` n'étant pas dans
+`VIEWER_ALLOWED_COMMANDS`, un visiteur en rôle "viewer" se le voit déjà
+refuser par construction, comme toute autre commande d'écriture.
+
+### Variables d'environnement
+
+`SHUTDOWN_POLICY_ENABLED` (désactivation complète, défaut activé),
+`SHUTDOWN_PROJECTION_INTERVAL_S` (5 min), `SHUTDOWN_SAMPLE_INTERVAL_S`
+(15s), `SHUTDOWN_BATTERY_CAPACITY_AH` (35), `SHUTDOWN_SAFETY_MARGIN_
+HOURS` (1h), `SHUTDOWN_LEAD_HOURS` (1h, valeur explicite de
+l'utilisateur) — même `SHUTDOWN_CMD` déjà utilisé par `_shutdown_pi()`
+pour `START`/`SHD` (pas de variable séparée : c'est volontairement la
+même commande d'extinction partout).
+
+**Non testé sur le matériel réel** (même réserve que pour le reste du
+projet, et plus encore ici — c'est la fonctionnalité la plus
+irréversible de ce dépôt). La logique de décision pure
+(`compute_scheduled_shutdown_ts`, `should_shutdown_now`, toutes les
+branches couvertes y compris la bascule « tombée de la nuit » et le
+cas « déjà sous le délai de préavis ») et le câblage
+d'échantillonnage/décision/déclenchement-unique de `ShutdownPolicy`
+(avec un `on_shutdown` factice, jamais `subprocess.run` réel) sont
+entièrement testés (`tests/test_shutdown_policy.py`,
+`tests/test_power_projection.py`), ainsi que la nouvelle commande `SHD`
+et le câblage `start_shutdown_policy` dans `link/server.py`
+(`tests/test_link_server.py`, `subprocess.run` systématiquement mocké,
+jamais exécuté pour de vrai). À surveiller en conditions réelles : que
+`SHUTDOWN_LEAD_HOURS` (1h) laisse bien le temps à un `sudo poweroff`
+propre avant que la batterie ne soit réellement à plat, et que la
+bascule « tombée de la nuit » ne déclenche pas un arrêt trop tôt en
+soirée sur le terrain réel (valeurs à ajuster après quelques nuits
+réelles, comme la marge de sécurité de la politique caméra ci-dessus).
+
+## Sécurité tension critique : vibreur manette + verrouillage AUTO (`link/voltage_safety.py`, 2026-10-12)
+
+Demande explicite de l'utilisateur, verbatim : « je ne veux pas que la
+Pi se coupe lors d'un appel de courant dû au mode manuel. Si la
+tension batterie devient critique (on commence à un seuil de 11.5
+Volts) alors les vibreurs de la manette doivent s'activer fort en
+continu jusqu'à ce que les joysticks reviennent au neutre. Alors on
+passe en idle et on attend la recharge. »
+
+C'est une protection **séparée** de l'arrêt automatique
+(`link/shutdown_policy.py`, ci-dessus) : celui-ci programme une
+extinction propre des heures à l'avance, à partir d'une moyenne
+glissante sur plusieurs minutes (« est-ce que la réserve tiendra
+jusqu'au prochain lever du soleil ? »). Celle-ci réagit en
+`VOLTAGE_SAFETY_CHECK_INTERVAL_S` (0.5 s) à la tension batterie brute,
+instantanée, spécifiquement pour arrêter de tirer du courant moteur
+(en forçant le robot en IDLE) *avant* qu'un appel de courant moteur
+soutenu en conduite manuelle ne fasse chuter la tension suffisamment
+bas pour déclencher la propre protection basse-tension matérielle du
+régulateur de charge EPever Tracer — ce qui couperait l'alimentation
+de la Pi elle-même, sans préavis, sans que ce logiciel ne puisse rien
+y faire après coup. Les deux modules ne partagent aucun état.
+
+Comportement, confirmé avec l'utilisateur via trois questions de
+clarification (2026-10-12) :
+- **Mode MANUAL** : pas de verrou dur sur le joystick — un pilote qui
+  pousse le manche garde toujours la main, même convention « le
+  manuel gagne toujours » déjà utilisée partout ailleurs dans ce
+  projet (`robot_state_drive_handler()`). La vibration forte et
+  continue est le seul moyen de dissuasion tant que la tension reste
+  critique et qu'un manche est hors neutre ; relâcher les deux manches
+  au neutre arrête la vibration et repasse en IDLE. Repousser le
+  manche ensuite, même si la tension est encore critique, est autorisé
+  — la vibration reprend simplement.
+- **Mode AUTO** : pas de joystick pour prévenir, donc une lecture
+  critique force IDLE immédiatement (pas de vibration — personne ne
+  tient la manette en AUTO). À la différence de MANUAL, AUTO est en
+  plus **verrouillé** : `RobotState.set_mode("AUTO")` et
+  `start_waypoint_return()` refusent tous les deux de (ré)armer AUTO
+  (`CommandError("26", "AUTO_LOCKED_LOW_VOLTAGE")`) jusqu'à ce que la
+  tension soit réellement remontée au-delà de
+  `RECOVERY_VOLTAGE_THRESHOLD_V` (12.0 V, soit +0.5 V de marge
+  au-dessus du seuil critique — valeur choisie explicitement par
+  l'utilisateur pour éviter un effet de « yo-yo » si la tension
+  oscille juste autour de 11.5 V). Ce verrou est indépendant du mode
+  qui l'a déclenché.
+
+Mêmes principes de code que `link/shutdown_policy.py` /
+`link/camera_power_policy.py` : une fonction de décision pure
+(`is_voltage_critical()`, `decide_voltage_safety_action()`,
+`update_auto_lockout()`, aucune I/O, testable sans matériel) et une
+classe `VoltageSafety` qui l'entoure dans son propre fil
+d'arrière-plan (échantillonne `RobotState.power_status()`/`.status()`
+toutes les `VOLTAGE_SAFETY_CHECK_INTERVAL_S`, pilote la vibration de
+`link.gamepad_handler.GamepadReader.start_rumble()`/`stop_rumble()`,
+force IDLE et met à jour le verrou via les deux nouvelles méthodes de
+`RobotState` : `set_mode()` — modifiée pour refuser AUTO si verrouillé
+— et `set_auto_locked_low_voltage()`). Câblée dans
+`ControlServer.__init__` comme toutes les autres politiques
+(`start_voltage_safety=True` par défaut, `VOLTAGE_SAFETY_ENABLED`,
+`VOLTAGE_SAFETY_CHECK_INTERVAL_S`, `VOLTAGE_SAFETY_CRITICAL_V`,
+`VOLTAGE_SAFETY_RECOVERY_V` en variables d'environnement) ;
+fonctionne sans manette connectée (juste pas de vibration à piloter —
+le forçage IDLE et le verrou AUTO restent actifs).
+
+Une lecture de tension manquante (câble RS485 débranché, Tracer non
+alimenté) est traitée comme « incertitude → ne rien faire » : ni
+vibration, ni IDLE forcé, ni changement du verrou — même philosophie
+que `link/shutdown_policy.py`, pour ne jamais réagir à une valeur
+inconnue.
+
+**Non testé sur une manette réelle** (même réserve que le reste de
+`link/gamepad_handler.py` — la vibration forte continue dépend du
+support FF_RUMBLE du pilote/contrôleur réel, voir le docstring de ce
+module). La logique de décision pure et le câblage
+échantillonnage/vibration/IDLE/verrou de `VoltageSafety` sont
+entièrement testés avec une fausse manette et un vrai `RobotState`
+(`tests/test_voltage_safety.py`), ainsi que le refus d'AUTO par
+`RobotState` (`tests/test_link_server.py`) et le câblage
+`start_voltage_safety` dans `link/server.py`. À surveiller sur le
+terrain réel : que 11.5 V / 12.0 V correspondent bien à la vraie
+protection basse-tension du Tracer sur la batterie réellement
+installée (valeurs à ajuster après un premier test de conduite
+prolongée qui fait vraiment chuter la tension).
 
 ## Carte d'ensoleillement (`link/solar_map.py`, extension de `link/power_history.py`, 2026-10-07)
 
@@ -1520,6 +2010,6 @@ non-régression sur `nav_target`).
 
 ## Documentation réseau et architecture
 
-Les schémas réseau (IP des deux Raspberry Pi, chez vous et chez vos parents)
+Les schémas réseau (IP des deux Raspberry Pi, chez vous et dans la zone d'essais)
 et l'architecture globale du projet (robot ↔ serveur web ↔ routeur) sont tenus
 à jour dans un document séparé, en dehors de ce dépôt de code.

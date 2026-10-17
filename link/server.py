@@ -17,8 +17,23 @@ import socketserver
 import subprocess
 import time
 
+from link.camera_power_policy import (
+    BATTERY_CAPACITY_AH as CAMERA_POWER_BATTERY_CAPACITY_AH,
+    LOW_PV_SUSTAINED_RECORDS as CAMERA_POWER_LOW_PV_RECORDS,
+    LOW_PV_THRESHOLD_W as CAMERA_POWER_LOW_PV_THRESHOLD_W,
+    PROJECTION_INTERVAL_S as CAMERA_POWER_PROJECTION_INTERVAL_S,
+    SAFETY_MARGIN_HOURS as CAMERA_POWER_SAFETY_MARGIN_HOURS,
+    SAMPLE_INTERVAL_S as CAMERA_POWER_SAMPLE_INTERVAL_S,
+    CameraPowerPolicy,
+)
 from link.gamepad_handler import GamepadReader, robot_state_button_handler, robot_state_drive_handler
 from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
+from link.led_control import (
+    LED_CHECK_INTERVAL_S,
+    LOW_VOLTAGE_DURATION_S,
+    LOW_VOLTAGE_THRESHOLD_V,
+    LedController,
+)
 from link.nmea import SentenceError, build_sentence, decimal_to_nmea, parse_sentence
 from link.power_history import (
     DEFAULT_LOG_INTERVAL_S as HISTORY_DEFAULT_LOG_INTERVAL_S,
@@ -31,12 +46,26 @@ from link.power_history import (
     system_clock_is_plausible,
 )
 from link.robot_state import CommandError, RobotState
+from link.shutdown_policy import (
+    BATTERY_CAPACITY_AH as SHUTDOWN_BATTERY_CAPACITY_AH,
+    PROJECTION_INTERVAL_S as SHUTDOWN_PROJECTION_INTERVAL_S,
+    SAFETY_MARGIN_HOURS as SHUTDOWN_SAFETY_MARGIN_HOURS,
+    SAMPLE_INTERVAL_S as SHUTDOWN_SAMPLE_INTERVAL_S,
+    SHUTDOWN_LEAD_HOURS,
+    ShutdownPolicy,
+)
 from link.tracer_reader import (
     DEFAULT_BAUDRATE as TRACER_DEFAULT_BAUDRATE,
     DEFAULT_DEVICE as TRACER_DEFAULT_DEVICE,
     DEFAULT_POLL_INTERVAL_S as TRACER_DEFAULT_POLL_INTERVAL_S,
     DEFAULT_SLAVE_ID as TRACER_DEFAULT_SLAVE_ID,
     TracerReader,
+)
+from link.voltage_safety import (
+    CRITICAL_VOLTAGE_THRESHOLD_V,
+    RECOVERY_VOLTAGE_THRESHOLD_V,
+    VOLTAGE_SAFETY_CHECK_INTERVAL_S,
+    VoltageSafety,
 )
 from motor_control.motor_driver import MotorDriver
 
@@ -88,13 +117,42 @@ GAMEPAD_STOP_BTN = os.environ.get("GAMEPAD_STOP_BTN") or None
 DGPS_PULSE_DURATION_S = 0.5
 
 
-def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str:
+def _handle_sentence(state: RobotState, sentence_type: str, fields: list, server=None) -> str:
     """Dispatches one parsed sentence to a RobotState method and returns
     the response sentence (ACK/STA) to send back. Raises CommandError
-    (caught by the caller) for invalid input or an unimplemented command."""
+    (caught by the caller) for invalid input or an unimplemented command.
+
+    `server` (2026-10-12, added for the new SHD sentence below) is the
+    owning ControlServer instance -- optional and unused by every other
+    sentence type, which only ever need `state`. Passed in rather than
+    reached via some module-level global so this function stays a plain,
+    easily-testable dispatcher; ControlHandler.handle() is the only
+    caller and always has `self.server` on hand to pass."""
     if sentence_type == "STP":
         state.stop()
         return build_sentence("ACK", "STP")
+
+    if sentence_type == "SHD":
+        # Command (2026-10-12, explicit user request): manual "shut down
+        # Pi #1 now" from robot-webserver's /control page, the button
+        # placed directly under STOP -- same underlying mechanism as the
+        # gamepad's BTN_START (see ControlServer._shutdown_pi() and
+        # robot_state_button_handler()'s on_shutdown callback below).
+        # `server` must be the owning ControlServer -- it always is in
+        # production (ControlHandler.handle() passes self.server on
+        # every call); only a direct unit-test call to this function
+        # with server left at its default None could hit the guard
+        # below, which fails loudly rather than crashing on
+        # AttributeError.
+        if server is None:
+            raise CommandError("25", "SHD_UNAVAILABLE")
+        # Same "call from a thread other than serve_forever()" rule
+        # _shutdown_pi() documents -- ControlHandler instances run on
+        # their own per-connection worker thread (ThreadingTCPServer),
+        # which satisfies it, exactly like the gamepad handler's own
+        # thread does.
+        server._shutdown_pi()
+        return build_sentence("ACK", "SHD")
 
     if sentence_type == "DRV":
         if len(fields) != 2:
@@ -387,6 +445,18 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         # Deliberately independent of the clock-plausibility question
         # above -- see link.uptime's own docstring for why a monotonic
         # boot-time counter has nothing to lose from an unset wall clock.
+        #
+        # shutdown_eta_ts (18th field, 2026-10-12, extend-only -- an
+        # older robot-webserver that doesn't know about it yet just
+        # ignores the extra field, same convention as every field added
+        # above): set in the background by
+        # link.shutdown_policy.ShutdownPolicy (see RobotState.
+        # set_shutdown_eta()/power_status()) -- the single authoritative
+        # "Pi1 will shut itself down at this time" answer, 0 meaning "no
+        # shutdown currently scheduled" (this protocol is text-only, same
+        # reasoning as `available` above for why a trailing sentinel is
+        # used rather than a real null). Drives robot-webserver's
+        # site-wide shutdown alert banner -- explicit user request.
         if system_clock_is_plausible():
             onboard_time = int(time.time())
             onboard_time_source = "SYS"
@@ -397,6 +467,7 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
             onboard_time = int(time.time())
             onboard_time_source = "SYS"
         uptime_s = p.get("uptime_s")
+        shutdown_eta_ts = p.get("shutdown_eta_ts")
         return build_sentence(
             "PWR",
             round(float(p["pv_voltage"] or 0.0), 2), round(float(p["pv_current"] or 0.0), 2),
@@ -413,6 +484,7 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
             onboard_time,
             onboard_time_source,
             uptime_s if uptime_s is not None else 0,
+            int(shutdown_eta_ts) if shutdown_eta_ts is not None else 0,
         )
 
     if sentence_type == "HIS":
@@ -499,7 +571,7 @@ class ControlHandler(socketserver.StreamRequestHandler):
                 continue
 
             try:
-                response = _handle_sentence(self.server.state, sentence_type, fields)
+                response = _handle_sentence(self.server.state, sentence_type, fields, self.server)
                 log.info("%s -> %s -> %s", peer, line, response)
             except CommandError as exc:
                 response = build_sentence("ERR", exc.code, exc.message.replace(",", ";"))
@@ -517,7 +589,9 @@ class ControlServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, host, port, state: RobotState = None, start_gps: bool = True,
                  start_motor: bool = True, start_gamepad: bool = True, start_tracer: bool = True,
-                 start_history: bool = True):
+                 start_history: bool = True, start_led_control: bool = True,
+                 start_camera_power_policy: bool = True, start_shutdown_policy: bool = True,
+                 start_voltage_safety: bool = True):
         super().__init__((host, port), ControlHandler)
 
         # MotorDriver is always constructed (cheap -- no hardware is
@@ -635,6 +709,133 @@ class ControlServer(socketserver.ThreadingTCPServer):
                     ),
                 )
                 self.power_history_logger.start()
+
+        self.led_controller = None
+        if start_led_control:
+            # LED_CONTROL_ENABLED=false disables this entirely -- same
+            # escape hatch as TRACER_ENABLED/POWER_LOG_ENABLED above,
+            # useful on a dev machine with no /sys/class/leds/ at all
+            # (this already degrades gracefully even when left on -- see
+            # link.led_control._write_led_file -- but the env var avoids
+            # even trying). Independent of TRACER_ENABLED on purpose,
+            # same reasoning as power_history_logger just above: it only
+            # acts on power_status()["available"]/["pv_voltage"], which
+            # already read as "unavailable"/None with the Tracer off,
+            # and LedController already treats that as "wait, don't
+            # guess" (see its own docstring) -- no need to couple the
+            # two switches.
+            if os.environ.get("LED_CONTROL_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.led_controller = LedController(
+                    self.state,
+                    check_interval=float(
+                        os.environ.get("LED_CHECK_INTERVAL_S", LED_CHECK_INTERVAL_S)
+                    ),
+                    threshold_v=float(
+                        os.environ.get("LED_LOW_VOLTAGE_THRESHOLD_V", LOW_VOLTAGE_THRESHOLD_V)
+                    ),
+                    duration_s=float(
+                        os.environ.get("LED_LOW_VOLTAGE_DURATION_S", LOW_VOLTAGE_DURATION_S)
+                    ),
+                )
+                self.led_controller.start()
+
+        self.camera_power_policy = None
+        if start_camera_power_policy:
+            # CAMERA_POWER_POLICY_ENABLED=false disables this entirely --
+            # same escape hatch as LED_CONTROL_ENABLED/TRACER_ENABLED/
+            # POWER_LOG_ENABLED above. Independent of TRACER_ENABLED and
+            # GPS_ENABLED on purpose, same reasoning as those: decide_
+            # camera_mode() (link.camera_power_policy) already treats
+            # missing power/GPS data as "uncertainty -> eco" (the user's
+            # own stated rule) rather than crashing or guessing, so there
+            # is no need to couple this switch to the others -- running
+            # with the Tracer or GPS off just means this policy settles
+            # on ECO and stays there, exactly as it should.
+            if os.environ.get("CAMERA_POWER_POLICY_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.camera_power_policy = CameraPowerPolicy(
+                    self.state,
+                    projection_interval=float(
+                        os.environ.get("CAMERA_POWER_PROJECTION_INTERVAL_S", CAMERA_POWER_PROJECTION_INTERVAL_S)
+                    ),
+                    sample_interval=float(
+                        os.environ.get("CAMERA_POWER_SAMPLE_INTERVAL_S", CAMERA_POWER_SAMPLE_INTERVAL_S)
+                    ),
+                    battery_capacity_ah=float(
+                        os.environ.get("CAMERA_POWER_BATTERY_CAPACITY_AH", CAMERA_POWER_BATTERY_CAPACITY_AH)
+                    ),
+                    safety_margin_hours=float(
+                        os.environ.get("CAMERA_POWER_SAFETY_MARGIN_HOURS", CAMERA_POWER_SAFETY_MARGIN_HOURS)
+                    ),
+                    low_pv_threshold_w=float(
+                        os.environ.get("CAMERA_POWER_LOW_PV_THRESHOLD_W", CAMERA_POWER_LOW_PV_THRESHOLD_W)
+                    ),
+                    low_pv_sustained_records=int(
+                        os.environ.get("CAMERA_POWER_LOW_PV_RECORDS", CAMERA_POWER_LOW_PV_RECORDS)
+                    ),
+                )
+                self.camera_power_policy.start()
+
+        self.shutdown_policy = None
+        if start_shutdown_policy:
+            # SHUTDOWN_POLICY_ENABLED=false disables this entirely --
+            # same escape hatch as CAMERA_POWER_POLICY_ENABLED above.
+            # Independent of TRACER_ENABLED/GPS_ENABLED on purpose, same
+            # reasoning as that policy: compute_scheduled_shutdown_ts()
+            # (link.shutdown_policy) already treats missing power/GPS
+            # data as "uncertainty -> do NOT schedule a shutdown" rather
+            # than crashing or guessing, so there is no need to couple
+            # this switch to the others -- running with the Tracer or
+            # GPS off just means this policy never schedules anything,
+            # exactly as it should (wrongly staying silent is far safer
+            # here than wrongly triggering a real poweroff).
+            if os.environ.get("SHUTDOWN_POLICY_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.shutdown_policy = ShutdownPolicy(
+                    self.state,
+                    on_shutdown=self._shutdown_pi,
+                    projection_interval=float(
+                        os.environ.get("SHUTDOWN_PROJECTION_INTERVAL_S", SHUTDOWN_PROJECTION_INTERVAL_S)
+                    ),
+                    sample_interval=float(
+                        os.environ.get("SHUTDOWN_SAMPLE_INTERVAL_S", SHUTDOWN_SAMPLE_INTERVAL_S)
+                    ),
+                    battery_capacity_ah=float(
+                        os.environ.get("SHUTDOWN_BATTERY_CAPACITY_AH", SHUTDOWN_BATTERY_CAPACITY_AH)
+                    ),
+                    lead_hours=float(
+                        os.environ.get("SHUTDOWN_LEAD_HOURS", SHUTDOWN_LEAD_HOURS)
+                    ),
+                    safety_margin_hours=float(
+                        os.environ.get("SHUTDOWN_SAFETY_MARGIN_HOURS", SHUTDOWN_SAFETY_MARGIN_HOURS)
+                    ),
+                )
+                self.shutdown_policy.start()
+
+        self.voltage_safety = None
+        if start_voltage_safety:
+            # VOLTAGE_SAFETY_ENABLED=false disables this entirely --
+            # same escape hatch as SHUTDOWN_POLICY_ENABLED above.
+            # Independent of TRACER_ENABLED/GAMEPAD_ENABLED on purpose:
+            # VoltageSafety already treats a missing battery_voltage
+            # reading as "uncertainty -> do not act" (is_voltage_
+            # critical()) and a missing gamepad as "no rumble to drive,
+            # the IDLE-forcing/AUTO-lockout logic still works" (see
+            # link.voltage_safety.VoltageSafety's own docstring) -- no
+            # need to couple this switch to the others.
+            if os.environ.get("VOLTAGE_SAFETY_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.voltage_safety = VoltageSafety(
+                    self.state,
+                    gamepad=self.gamepad_reader,
+                    check_interval=float(
+                        os.environ.get("VOLTAGE_SAFETY_CHECK_INTERVAL_S", VOLTAGE_SAFETY_CHECK_INTERVAL_S)
+                    ),
+                    critical_threshold_v=float(
+                        os.environ.get("VOLTAGE_SAFETY_CRITICAL_V", CRITICAL_VOLTAGE_THRESHOLD_V)
+                    ),
+                    recovery_threshold_v=float(
+                        os.environ.get("VOLTAGE_SAFETY_RECOVERY_V", RECOVERY_VOLTAGE_THRESHOLD_V)
+                    ),
+                )
+                self.voltage_safety.start()
 
     def _on_gps_quality_change(self, is_dgps):
         """Wired in as link.gps_reader.GPSReader's on_gps_quality callback

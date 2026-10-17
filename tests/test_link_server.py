@@ -16,7 +16,7 @@ import pytest
 
 from link.nmea import build_sentence, nmea_to_decimal, parse_sentence
 from link.robot_state import CommandError, RobotState
-from link.server import SHUTDOWN_CMD, ControlServer
+from link.server import SHUTDOWN_CMD, ControlServer, _handle_sentence
 
 
 # --- RobotState unit tests -------------------------------------------------
@@ -46,6 +46,55 @@ def test_set_mode_rejects_unknown_mode():
     state = RobotState()
     with pytest.raises(CommandError):
         state.set_mode("FLY")
+
+
+# --- Critical-battery-voltage AUTO lockout (2026-10-12, see
+# link.voltage_safety.VoltageSafety's own docstring for the full design)
+# -- RobotState.set_auto_locked_low_voltage()/set_mode()/
+# start_waypoint_return() wiring, independent of the background policy
+# itself (covered separately in tests/test_voltage_safety.py).
+
+def test_set_mode_auto_refuses_while_voltage_locked():
+    state = RobotState()
+    state.set_auto_locked_low_voltage(True)
+    with pytest.raises(CommandError) as exc_info:
+        state.set_mode("AUTO")
+    assert exc_info.value.code == "26"
+    assert state.mode == "IDLE"  # unchanged -- the refused mode never applied
+
+
+def test_set_mode_auto_allowed_again_once_unlocked():
+    state = RobotState()
+    state.set_auto_locked_low_voltage(True)
+    state.set_auto_locked_low_voltage(False)
+    state.set_mode("AUTO")
+    assert state.mode == "AUTO"
+
+
+def test_set_mode_manual_and_idle_are_not_gated_by_the_voltage_lockout():
+    # Explicit design choice: a physical operator pushing the joystick
+    # always keeps control -- only AUTO is locked out.
+    state = RobotState()
+    state.set_auto_locked_low_voltage(True)
+    state.set_mode("MANUAL")
+    assert state.mode == "MANUAL"
+    state.set_mode("IDLE")
+    assert state.mode == "IDLE"
+
+
+def test_start_waypoint_return_refuses_while_voltage_locked(tmp_path, monkeypatch):
+    waypoints_file = tmp_path / "waypoints.txt"
+    waypoints_file.write_text("10.000000,20.000000,t1\n")
+    monkeypatch.setenv("WAYPOINTS_FILE", str(waypoints_file))
+    state = RobotState()
+    state.update_gps_fix(10.0, 20.0)
+    state.set_auto_locked_low_voltage(True)
+
+    with pytest.raises(CommandError) as exc_info:
+        state.start_waypoint_return()
+    assert exc_info.value.code == "26"
+    assert state.mode == "IDLE"
+    assert state.route == []
 
 
 # --- RobotState <-> motor_driver wiring (2026-09-07) ------------------------
@@ -662,22 +711,31 @@ def test_get_route_progress_returns_a_copy_not_the_live_list():
 
 @pytest.fixture()
 def running_server():
-    # start_gps/start_motor/start_gamepad/start_tracer/start_history=False:
-    # tests don't need a real (or attempted) GPS fix, GPIO chip, gamepad,
-    # RS485 read, or a background history logger writing to data/
-    # power_history.db in whatever directory the test suite happens to
-    # run from -- this avoids every test run making real subprocess/
-    # device-scan/serial-open calls (gpiodetect, evdev.list_devices,
-    # serial.Serial(...)) or leaving SQLite files behind. See
-    # test_control_server_starts_fine_without_gps_hardware and
-    # test_control_server_starts_fine_without_tracer_hardware below for
-    # dedicated checks that leaving these at their True default doesn't
-    # crash when the hardware behind them isn't there, and
-    # test_his_* below (own fixture, own tmp DB) for the history logger.
+    # start_gps/start_motor/start_gamepad/start_tracer/start_history/
+    # start_led_control/start_camera_power_policy/start_shutdown_policy=
+    # False: tests don't need a real (or attempted) GPS fix, GPIO chip,
+    # gamepad, RS485 read, a background history logger writing to
+    # data/power_history.db in whatever directory the test suite happens
+    # to run from, a background LED-control thread polling power_status()
+    # every 10s, a background camera-power-policy thread doing the same
+    # every 15s, or a background shutdown-policy thread doing the same --
+    # this avoids every test run making real subprocess/device-scan/
+    # serial-open calls (gpiodetect, evdev.list_devices, serial.Serial(...))
+    # or leaving SQLite files behind. See test_control_server_starts_fine_without_gps_hardware
+    # and test_control_server_starts_fine_without_tracer_hardware below
+    # for dedicated checks that leaving these at their True default
+    # doesn't crash when the hardware behind them isn't there,
+    # test_his_* below (own fixture, own tmp DB) for the history logger,
+    # the "LedController" tests further down (own fixture) for the LED
+    # controller itself, the "CameraPowerPolicy" tests further down (own
+    # fixture) for the camera power policy itself, and the
+    # "ShutdownPolicy"/"SHD sentence" tests further down (own fixture)
+    # for the shutdown policy itself.
     server = ControlServer(
         "127.0.0.1", 0,  # port 0 = pick a free port
         start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
-        start_history=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+        start_shutdown_policy=False, start_voltage_safety=False,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1029,6 +1087,7 @@ def test_pwr_over_real_socket_reports_unavailable_before_any_reading(running_ser
     assert fields[14].isdigit()
     assert fields[15] == "SYS"  # no GPS fix either -- falls back to the system clock
     assert fields[16].isdigit()
+    assert fields[17] == "0"  # shutdown_eta_ts (2026-10-12) -- nothing scheduled yet
 
 
 def test_pwr_over_real_socket_reports_a_real_reading(running_server, monkeypatch):
@@ -1053,6 +1112,7 @@ def test_pwr_over_real_socket_reports_a_real_reading(running_server, monkeypatch
     assert fields[14].isdigit()  # onboard_time -- whole-second Unix timestamp
     assert fields[15] == "SYS"
     assert fields[16].isdigit()  # uptime_s
+    assert fields[17] == "0"  # shutdown_eta_ts (2026-10-12) -- nothing scheduled yet
 
 
 def test_pwr_cpu_temp_is_reported_even_when_tracer_is_unavailable(running_server, monkeypatch):
@@ -1141,6 +1201,90 @@ def test_pwr_uptime_s_reports_the_mocked_read_uptime_s_value(running_server, mon
     assert fields[16] == "12345"
 
 
+def test_pwr_shutdown_eta_ts_reports_zero_when_nothing_scheduled(running_server, monkeypatch):
+    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("PWR"))
+    _, fields = parse_sentence(response)
+    assert fields[17] == "0"
+
+
+def test_pwr_shutdown_eta_ts_reports_the_scheduled_unix_timestamp(running_server, monkeypatch):
+    # shutdown_eta_ts (2026-10-12, explicit user request): whatever
+    # link.shutdown_policy.ShutdownPolicy last wrote via
+    # RobotState.set_shutdown_eta() is reported as-is, truncated to a
+    # whole second -- `running_server` has start_shutdown_policy=False
+    # (see that fixture), so this calls set_shutdown_eta() directly
+    # rather than waiting on a real background policy tick.
+    monkeypatch.setattr("link.robot_state.read_cpu_temperature_c", lambda: None)
+    running_server.state.set_shutdown_eta(1234567890.7)
+    port = running_server.server_address[1]
+    response = _send_and_receive(port, build_sentence("PWR"))
+    _, fields = parse_sentence(response)
+    assert fields[17] == "1234567890"
+
+
+# --- LED control (link.led_control.LedController, 2026-10-10) --------------
+# Just the ControlServer wiring here (start_led_control on/off) -- the
+# controller's own timer/transition logic is covered in its own
+# dedicated tests/test_led_control.py, same split as PowerHistoryLogger
+# (wiring here, logic in link/power_history.py's own tests further down).
+
+def test_control_server_starts_a_led_controller_by_default():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
+    )
+    try:
+        assert server.led_controller is not None
+    finally:
+        server.server_close()
+
+
+def test_control_server_skips_the_led_controller_when_disabled():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
+    )
+    try:
+        assert server.led_controller is None
+    finally:
+        server.server_close()
+
+
+# --- Camera power policy (link.camera_power_policy.CameraPowerPolicy,
+#     2026-10-10) ------------------------------------------------------------
+# Just the ControlServer wiring here (start_camera_power_policy on/off) --
+# the policy's own decision/sampling/notification logic is covered in its
+# own dedicated tests/test_camera_power_policy.py, same split as
+# PowerHistoryLogger/LedController above.
+
+def test_control_server_starts_a_camera_power_policy_by_default():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_shutdown_policy=False, start_voltage_safety=False,
+    )
+    try:
+        assert server.camera_power_policy is not None
+    finally:
+        server.server_close()
+
+
+def test_control_server_skips_the_camera_power_policy_when_disabled():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
+    )
+    try:
+        assert server.camera_power_policy is None
+    finally:
+        server.server_close()
+
+
 # --- BTN_START -> ControlServer._shutdown_pi (2026-09-12) -------------------
 # subprocess.run is mocked in every test here -- this must NEVER actually
 # run `sudo poweroff` (or whatever SHUTDOWN_CMD is set to) against the
@@ -1170,6 +1314,121 @@ def test_shutdown_pi_stops_serve_forever_even_if_the_shutdown_command_fails():
         server.server_close()
 
 
+# --- SHD sentence (2026-10-12, explicit user request) -----------------------
+# A manual "shut down Pi #1 now" from robot-webserver's /control page (the
+# button placed directly under STOP) -- same underlying _shutdown_pi()
+# mechanism as BTN_START above, just reached over the TCP control socket
+# instead of the gamepad. subprocess.run is mocked here too -- same
+# never-run-this-for-real-in-tests rule as the BTN_START tests above.
+
+def test_shd_sentence_runs_the_configured_shutdown_command_over_a_real_socket(running_server):
+    port = running_server.server_address[1]
+    with patch("link.server.subprocess.run") as mock_run:
+        response = _send_and_receive(port, build_sentence("SHD"))
+    mock_run.assert_called_once_with(SHUTDOWN_CMD, check=True, timeout=10)
+    resp_type, fields = parse_sentence(response)
+    assert resp_type == "ACK"
+    assert fields == ["SHD"]
+
+
+def test_handle_sentence_shd_without_a_server_instance_raises_cleanly():
+    # Direct unit-level check of _handle_sentence()'s own guard: every
+    # real call (via ControlHandler.handle()) always passes `server`, so
+    # this only exercises the defensive branch itself.
+    with pytest.raises(CommandError) as exc_info:
+        _handle_sentence(RobotState(), "SHD", [])
+    assert exc_info.value.code == "25"
+
+
+# --- Shutdown policy (link.shutdown_policy.ShutdownPolicy, 2026-10-12) -----
+# Just the ControlServer wiring here (start_shutdown_policy on/off, and
+# that it's handed self._shutdown_pi as its on_shutdown callback) -- the
+# policy's own decision/sampling/scheduling logic is covered in its own
+# dedicated tests/test_shutdown_policy.py, same split as
+# CameraPowerPolicy/LedController above.
+
+def test_control_server_starts_a_shutdown_policy_by_default():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+    )
+    try:
+        assert server.shutdown_policy is not None
+        assert server.shutdown_policy.on_shutdown == server._shutdown_pi
+    finally:
+        server.server_close()
+
+
+def test_control_server_skips_the_shutdown_policy_when_disabled():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+        start_shutdown_policy=False, start_voltage_safety=False,
+    )
+    try:
+        assert server.shutdown_policy is None
+    finally:
+        server.server_close()
+
+
+def test_control_server_skips_the_shutdown_policy_via_env_var(monkeypatch):
+    monkeypatch.setenv("SHUTDOWN_POLICY_ENABLED", "false")
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+    )
+    try:
+        assert server.shutdown_policy is None
+    finally:
+        server.server_close()
+
+
+def test_control_server_starts_a_voltage_safety_by_default():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+        start_shutdown_policy=False,
+    )
+    try:
+        assert server.voltage_safety is not None
+        # Wired to the (possibly-None, GAMEPAD_ENABLED=false here) gamepad
+        # reader -- see VoltageSafety's own docstring on why None is fine.
+        assert server.voltage_safety.gamepad is server.gamepad_reader
+    finally:
+        server.server_close()
+
+
+def test_control_server_skips_the_voltage_safety_when_disabled():
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+        start_shutdown_policy=False, start_voltage_safety=False,
+    )
+    try:
+        assert server.voltage_safety is None
+    finally:
+        server.server_close()
+
+
+def test_control_server_skips_the_voltage_safety_via_env_var(monkeypatch):
+    monkeypatch.setenv("VOLTAGE_SAFETY_ENABLED", "false")
+    server = ControlServer(
+        "127.0.0.1", 0,
+        start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False,
+        start_shutdown_policy=False,
+    )
+    try:
+        assert server.voltage_safety is None
+    finally:
+        server.server_close()
+
+
 # --- HIS / power history (2026-10-05) --------------------------------------
 
 @pytest.fixture()
@@ -1182,7 +1441,7 @@ def history_server(tmp_path, monkeypatch):
     server = ControlServer(
         "127.0.0.1", 0,
         start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
-        start_history=True,
+        start_history=True, start_led_control=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1700,6 +1959,7 @@ def test_wpd_sentence_deletes_over_a_real_socket(tmp_path, monkeypatch):
     server = ControlServer(
         "127.0.0.1", 0,
         start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_led_control=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1722,6 +1982,7 @@ def test_wpd_sentence_rejects_wrong_field_count(tmp_path, monkeypatch):
     server = ControlServer(
         "127.0.0.1", 0,
         start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
+        start_led_control=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2250,7 +2511,7 @@ def test_smp_sentence_returns_cells_paginated(tmp_path, monkeypatch):
     server = ControlServer(
         "127.0.0.1", 0,
         start_gps=False, start_motor=False, start_gamepad=False, start_tracer=False,
-        start_history=False,
+        start_history=False, start_led_control=False, start_camera_power_policy=False, start_shutdown_policy=False, start_voltage_safety=False,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

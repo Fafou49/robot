@@ -22,6 +22,8 @@ import urllib.error
 import urllib.request
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import camera.stream_server as stream_server
 from camera.stream_server import FrameGrabber, StreamHandler
 
@@ -424,3 +426,342 @@ def test_delete_on_an_unknown_path_is_404(monkeypatch):
         server.server_close()
 
     assert status == 404
+
+
+# --- FrameGrabber: reactive/eco mode (2026-10-10) ---------------------------
+# Explicit user request: "je souhaites la reactivite lorsque le panneau
+# solaire charge ou que j'ai assez d'energie pour passer la nuit. En cas
+# d'incertitude on passe en mode eco" -- the actual REACTIVE/ECO decision
+# lives in link/camera_power_policy.py (tests/test_camera_power_policy.py);
+# these tests only cover what FrameGrabber/StreamHandler DO with that
+# decision once it's handed to them.
+
+def test_set_mode_rejects_an_invalid_value():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    with pytest.raises(ValueError):
+        grabber.set_mode("turbo")
+    assert grabber.mode == "reactive"  # unchanged by the rejected call
+
+
+def test_set_mode_accepts_reactive_and_eco():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    grabber.set_mode("eco")
+    assert grabber.mode == "eco"
+    grabber.set_mode("reactive")
+    assert grabber.mode == "reactive"
+
+
+def test_frame_grabber_defaults_to_reactive_mode():
+    # Matches this class's own behaviour before eco mode existed --
+    # continuous capture regardless of viewers -- for every existing
+    # caller/test that never calls set_mode() at all.
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    assert grabber.mode == "reactive"
+
+
+def test_viewer_connected_disconnected_tracks_a_count():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    grabber.viewer_connected()
+    grabber.viewer_connected()
+    assert grabber._active_viewers == 2
+    grabber.viewer_disconnected()
+    assert grabber._active_viewers == 1
+
+
+def test_viewer_disconnected_never_goes_negative():
+    # An extra disconnect (e.g. a bug, or a race between two handler
+    # threads) must not leave the count negative, which would otherwise
+    # require two more connects than disconnects before eco mode could
+    # ever engage again.
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    grabber.viewer_disconnected()
+    assert grabber._active_viewers == 0
+
+
+def test_request_active_extends_rather_than_shortens_the_window(monkeypatch):
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    grabber.request_active(duration=10.0)
+    assert grabber._force_active_until == 1010.0
+    grabber.request_active(duration=2.0)  # a shorter request right after
+    assert grabber._force_active_until == 1010.0  # unchanged -- not shortened
+
+
+def test_should_release_for_eco_mode_is_always_false_in_reactive_mode():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    assert grabber.mode == "reactive"
+    grabber.set_mode("reactive")
+    assert grabber._should_release_for_eco_mode() is False
+
+
+def test_should_release_for_eco_mode_true_when_idle_in_eco_mode():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    grabber.set_mode("eco")
+    assert grabber._should_release_for_eco_mode() is True
+
+
+def test_should_release_for_eco_mode_false_with_an_active_viewer():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    grabber.set_mode("eco")
+    grabber.viewer_connected()
+    assert grabber._should_release_for_eco_mode() is False
+
+
+def test_should_release_for_eco_mode_false_during_a_pending_wake_request(monkeypatch):
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    grabber.set_mode("eco")
+    monkeypatch.setattr(time, "time", lambda: 1000.0)
+    grabber.request_active(duration=5.0)
+    assert grabber._should_release_for_eco_mode() is False
+    monkeypatch.setattr(time, "time", lambda: 1006.0)  # past the window
+    assert grabber._should_release_for_eco_mode() is True
+
+
+def test_should_release_for_eco_mode_false_while_a_recording_is_in_progress():
+    fake_recorder = MagicMock()
+    fake_recorder.is_recording = True
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, recorder=fake_recorder)
+    grabber.set_mode("eco")
+    assert grabber._should_release_for_eco_mode() is False
+
+
+def test_should_release_for_eco_mode_true_with_no_recorder_at_all():
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=_FakeCapture(opened=False)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15)
+    assert grabber.recorder is None
+    grabber.set_mode("eco")
+    assert grabber._should_release_for_eco_mode() is True
+
+
+# --- FrameGrabber._loop(): eco mode actually releasing/reopening the device -
+
+def test_loop_never_opens_the_camera_while_idle_in_eco_mode_from_the_start():
+    open_calls = {"count": 0}
+
+    def fake_video_capture(device):
+        open_calls["count"] += 1
+        frame = MagicMock()
+        frame.shape = (480, 640, 3)
+        return _FakeCapture(opened=True, frames=[(True, frame)])
+
+    with patch("camera.stream_server.cv2.VideoCapture", side_effect=fake_video_capture):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05)
+        grabber.set_mode("eco")  # idle from the very first tick: no viewer, no recording
+        grabber.start()
+        time.sleep(0.3)
+        grabber._running = False
+
+    assert open_calls["count"] == 0
+    assert grabber.latest_jpeg() is None
+
+
+def test_loop_releases_the_device_once_eco_mode_engages_with_no_viewers():
+    fake_capture = _FakeCapture(opened=True, frames=[])
+
+    with patch("camera.stream_server.cv2.VideoCapture", return_value=fake_capture):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05)
+        grabber.start()
+        deadline = time.time() + 2.0
+        while grabber._capture is None and time.time() < deadline:
+            time.sleep(0.02)
+        assert grabber._capture is fake_capture  # opened under the default reactive mode
+
+        grabber.set_mode("eco")
+        deadline = time.time() + 2.0
+        while grabber._capture is not None and time.time() < deadline:
+            time.sleep(0.02)
+        grabber._running = False
+
+    assert fake_capture.released is True
+    assert grabber._capture is None
+
+
+def test_loop_reopens_the_device_once_a_viewer_connects_in_eco_mode():
+    open_calls = {"count": 0}
+
+    def fake_video_capture(device):
+        open_calls["count"] += 1
+        frame = MagicMock()
+        frame.shape = (480, 640, 3)
+        return _FakeCapture(opened=True, frames=[(True, frame)])
+
+    fake_buffer = MagicMock()
+    fake_buffer.tobytes.return_value = b"jpeg-bytes"
+
+    with patch("camera.stream_server.cv2.VideoCapture", side_effect=fake_video_capture), \
+         patch("camera.stream_server.cv2.imencode", return_value=(True, fake_buffer)):
+        grabber = FrameGrabber(device=0, width=640, height=480, fps=15, retry_interval=0.05)
+        grabber.set_mode("eco")
+        grabber.start()
+        time.sleep(0.2)
+        assert open_calls["count"] == 0  # confirmed idle so far
+
+        grabber.viewer_connected()
+        deadline = time.time() + 2.0
+        while grabber.latest_jpeg() is None and time.time() < deadline:
+            time.sleep(0.02)
+        grabber._running = False
+
+    assert grabber.latest_jpeg() == b"jpeg-bytes"
+    assert open_calls["count"] >= 1
+
+
+# --- StreamHandler: POST /power_mode (2026-10-10) ---------------------------
+
+def test_power_mode_sets_the_grabbers_mode(monkeypatch):
+    fake_grabber = MagicMock()
+    monkeypatch.setattr(stream_server, "grabber", fake_grabber)
+
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/power_mode",
+            data=json.dumps({"mode": "eco"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            body = json.loads(resp.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body == {"ok": True, "mode": "eco"}
+    fake_grabber.set_mode.assert_called_once_with("eco")
+
+
+def test_power_mode_rejects_an_invalid_mode(monkeypatch):
+    fake_grabber = MagicMock()
+    fake_grabber.set_mode.side_effect = ValueError("invalid camera mode: 'turbo'")
+    monkeypatch.setattr(stream_server, "grabber", fake_grabber)
+
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/power_mode",
+            data=json.dumps({"mode": "turbo"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            raise AssertionError("expected an HTTPError (400)")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            body = json.loads(exc.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert body["ok"] is False
+
+
+def test_power_mode_rejects_a_malformed_body(monkeypatch):
+    fake_grabber = MagicMock()
+    monkeypatch.setattr(stream_server, "grabber", fake_grabber)
+
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/power_mode",
+            data=b"not json",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            raise AssertionError("expected an HTTPError (400)")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    fake_grabber.set_mode.assert_not_called()
+
+
+def test_power_mode_on_an_unknown_path_is_still_404(monkeypatch):
+    fake_grabber = MagicMock()
+    monkeypatch.setattr(stream_server, "grabber", fake_grabber)
+
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/not-a-real-path", data=b"{}", method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            raise AssertionError("expected an HTTPError (404)")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 404
+
+
+def test_power_mode_returns_503_when_grabber_not_yet_constructed(monkeypatch):
+    monkeypatch.setattr(stream_server, "grabber", None)
+
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/power_mode",
+            data=json.dumps({"mode": "eco"}).encode("utf-8"),
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            raise AssertionError("expected an HTTPError (503)")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 503
+
+
+# --- StreamHandler: /stream.mjpg viewer tracking (2026-10-10) --------------
+
+def test_stream_mjpg_counts_a_viewer_while_connected_and_releases_on_disconnect(monkeypatch):
+    fake_grabber = MagicMock()
+    fake_grabber.latest_jpeg.return_value = b"jpeg-bytes"
+    fake_grabber.frame_interval = 0.01
+    monkeypatch.setattr(stream_server, "grabber", fake_grabber)
+
+    server, thread = _start_test_server()
+    try:
+        port = server.server_address[1]
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/stream.mjpg", timeout=2)
+        # Read a little of the stream to make sure the handler thread has
+        # actually entered its loop (and called viewer_connected()) before
+        # disconnecting.
+        resp.read(20)
+        resp.close()
+        deadline = time.time() + 2.0
+        while fake_grabber.viewer_disconnected.call_count == 0 and time.time() < deadline:
+            time.sleep(0.02)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    fake_grabber.viewer_connected.assert_called_once()
+    fake_grabber.viewer_disconnected.assert_called_once()

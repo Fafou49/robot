@@ -300,6 +300,25 @@ class RobotState:
         # reading is more useful on screen than a flicker back to zero.
         self.power_available = None
         self.last_power_reading_at = None
+        # Self-shutdown ETA (2026-10-12, explicit user request): set by
+        # link.shutdown_policy.ShutdownPolicy in the background, every
+        # projection tick -- see set_shutdown_eta() below. None means
+        # "no shutdown currently scheduled" (reserve is projected fine,
+        # or the policy isn't running/hasn't ticked yet); otherwise a
+        # Unix timestamp, the single authoritative "Pi1 will shut down
+        # at this time" answer, reported as the PWR sentence's 18th
+        # field (link/server.py) for the website's shutdown banner.
+        self.shutdown_eta_ts = None
+        # Critical-battery-voltage AUTO lockout (2026-10-12, explicit
+        # user request): set by link.voltage_safety.VoltageSafety in
+        # the background, True from the moment battery_voltage drops
+        # to/below its CRITICAL_VOLTAGE_THRESHOLD_V until it has
+        # recovered past RECOVERY_VOLTAGE_THRESHOLD_V. While True,
+        # set_mode("AUTO") and start_waypoint_return() below both
+        # refuse to arm AUTO -- see set_auto_locked_low_voltage()'s own
+        # docstring for why MANUAL is deliberately NOT gated the same
+        # way.
+        self._auto_locked_low_voltage = False
 
     # -- STP: emergency stop, highest priority -------------------------
     def stop(self):
@@ -345,6 +364,13 @@ class RobotState:
         if mode not in VALID_MODES:
             raise CommandError("03", f"UNKNOWN_MODE:{mode}")
         with self._lock:
+            if mode == "AUTO" and self._auto_locked_low_voltage:
+                # See set_auto_locked_low_voltage()'s docstring --
+                # critical battery voltage, waiting for a real recharge
+                # before autonomous driving (and its motor current
+                # draw) is allowed to resume. MANUAL is deliberately
+                # NOT gated here.
+                raise CommandError("26", "AUTO_LOCKED_LOW_VOLTAGE")
             self.mode = mode
             zero_pwm = mode != "MANUAL"
             if zero_pwm:
@@ -780,6 +806,42 @@ class RobotState:
             self.controller_temp = controller_temp
             self.last_power_reading_at = time.time()
 
+    def set_shutdown_eta(self, shutdown_eta_ts):
+        """Called by link.shutdown_policy.ShutdownPolicy on every
+        projection tick (see that module's _decide_and_apply()).
+        `shutdown_eta_ts` is None when no shutdown is currently
+        scheduled, else the Unix timestamp computed by
+        compute_scheduled_shutdown_ts() -- stored as-is, no
+        interpretation here (same "setter just stores, policy module
+        decides" split as update_power_reading() above)."""
+        with self._lock:
+            self.shutdown_eta_ts = shutdown_eta_ts
+
+    def set_auto_locked_low_voltage(self, locked):
+        """Called by link.voltage_safety.VoltageSafety in the
+        background (same "setter just stores, policy module decides"
+        split as set_shutdown_eta() above). True once the battery
+        voltage has dropped to/below VoltageSafety's critical
+        threshold, cleared only once it has recovered past that
+        module's (higher) recovery margin -- see its own docstring for
+        the full hysteresis rule.
+
+        While True, set_mode("AUTO") and start_waypoint_return() both
+        refuse to arm AUTO (CommandError("26",
+        "AUTO_LOCKED_LOW_VOLTAGE")), so the robot can't resume
+        autonomous driving -- and therefore drawing motor current --
+        until the battery has genuinely recovered.
+
+        MANUAL driving is deliberately NOT gated here: a physical
+        operator pushing the joystick always keeps control, same
+        "manual always wins" convention this project already uses
+        everywhere else (see robot_state_drive_handler() in
+        link/gamepad_handler.py) -- the gamepad's continuous strong
+        rumble (also driven by VoltageSafety) is the warning for that
+        case instead of a hard lock."""
+        with self._lock:
+            self._auto_locked_low_voltage = locked
+
     def _advance_route_if_arrived(self):
         """Called with self._lock already held, on every new GPS fix. This
         is what makes RTE "chase the whole list" rather than just remember
@@ -1208,8 +1270,15 @@ class RobotState:
         waypoints now queued."""
         with self._lock:
             have_fix = self.current_lat is not None and self.current_lon is not None
+            locked = self._auto_locked_low_voltage
         if not have_fix:
             raise CommandError("14", "NO_GPS_FIX_YET")
+        if locked:
+            # Same critical-battery-voltage AUTO lockout set_mode("AUTO")
+            # enforces -- see set_auto_locked_low_voltage()'s docstring.
+            # This method sets self.mode = "AUTO" directly (not through
+            # set_mode()), so it needs its own check.
+            raise CommandError("26", "AUTO_LOCKED_LOW_VOLTAGE")
 
         entries = list(reversed(self._read_waypoint_entries()))
         if not entries:
@@ -1427,4 +1496,8 @@ class RobotState:
                 # on WiFi/NTP at all. None until at least one GPRMC
                 # sentence with a valid fix has been seen.
                 "gps_utc_ts": self.last_gps_utc_ts,
+                # Self-shutdown ETA (2026-10-12) -- see set_shutdown_eta()
+                # above and link.shutdown_policy. None = no shutdown
+                # currently scheduled.
+                "shutdown_eta_ts": self.shutdown_eta_ts,
             }
