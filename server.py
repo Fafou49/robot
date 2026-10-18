@@ -15,25 +15,59 @@ import os
 import shlex
 import socketserver
 import subprocess
+import time
 
+from link.camera_power_policy import (
+    BATTERY_CAPACITY_AH as CAMERA_POWER_BATTERY_CAPACITY_AH,
+    LOW_PV_SUSTAINED_RECORDS as CAMERA_POWER_LOW_PV_RECORDS,
+    LOW_PV_THRESHOLD_W as CAMERA_POWER_LOW_PV_THRESHOLD_W,
+    PROJECTION_INTERVAL_S as CAMERA_POWER_PROJECTION_INTERVAL_S,
+    SAFETY_MARGIN_HOURS as CAMERA_POWER_SAFETY_MARGIN_HOURS,
+    SAMPLE_INTERVAL_S as CAMERA_POWER_SAMPLE_INTERVAL_S,
+    CameraPowerPolicy,
+)
 from link.gamepad_handler import GamepadReader, robot_state_button_handler, robot_state_drive_handler
 from link.gps_reader import DEFAULT_BAUDRATE, DEFAULT_DEVICE, GPSReader
+from link.led_control import (
+    LED_CHECK_INTERVAL_S,
+    LOW_VOLTAGE_DURATION_S,
+    LOW_VOLTAGE_THRESHOLD_V,
+    LedController,
+)
 from link.nmea import SentenceError, build_sentence, decimal_to_nmea, parse_sentence
 from link.power_history import (
     DEFAULT_LOG_INTERVAL_S as HISTORY_DEFAULT_LOG_INTERVAL_S,
     DEFAULT_RETENTION_DAYS as HISTORY_DEFAULT_RETENTION_DAYS,
     HIS_PERIODS,
     PowerHistoryLogger,
+    fetch_obstacle_chunk,
     fetch_period_chunk,
+    fetch_solar_map_chunk,
+    fetch_stats_summary,
     resolve_db_path,
+    system_clock_is_plausible,
 )
 from link.robot_state import CommandError, RobotState
+from link.shutdown_policy import (
+    BATTERY_CAPACITY_AH as SHUTDOWN_BATTERY_CAPACITY_AH,
+    PROJECTION_INTERVAL_S as SHUTDOWN_PROJECTION_INTERVAL_S,
+    SAFETY_MARGIN_HOURS as SHUTDOWN_SAFETY_MARGIN_HOURS,
+    SAMPLE_INTERVAL_S as SHUTDOWN_SAMPLE_INTERVAL_S,
+    SHUTDOWN_LEAD_HOURS,
+    ShutdownPolicy,
+)
 from link.tracer_reader import (
     DEFAULT_BAUDRATE as TRACER_DEFAULT_BAUDRATE,
     DEFAULT_DEVICE as TRACER_DEFAULT_DEVICE,
     DEFAULT_POLL_INTERVAL_S as TRACER_DEFAULT_POLL_INTERVAL_S,
     DEFAULT_SLAVE_ID as TRACER_DEFAULT_SLAVE_ID,
     TracerReader,
+)
+from link.voltage_safety import (
+    CRITICAL_VOLTAGE_THRESHOLD_V,
+    RECOVERY_VOLTAGE_THRESHOLD_V,
+    VOLTAGE_SAFETY_CHECK_INTERVAL_S,
+    VoltageSafety,
 )
 from motor_control.motor_driver import MotorDriver
 
@@ -85,13 +119,42 @@ GAMEPAD_STOP_BTN = os.environ.get("GAMEPAD_STOP_BTN") or None
 DGPS_PULSE_DURATION_S = 0.5
 
 
-def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str:
+def _handle_sentence(state: RobotState, sentence_type: str, fields: list, server=None) -> str:
     """Dispatches one parsed sentence to a RobotState method and returns
     the response sentence (ACK/STA) to send back. Raises CommandError
-    (caught by the caller) for invalid input or an unimplemented command."""
+    (caught by the caller) for invalid input or an unimplemented command.
+
+    `server` (2026-10-12, added for the new SHD sentence below) is the
+    owning ControlServer instance -- optional and unused by every other
+    sentence type, which only ever need `state`. Passed in rather than
+    reached via some module-level global so this function stays a plain,
+    easily-testable dispatcher; ControlHandler.handle() is the only
+    caller and always has `self.server` on hand to pass."""
     if sentence_type == "STP":
         state.stop()
         return build_sentence("ACK", "STP")
+
+    if sentence_type == "SHD":
+        # Command (2026-10-12, explicit user request): manual "shut down
+        # Pi #1 now" from robot-webserver's /control page, the button
+        # placed directly under STOP -- same underlying mechanism as the
+        # gamepad's BTN_START (see ControlServer._shutdown_pi() and
+        # robot_state_button_handler()'s on_shutdown callback below).
+        # `server` must be the owning ControlServer -- it always is in
+        # production (ControlHandler.handle() passes self.server on
+        # every call); only a direct unit-test call to this function
+        # with server left at its default None could hit the guard
+        # below, which fails loudly rather than crashing on
+        # AttributeError.
+        if server is None:
+            raise CommandError("25", "SHD_UNAVAILABLE")
+        # Same "call from a thread other than serve_forever()" rule
+        # _shutdown_pi() documents -- ControlHandler instances run on
+        # their own per-connection worker thread (ThreadingTCPServer),
+        # which satisfies it, exactly like the gamepad handler's own
+        # thread does.
+        server._shutdown_pi()
+        return build_sentence("ACK", "SHD")
 
     if sentence_type == "DRV":
         if len(fields) != 2:
@@ -346,6 +409,67 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         # still reported even when the Tracer cable is unplugged. See
         # link.cpu_temp for why it falls back to the same 0.0 placeholder
         # as every other field here rather than needing its own flag.
+        # onboard_time (15th field, 2026-10-10, extend-only -- an older
+        # robot-webserver that doesn't know about it yet just ignores the
+        # extra field, same convention as STA's dgps field and this same
+        # sentence's own cpu_temp field above): Pi #1's own system clock,
+        # as a whole-second Unix timestamp. Explicit user request -- the
+        # /power page shows it as a small "onboard time" readout above the
+        # Battery panel, specifically so a drifted/wrong Pi #1 clock (no
+        # RTC battery, NTP not reachable, ...) is visible at a glance next
+        # to the operator's own watch. Like cpu_temp, this is Pi #1 itself
+        # and has nothing to do with the Tracer, so it is NOT gated by
+        # `available` either.
+        #
+        # GPS fallback (2026-10-10, explicit user request): whenever the
+        # system clock itself still looks unset (system_clock_is_plausible()
+        # -- same check link.power_history's logger uses before writing
+        # anything to the history DB), fall back to the last UTC date/time
+        # the GPS receiver's own GPRMC sentence reported (RobotState.
+        # last_gps_utc_ts, see link/gps_reader.py) -- a GPS fix's UTC time
+        # is correct the instant a fix is acquired, with no dependency on
+        # WiFi/NTP at all. onboard_time_source (16th field, a trailing
+        # enum, same convention as STA's own dgps field) tells the website
+        # which one it's actually looking at: "SYS" (the system clock,
+        # trusted) or "GPS" (system clock not trusted, GPS time used
+        # instead). If NEITHER is available yet (system clock unset AND no
+        # GPS fix with a valid date has ever arrived), this falls back to
+        # the system clock anyway, still labelled "SYS" -- reporting
+        # *something* rather than a placeholder the wire format has no
+        # clean way to express, same reasoning PWR already uses elsewhere
+        # (see the 0.0-placeholder note above); the website's own display
+        # of this value is what makes a still-wrong reading visible to the
+        # operator.
+        #
+        # uptime_s (17th field, 2026-10-10, extend-only): Pi #1's own
+        # uptime in whole seconds since boot (link.uptime), shown as a
+        # small "lifetime" readout right next to onboard_time on /power.
+        # Deliberately independent of the clock-plausibility question
+        # above -- see link.uptime's own docstring for why a monotonic
+        # boot-time counter has nothing to lose from an unset wall clock.
+        #
+        # shutdown_eta_ts (18th field, 2026-10-12, extend-only -- an
+        # older robot-webserver that doesn't know about it yet just
+        # ignores the extra field, same convention as every field added
+        # above): set in the background by
+        # link.shutdown_policy.ShutdownPolicy (see RobotState.
+        # set_shutdown_eta()/power_status()) -- the single authoritative
+        # "Pi1 will shut itself down at this time" answer, 0 meaning "no
+        # shutdown currently scheduled" (this protocol is text-only, same
+        # reasoning as `available` above for why a trailing sentinel is
+        # used rather than a real null). Drives robot-webserver's
+        # site-wide shutdown alert banner -- explicit user request.
+        if system_clock_is_plausible():
+            onboard_time = int(time.time())
+            onboard_time_source = "SYS"
+        elif p.get("gps_utc_ts") is not None:
+            onboard_time = int(p["gps_utc_ts"])
+            onboard_time_source = "GPS"
+        else:
+            onboard_time = int(time.time())
+            onboard_time_source = "SYS"
+        uptime_s = p.get("uptime_s")
+        shutdown_eta_ts = p.get("shutdown_eta_ts")
         return build_sentence(
             "PWR",
             round(float(p["pv_voltage"] or 0.0), 2), round(float(p["pv_current"] or 0.0), 2),
@@ -359,6 +483,10 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
             round(float(p["battery_temp"] or 0.0), 1), round(float(p["controller_temp"] or 0.0), 1),
             round(float(p["cpu_temp"] or 0.0), 1),
             1 if available else 0,
+            onboard_time,
+            onboard_time_source,
+            uptime_s if uptime_s is not None else 0,
+            int(shutdown_eta_ts) if shutdown_eta_ts is not None else 0,
         )
 
     if sentence_type == "HIS":
@@ -394,6 +522,87 @@ def _handle_sentence(state: RobotState, sentence_type: str, fields: list) -> str
         flat_rows = [value for row in rows for value in row]
         return build_sentence("HIS", period, total_count, offset, len(rows), *flat_rows)
 
+    if sentence_type == "SMP":
+        # Query (2026-10-07, explicit user request): one page of the
+        # solar-exposure map grid computed by link.power_history.
+        # recompute_solar_map() (see link.solar_map for the full
+        # buffering/gating/gridding design), for robot-webserver's
+        # /control map overlay. Paginated the same way as HIS above (see
+        # link.power_history.SOLAR_MAP_CHUNK_ROWS) -- caller
+        # (robot-webserver's power_history_client.py) loops, bumping
+        # `offset`, until it has every cell.
+        #
+        # Fields in: offset (0-based row index -- no period field, the
+        # grid itself has no time window, see fetch_solar_map_chunk()'s
+        # own docstring).
+        # Fields out: total_count (cells known right now), offset
+        # (echoed), returned_count, then `returned_count` rows flattened
+        # back-to-back -- each row is (lat, lon, avg_pv_power,
+        # sample_count, last_ts).
+        if len(fields) != 1:
+            raise CommandError("23", "SMP_NEEDS_1_FIELD")
+        try:
+            offset = int(fields[0])
+        except ValueError:
+            raise CommandError("24", f"SMP_BAD_OFFSET:{fields[0]}")
+        if offset < 0:
+            raise CommandError("24", f"SMP_BAD_OFFSET:{offset}")
+
+        total_count, rows = fetch_solar_map_chunk(resolve_db_path(), offset)
+        flat_rows = [value for row in rows for value in row]
+        return build_sentence("SMP", total_count, offset, len(rows), *flat_rows)
+
+    if sentence_type == "STS":
+        # Query (2026-10-18): one-shot summary for robot-webserver's
+        # /stats page -- see link.power_history.fetch_stats_summary()'s
+        # own docstring for exactly what each figure means and which
+        # table it comes from. No pagination (unlike HIS/SMP/OBS): this
+        # is a handful of numbers, not a row set.
+        #
+        # Fields in: none (same "query, no fields" shape as PWR/STA above).
+        # Fields out: total_distance_m, avg_speed_moving_mps,
+        # best_daily_distance_m, solar_harvested_kwh,
+        # energy_consumed_kwh, best_solar_day_kwh, worst_solar_day_kwh,
+        # obstacle_front_count, obstacle_rear_count.
+        summary = fetch_stats_summary(resolve_db_path())
+        return build_sentence(
+            "STS",
+            round(summary["total_distance_m"], 1),
+            round(summary["avg_speed_moving_mps"], 3),
+            round(summary["best_daily_distance_m"], 1),
+            round(summary["solar_harvested_kwh"], 3),
+            round(summary["energy_consumed_kwh"], 3),
+            round(summary["best_solar_day_kwh"], 3),
+            round(summary["worst_solar_day_kwh"], 3),
+            summary["obstacle_front_count"],
+            summary["obstacle_rear_count"],
+        )
+
+    if sentence_type == "OBS":
+        # Query (2026-10-18): one page of obstacle_log, for /control's
+        # new "Obstacle map (ultrasonic)" layer -- see
+        # link.power_history.fetch_obstacle_chunk()'s own docstring.
+        # Paginated the same way as SMP above. Will legitimately return
+        # total_count=0 until the ultrasonic sensors exist and start
+        # calling log_obstacle() -- see that function's own docstring.
+        #
+        # Fields in: offset (0-based row index).
+        # Fields out: total_count, offset (echoed), returned_count, then
+        # `returned_count` rows flattened back-to-back -- each row is
+        # (ts, side, distance_m, lat, lon, heading_deg).
+        if len(fields) != 1:
+            raise CommandError("28", "OBS_NEEDS_1_FIELD")
+        try:
+            offset = int(fields[0])
+        except ValueError:
+            raise CommandError("29", f"OBS_BAD_OFFSET:{fields[0]}")
+        if offset < 0:
+            raise CommandError("29", f"OBS_BAD_OFFSET:{offset}")
+
+        total_count, rows = fetch_obstacle_chunk(resolve_db_path(), offset)
+        flat_rows = [value for row in rows for value in row]
+        return build_sentence("OBS", total_count, offset, len(rows), *flat_rows)
+
     raise CommandError("11", f"UNKNOWN_SENTENCE_TYPE:{sentence_type}")
 
 
@@ -415,7 +624,7 @@ class ControlHandler(socketserver.StreamRequestHandler):
                 continue
 
             try:
-                response = _handle_sentence(self.server.state, sentence_type, fields)
+                response = _handle_sentence(self.server.state, sentence_type, fields, self.server)
                 log.info("%s -> %s -> %s", peer, line, response)
             except CommandError as exc:
                 response = build_sentence("ERR", exc.code, exc.message.replace(",", ";"))
@@ -433,7 +642,9 @@ class ControlServer(socketserver.ThreadingTCPServer):
 
     def __init__(self, host, port, state: RobotState = None, start_gps: bool = True,
                  start_motor: bool = True, start_gamepad: bool = True, start_tracer: bool = True,
-                 start_history: bool = True):
+                 start_history: bool = True, start_led_control: bool = True,
+                 start_camera_power_policy: bool = True, start_shutdown_policy: bool = True,
+                 start_voltage_safety: bool = True):
         super().__init__((host, port), ControlHandler)
 
         # MotorDriver is always constructed (cheap -- no hardware is
@@ -551,6 +762,133 @@ class ControlServer(socketserver.ThreadingTCPServer):
                     ),
                 )
                 self.power_history_logger.start()
+
+        self.led_controller = None
+        if start_led_control:
+            # LED_CONTROL_ENABLED=false disables this entirely -- same
+            # escape hatch as TRACER_ENABLED/POWER_LOG_ENABLED above,
+            # useful on a dev machine with no /sys/class/leds/ at all
+            # (this already degrades gracefully even when left on -- see
+            # link.led_control._write_led_file -- but the env var avoids
+            # even trying). Independent of TRACER_ENABLED on purpose,
+            # same reasoning as power_history_logger just above: it only
+            # acts on power_status()["available"]/["pv_voltage"], which
+            # already read as "unavailable"/None with the Tracer off,
+            # and LedController already treats that as "wait, don't
+            # guess" (see its own docstring) -- no need to couple the
+            # two switches.
+            if os.environ.get("LED_CONTROL_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.led_controller = LedController(
+                    self.state,
+                    check_interval=float(
+                        os.environ.get("LED_CHECK_INTERVAL_S", LED_CHECK_INTERVAL_S)
+                    ),
+                    threshold_v=float(
+                        os.environ.get("LED_LOW_VOLTAGE_THRESHOLD_V", LOW_VOLTAGE_THRESHOLD_V)
+                    ),
+                    duration_s=float(
+                        os.environ.get("LED_LOW_VOLTAGE_DURATION_S", LOW_VOLTAGE_DURATION_S)
+                    ),
+                )
+                self.led_controller.start()
+
+        self.camera_power_policy = None
+        if start_camera_power_policy:
+            # CAMERA_POWER_POLICY_ENABLED=false disables this entirely --
+            # same escape hatch as LED_CONTROL_ENABLED/TRACER_ENABLED/
+            # POWER_LOG_ENABLED above. Independent of TRACER_ENABLED and
+            # GPS_ENABLED on purpose, same reasoning as those: decide_
+            # camera_mode() (link.camera_power_policy) already treats
+            # missing power/GPS data as "uncertainty -> eco" (the user's
+            # own stated rule) rather than crashing or guessing, so there
+            # is no need to couple this switch to the others -- running
+            # with the Tracer or GPS off just means this policy settles
+            # on ECO and stays there, exactly as it should.
+            if os.environ.get("CAMERA_POWER_POLICY_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.camera_power_policy = CameraPowerPolicy(
+                    self.state,
+                    projection_interval=float(
+                        os.environ.get("CAMERA_POWER_PROJECTION_INTERVAL_S", CAMERA_POWER_PROJECTION_INTERVAL_S)
+                    ),
+                    sample_interval=float(
+                        os.environ.get("CAMERA_POWER_SAMPLE_INTERVAL_S", CAMERA_POWER_SAMPLE_INTERVAL_S)
+                    ),
+                    battery_capacity_ah=float(
+                        os.environ.get("CAMERA_POWER_BATTERY_CAPACITY_AH", CAMERA_POWER_BATTERY_CAPACITY_AH)
+                    ),
+                    safety_margin_hours=float(
+                        os.environ.get("CAMERA_POWER_SAFETY_MARGIN_HOURS", CAMERA_POWER_SAFETY_MARGIN_HOURS)
+                    ),
+                    low_pv_threshold_w=float(
+                        os.environ.get("CAMERA_POWER_LOW_PV_THRESHOLD_W", CAMERA_POWER_LOW_PV_THRESHOLD_W)
+                    ),
+                    low_pv_sustained_records=int(
+                        os.environ.get("CAMERA_POWER_LOW_PV_RECORDS", CAMERA_POWER_LOW_PV_RECORDS)
+                    ),
+                )
+                self.camera_power_policy.start()
+
+        self.shutdown_policy = None
+        if start_shutdown_policy:
+            # SHUTDOWN_POLICY_ENABLED=false disables this entirely --
+            # same escape hatch as CAMERA_POWER_POLICY_ENABLED above.
+            # Independent of TRACER_ENABLED/GPS_ENABLED on purpose, same
+            # reasoning as that policy: compute_scheduled_shutdown_ts()
+            # (link.shutdown_policy) already treats missing power/GPS
+            # data as "uncertainty -> do NOT schedule a shutdown" rather
+            # than crashing or guessing, so there is no need to couple
+            # this switch to the others -- running with the Tracer or
+            # GPS off just means this policy never schedules anything,
+            # exactly as it should (wrongly staying silent is far safer
+            # here than wrongly triggering a real poweroff).
+            if os.environ.get("SHUTDOWN_POLICY_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.shutdown_policy = ShutdownPolicy(
+                    self.state,
+                    on_shutdown=self._shutdown_pi,
+                    projection_interval=float(
+                        os.environ.get("SHUTDOWN_PROJECTION_INTERVAL_S", SHUTDOWN_PROJECTION_INTERVAL_S)
+                    ),
+                    sample_interval=float(
+                        os.environ.get("SHUTDOWN_SAMPLE_INTERVAL_S", SHUTDOWN_SAMPLE_INTERVAL_S)
+                    ),
+                    battery_capacity_ah=float(
+                        os.environ.get("SHUTDOWN_BATTERY_CAPACITY_AH", SHUTDOWN_BATTERY_CAPACITY_AH)
+                    ),
+                    lead_hours=float(
+                        os.environ.get("SHUTDOWN_LEAD_HOURS", SHUTDOWN_LEAD_HOURS)
+                    ),
+                    safety_margin_hours=float(
+                        os.environ.get("SHUTDOWN_SAFETY_MARGIN_HOURS", SHUTDOWN_SAFETY_MARGIN_HOURS)
+                    ),
+                )
+                self.shutdown_policy.start()
+
+        self.voltage_safety = None
+        if start_voltage_safety:
+            # VOLTAGE_SAFETY_ENABLED=false disables this entirely --
+            # same escape hatch as SHUTDOWN_POLICY_ENABLED above.
+            # Independent of TRACER_ENABLED/GAMEPAD_ENABLED on purpose:
+            # VoltageSafety already treats a missing battery_voltage
+            # reading as "uncertainty -> do not act" (is_voltage_
+            # critical()) and a missing gamepad as "no rumble to drive,
+            # the IDLE-forcing/AUTO-lockout logic still works" (see
+            # link.voltage_safety.VoltageSafety's own docstring) -- no
+            # need to couple this switch to the others.
+            if os.environ.get("VOLTAGE_SAFETY_ENABLED", "true").lower() not in ("false", "0", "no"):
+                self.voltage_safety = VoltageSafety(
+                    self.state,
+                    gamepad=self.gamepad_reader,
+                    check_interval=float(
+                        os.environ.get("VOLTAGE_SAFETY_CHECK_INTERVAL_S", VOLTAGE_SAFETY_CHECK_INTERVAL_S)
+                    ),
+                    critical_threshold_v=float(
+                        os.environ.get("VOLTAGE_SAFETY_CRITICAL_V", CRITICAL_VOLTAGE_THRESHOLD_V)
+                    ),
+                    recovery_threshold_v=float(
+                        os.environ.get("VOLTAGE_SAFETY_RECOVERY_V", RECOVERY_VOLTAGE_THRESHOLD_V)
+                    ),
+                )
+                self.voltage_safety.start()
 
     def _on_gps_quality_change(self, is_dgps):
         """Wired in as link.gps_reader.GPSReader's on_gps_quality callback

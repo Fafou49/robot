@@ -37,6 +37,9 @@ import sqlite3
 import threading
 import time
 
+from link import solar_map
+from link.autopilot import haversine_distance_m
+
 log = logging.getLogger("link.power_history")
 
 # -- Schema -----------------------------------------------------------------
@@ -94,6 +97,75 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 """
 
+# Solar-exposure survey (2026-10-07) -- two tables, same "raw log +
+# derived aggregate" split as the rest of this module keeps implicit:
+#
+#  - solar_survey_raw: one row per buffered (ts, lat, lon, pv_power)
+#    sample flushed from link.solar_map's tmp file (see that module's
+#    docstring for the write-side gating -- valid GPS fix + Tracer
+#    available -- already applied before a sample ever reaches here).
+#    cell_lat_idx/cell_lon_idx are link.solar_map.cell_key()'s own grid
+#    indices, computed once at insert time (log_solar_survey_batch())
+#    rather than recomputed on every aggregation query.
+#  - solar_map_cells: the current grid average per cell, rebuilt from
+#    solar_survey_raw by recompute_solar_map() -- what robot-webserver's
+#    /control map overlay actually reads (via link/server.py's SMP
+#    sentence), one row per populated cell.
+_SOLAR_SURVEY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS solar_survey_raw (
+    ts INTEGER PRIMARY KEY,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    pv_power REAL NOT NULL,
+    cell_lat_idx INTEGER NOT NULL,
+    cell_lon_idx INTEGER NOT NULL
+);
+"""
+
+_SOLAR_SURVEY_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_solar_survey_cell
+    ON solar_survey_raw (cell_lat_idx, cell_lon_idx);
+"""
+
+_SOLAR_MAP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS solar_map_cells (
+    cell_lat_idx INTEGER NOT NULL,
+    cell_lon_idx INTEGER NOT NULL,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    avg_pv_power REAL NOT NULL,
+    sample_count INTEGER NOT NULL,
+    last_ts INTEGER NOT NULL,
+    PRIMARY KEY (cell_lat_idx, cell_lon_idx)
+);
+"""
+
+# Obstacle log (2026-10-18, provisioned ahead of the hardware -- the
+# front/rear ultrasonic sensors and their GPIO polling loop don't exist
+# yet, see the "Pi 1 implementation notes" doc delivered alongside this
+# change). The schema/frame/website plumbing is built now so that once
+# the sensor code lands, it only has to call log_obstacle() below -- the
+# /stats page and /control map layer already know how to read this
+# table and will simply start showing real numbers.
+#
+# Deliberately stores the RAW reading (the robot's own position + the
+# echo's distance/heading), not a pre-projected obstacle position -- same
+# "keep raw, derive at display time" split this module already uses for
+# solar_survey_raw vs solar_map_cells. robot-webserver's /control page
+# projects (lat, lon) + distance_m along heading_deg itself when it
+# draws the point, so the projection formula lives in exactly one place
+# (its drawObstaclePoints()) instead of being duplicated here too.
+_OBSTACLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS obstacle_log (
+    ts INTEGER PRIMARY KEY,
+    side TEXT NOT NULL,
+    distance_m REAL NOT NULL,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    heading_deg REAL NOT NULL
+);
+"""
+
 # Column order also used, in this exact sequence, by:
 #  - insert_sample()'s INSERT statement below,
 #  - fetch_period_chunk()'s SELECT below, and
@@ -129,6 +201,26 @@ HIS_PERIODS = {
 # 16 fields is a plainly reasonable line length (a few KB) either way.
 HIS_CHUNK_ROWS = 100
 
+# Same pagination reasoning as HIS_CHUNK_ROWS above, for the SMP
+# sentence's own solar_map_cells rows (see fetch_solar_map_chunk()).
+SOLAR_MAP_CHUNK_ROWS = 100
+
+# Same pagination reasoning again, for the OBS sentence's obstacle_log
+# rows (see fetch_obstacle_chunk()). Likely to stay far smaller than the
+# other two tables in practice (one row per actual echo, gated on the
+# robot actually moving -- see log_obstacle()'s docstring), but there's
+# no reason to special-case it.
+OBSTACLE_CHUNK_ROWS = 100
+
+# A log_obstacle() row older than this is excluded from
+# fetch_stats_summary()'s front/rear counts and from fetch_obstacle_chunk()
+# -- same rolling-recency idea as HIS_PERIODS, kept as its own constant
+# since there's no reason obstacle data should share the power/GPS
+# history's own retention window. 30 days: long enough that a map built
+# up over several outings still accumulates, short enough that a sensor
+# glitch early on doesn't paint a false obstacle forever.
+OBSTACLE_RETENTION_DAYS = 30
+
 
 def resolve_db_path() -> str:
     """The one place both the logger (below) and link/server.py's HIS
@@ -158,6 +250,10 @@ def ensure_schema(db_path: str) -> None:
     with _connect(db_path) as conn:
         conn.execute(_SCHEMA)
         conn.execute(_SNAPSHOT_SCHEMA)
+        conn.execute(_SOLAR_SURVEY_SCHEMA)
+        conn.execute(_SOLAR_SURVEY_INDEX)
+        conn.execute(_SOLAR_MAP_SCHEMA)
+        conn.execute(_OBSTACLE_SCHEMA)
 
 
 def log_media(db_path: str, filename: str, kind: str, lat, lon) -> None:
@@ -169,7 +265,26 @@ def log_media(db_path: str, filename: str, kind: str, lat, lon) -> None:
     but only written once REC_STOP hands back the actual filename -- see
     that method's own comment for why) -- see the `snapshots` table's own
     comment above for why this isn't gated on Tracer availability the way
-    power_log is."""
+    power_log is.
+
+    Clock-plausibility gate (2026-10-10, explicit user request, same
+    reasoning/helper as PowerHistoryLogger._log_once() and
+    RobotState.update_gps_fix()'s own solar-survey gating): skipped
+    entirely while the system clock still looks like a pre-NTP-sync
+    fallback value (see system_clock_is_plausible()'s own docstring)
+    rather than permanently burning in a `ts` that's about to be wrong by
+    months. Unlike the power_log/solar-survey ticks, there's no later
+    retry for this one specific file -- log_media() only ever runs once
+    per capture (at SNAP, or at REC_STOP for a recording) -- so a photo
+    or video taken during that window simply stays off the /control map
+    (no geotag row at all) rather than being geotagged with a wrong
+    timestamp; the file itself is untouched either way, only this map
+    metadata is skipped."""
+    if not system_clock_is_plausible():
+        log.warning(
+            "skipping geotag DB write for %r -- system clock looks unset", filename,
+        )
+        return
     ensure_schema(db_path)
     with _connect(db_path) as conn:
         conn.execute(
@@ -221,6 +336,57 @@ def delete_media_row(db_path: str, filename: str) -> None:
         conn.execute("DELETE FROM snapshots WHERE filename = ?", (filename,))
 
 
+# A Raspberry Pi with no RTC battery (this project has none, see the
+# "Heure de bord" section of the README) has no real clock of its own: on
+# boot it starts from whatever Raspberry Pi OS's `fake-hwclock` mechanism
+# last saved to disk (close to the previous shutdown time, itself not
+# guaranteed correct) or, on a brand-new SD card image with no saved file
+# yet, essentially the image's own build date -- in both cases a value
+# that can easily be months or years behind the real time. systemd-
+# timesyncd then corrects it automatically as soon as the Pi reaches an
+# NTP server over WiFi, normally within seconds of getting a network
+# link, but there's no bound on how long that can take (or whether it
+# ever happens, if the robot is run somewhere with no internet access).
+#
+# MIN_PLAUSIBLE_EPOCH_S is a deliberately conservative floor (comfortably
+# before this project's own 2026 timeline) below which `time.time()` is
+# almost certainly still that pre-sync fallback rather than a real
+# reading -- same "a valid number, just the wrong shape/scale" reasoning
+# as link.robot_state's own RAW_LAT_MAGNITUDE_FLOOR check for lat/lon.
+# 2026-01-01T00:00:00Z.
+MIN_PLAUSIBLE_EPOCH_S = 1767225600
+
+_clock_implausible_warned = False
+
+
+def system_clock_is_plausible() -> bool:
+    """False while Pi #1's system clock still looks like a pre-NTP-sync
+    fallback value (see MIN_PLAUSIBLE_EPOCH_S above) rather than a real
+    reading. Callers use this to skip writing any timestamped row to the
+    history DB until the clock has had a chance to correct itself --
+    explicit user request (2026-10-10, prompted by the new PWR
+    onboard_time field): a row permanently burned in with a wrong `ts`
+    can't be fixed up later just because the clock corrects itself a
+    minute after boot. Logs one warning the first time this is found
+    False (not every tick -- this can legitimately stay False for a
+    while right after boot) and one info line once it recovers."""
+    global _clock_implausible_warned
+    plausible = time.time() >= MIN_PLAUSIBLE_EPOCH_S
+    if not plausible and not _clock_implausible_warned:
+        log.warning(
+            "system clock looks unset (reads before %s) -- most likely "
+            "this Pi has no RTC battery and hasn't reached an NTP server "
+            "yet since boot; skipping history DB writes until it "
+            "corrects itself",
+            time.strftime("%Y-%m-%d", time.gmtime(MIN_PLAUSIBLE_EPOCH_S)),
+        )
+        _clock_implausible_warned = True
+    elif plausible and _clock_implausible_warned:
+        log.info("system clock now looks plausible -- resuming history DB writes")
+        _clock_implausible_warned = False
+    return plausible
+
+
 def insert_sample(db_path: str, sample: dict) -> None:
     """`sample` must have exactly FIELD_ORDER's keys (lat/lon may be
     None)."""
@@ -237,6 +403,179 @@ def prune_old_rows(db_path: str, retention_days: float) -> None:
     cutoff = int(time.time()) - int(retention_days * 24 * 3600)
     with _connect(db_path) as conn:
         conn.execute("DELETE FROM power_log WHERE ts < ?", (cutoff,))
+
+
+def log_solar_survey_batch(db_path: str, points) -> None:
+    """`points` is a list of (ts, lat, lon, pv_power) tuples, as drained
+    from link.solar_map.drain_points() -- this function's only caller
+    (via PowerHistoryLogger._log_once(), every DEFAULT_LOG_INTERVAL_S
+    tick). One row per point, keyed on `ts` like power_log's own
+    INSERT -- in practice two buffered points never share the same
+    second (the 5-metre gating alone takes longer than that to satisfy
+    while driving), INSERT OR REPLACE is just the same safety margin
+    insert_sample() already uses."""
+    if not points:
+        return
+    ensure_schema(db_path)
+    rows = [
+        (int(ts), lat, lon, pv_power, *solar_map.cell_key(lat, lon))
+        for ts, lat, lon, pv_power in points
+    ]
+    with _connect(db_path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO solar_survey_raw "
+            "(ts, lat, lon, pv_power, cell_lat_idx, cell_lon_idx) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+
+def prune_old_solar_survey_rows(db_path: str, retention_days: float) -> None:
+    """Same retention window as prune_old_rows() above, kept as its own
+    function (rather than folded into that one) since solar_survey_raw
+    is a different table with a different primary key -- called right
+    before recompute_solar_map() so a cell whose raw samples have all
+    aged out doesn't linger in the aggregate."""
+    cutoff = int(time.time()) - int(retention_days * 24 * 3600)
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM solar_survey_raw WHERE ts < ?", (cutoff,))
+
+
+def recompute_solar_map(db_path: str) -> None:
+    """Full rebuild of solar_map_cells from solar_survey_raw's current
+    rows. A full rebuild (DELETE then re-INSERT every group) rather than
+    an incremental update: the simplest correct way to make a cell whose
+    raw samples have all aged out of retention disappear from the map
+    too, and -- per this module's own retention note (a few MB for
+    5-10 months of continuous samples) -- the whole raw table stays
+    small enough, for one robot operating at one site, that grouping it
+    from scratch on every tick is cheap. Called from
+    PowerHistoryLogger._log_once() only while the robot is idle (mode
+    == "IDLE") -- see that method's own comment for why, and this
+    module's own docstring for the "lors des temps de moindre activité
+    CPU" requirement this satisfies.
+
+    Wrapped in an explicit BEGIN IMMEDIATE (rather than the plain
+    deferred transaction _connect()'s callers normally get) so the
+    read-group-then-replace sequence below is atomic against any other
+    writer touching solar_map_cells at the same time -- in normal
+    operation there's only ever one PowerHistoryLogger thread ticking
+    sequentially, so this never actually contends, but without it nothing
+    stops a second call (e.g. two recomputes racing in a test harness)
+    from reading a stale, pre-insert `grouped` snapshot and then
+    clobbering a newer, already-committed rebuild with it."""
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        grouped = conn.execute(
+            "SELECT cell_lat_idx, cell_lon_idx, AVG(pv_power), COUNT(*), MAX(ts) "
+            "FROM solar_survey_raw GROUP BY cell_lat_idx, cell_lon_idx"
+        ).fetchall()
+        conn.execute("DELETE FROM solar_map_cells")
+        conn.executemany(
+            "INSERT INTO solar_map_cells "
+            "(cell_lat_idx, cell_lon_idx, lat, lon, avg_pv_power, sample_count, last_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    cell_lat_idx, cell_lon_idx,
+                    *solar_map.cell_center(cell_lat_idx, cell_lon_idx),
+                    avg_pv_power, sample_count, last_ts,
+                )
+                for cell_lat_idx, cell_lon_idx, avg_pv_power, sample_count, last_ts in grouped
+            ],
+        )
+
+
+def fetch_solar_map_chunk(db_path: str, offset: int):
+    """Returns (total_count, rows) of solar_map_cells, ordered by cell
+    index for deterministic pagination across calls (mirrors
+    fetch_period_chunk()'s own offset/LIMIT pagination below for link/
+    server.py's HIS sentence) -- each row is
+    (lat, lon, avg_pv_power, sample_count, last_ts), at most
+    SOLAR_MAP_CHUNK_ROWS per call. Unlike fetch_period_chunk(), there is
+    no time-window `cutoff` here: the grid itself has no rolling window
+    of its own -- prune_old_solar_survey_rows()/recompute_solar_map()
+    above are what keep it from growing unbounded, not this read."""
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM solar_map_cells"
+        ).fetchone()[0]
+        cursor = conn.execute(
+            "SELECT lat, lon, avg_pv_power, sample_count, last_ts FROM solar_map_cells "
+            "ORDER BY cell_lat_idx ASC, cell_lon_idx ASC LIMIT ? OFFSET ?",
+            (SOLAR_MAP_CHUNK_ROWS, offset),
+        )
+        rows = cursor.fetchall()
+    return total_count, rows
+
+
+def log_obstacle(db_path: str, side: str, distance_m: float, lat: float, lon: float,
+                  heading_deg: float) -> None:
+    """Records one ultrasonic echo: which sensor ("front"/"rear"), the
+    measured distance, the robot's own GPS position at that moment, and
+    its heading (degrees from north) -- NOT a pre-projected obstacle
+    position, see _OBSTACLE_SCHEMA's own comment above for why.
+
+    NO CALLER YET: the front/rear ultrasonic sensors and the GPIO
+    polling loop that would call this don't exist as of this writing
+    (2026-10-18) -- this function, the table, and the OBS sentence in
+    link/server.py are provisioned ahead of that hardware so the
+    website side needs no further change once it's built. See the
+    "Pi 1 implementation notes" doc for the gating this future caller is
+    expected to apply (only while actually moving, debounced over a few
+    consecutive reads, clock-plausibility-gated like log_media() above)
+    before calling this.
+
+    Same clock-plausibility gate as log_media()/the power/solar-survey
+    ticks: skipped entirely while the system clock still looks unset,
+    rather than burning in a `ts` that's about to be wrong by months."""
+    if not system_clock_is_plausible():
+        log.warning("skipping obstacle log write -- system clock looks unset")
+        return
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO obstacle_log "
+            "(ts, side, distance_m, lat, lon, heading_deg) VALUES (?, ?, ?, ?, ?, ?)",
+            (int(time.time()), side, distance_m, lat, lon, heading_deg),
+        )
+
+
+def prune_old_obstacle_rows(db_path: str, retention_days: float = OBSTACLE_RETENTION_DAYS) -> None:
+    """Same shape as prune_old_rows()/prune_old_solar_survey_rows() above.
+    Not called from anywhere yet (no logging loop exists to call it on a
+    timer) -- the future ultrasonic polling loop is expected to call this
+    once per tick, same as PowerHistoryLogger._log_once() does for the
+    solar survey table."""
+    cutoff = int(time.time()) - int(retention_days * 24 * 3600)
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM obstacle_log WHERE ts < ?", (cutoff,))
+
+
+def fetch_obstacle_chunk(db_path: str, offset: int):
+    """Returns (total_count, rows) of obstacle_log within
+    OBSTACLE_RETENTION_DAYS, oldest-first, at most OBSTACLE_CHUNK_ROWS
+    per call -- same pagination shape as fetch_solar_map_chunk() above.
+    Each row is (ts, side, distance_m, lat, lon, heading_deg). Used by
+    link/server.py's OBS sentence for robot-webserver's /control map
+    obstacle-layer checkbox, which projects (lat, lon) + distance_m
+    along heading_deg itself to draw each point (see _OBSTACLE_SCHEMA's
+    comment for why the projection isn't done here)."""
+    cutoff = int(time.time()) - int(OBSTACLE_RETENTION_DAYS * 24 * 3600)
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM obstacle_log WHERE ts >= ?", (cutoff,)
+        ).fetchone()[0]
+        cursor = conn.execute(
+            "SELECT ts, side, distance_m, lat, lon, heading_deg FROM obstacle_log "
+            "WHERE ts >= ? ORDER BY ts ASC LIMIT ? OFFSET ?",
+            (cutoff, OBSTACLE_CHUNK_ROWS, offset),
+        )
+        rows = cursor.fetchall()
+    return total_count, rows
 
 
 def fetch_period_chunk(db_path: str, period: str, offset: int):
@@ -267,6 +606,143 @@ def fetch_period_chunk(db_path: str, period: str, offset: int):
             for row in cursor.fetchall()
         ]
     return total_count, rows
+
+
+def fetch_recent_pv_readings(db_path: str, n: int = 3):
+    """Returns the `n` most recent (ts, pv_power) rows from power_log,
+    newest first -- added 2026-10-12 for link.camera_power_policy's new
+    "PV < 7W sustained for 15 minutes" day-mode rule (explicit user
+    request: "depuis 15minutes (3 enregistrements en BD)" -- the user
+    was explicit this has to read the actual logged history, not the
+    policy's own short in-process sampling buffer, so a brief dip that
+    recovers before the next 5-minute log tick doesn't force Eco, and a
+    policy/control-server restart doesn't lose the last ~15 minutes of
+    context the way an in-memory buffer would).
+
+    pv_power can be NULL in principle (same nullable column as the rest
+    of power_log, though in practice insert_sample() always writes a
+    number here when a row is written at all) -- turned into 0.0 on the
+    way out, same NULL convention fetch_period_chunk() already uses for
+    this table, so callers never have to special-case None."""
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT ts, pv_power FROM power_log ORDER BY ts DESC LIMIT ?",
+            (n,),
+        )
+        return [
+            (row[0], 0.0 if row[1] is None else row[1])
+            for row in cursor.fetchall()
+        ]
+
+
+# Consecutive solar_survey_raw points more than this many seconds apart
+# are treated as two separate legs (the robot was stopped/idle in
+# between, or the Tracer/GPS link dropped out) rather than one
+# continuous move -- their distance and elapsed time are excluded from
+# fetch_stats_summary()'s totals so a long gap never gets silently
+# counted as "the robot drove very slowly" or "a giant single hop".
+STATS_MAX_POINT_GAP_S = 120
+
+# Same idea for power_log's own (ts, pv_power, load_power) samples, used
+# to integrate energy below -- a gap wider than this (Tracer link down,
+# Pi #1 rebooted) is excluded rather than assumed to have held the last
+# known power level throughout.
+STATS_MAX_ENERGY_GAP_S = 2 * DEFAULT_LOG_INTERVAL_S
+
+
+def fetch_stats_summary(db_path: str) -> dict:
+    """One-shot summary for robot-webserver's /stats page -- see
+    link/server.py's STS sentence. Returns a dict with:
+
+      total_distance_m, avg_speed_moving_mps, best_daily_distance_m
+          -- from solar_survey_raw (better point density for this than
+          power_log, see that table's own comment), haversine-summed
+          between consecutive points, excluding gaps wider than
+          STATS_MAX_POINT_GAP_S (see its own comment). "Best daily
+          distance" buckets by UTC calendar day.
+      solar_harvested_kwh, energy_consumed_kwh,
+      best_solar_day_kwh, worst_solar_day_kwh
+          -- from power_log, trapezoidal-integrating pv_power (harvested)
+          and load_power (consumed) over elapsed time between
+          consecutive samples, excluding gaps wider than
+          STATS_MAX_ENERGY_GAP_S. Best/worst solar day are the max/min
+          of the per-UTC-day harvested total, among days with at least
+          one sample.
+      obstacle_front_count, obstacle_rear_count
+          -- COUNT(*) from obstacle_log (within OBSTACLE_RETENTION_DAYS,
+          same window fetch_obstacle_chunk() reads) grouped by `side`.
+          Legitimately 0/0 until the ultrasonic sensors exist and start
+          calling log_obstacle() -- not a placeholder, an honest count.
+
+    All of this is a FIRST VERSION (2026-10-18): simple
+    trapezoidal/haversine integration over whatever samples happen to be
+    in the tables, no smoothing or outlier rejection beyond the gap
+    cutoffs above. Good enough for a dashboard figure, not a calibrated
+    instrument."""
+    ensure_schema(db_path)
+    with _connect(db_path) as conn:
+        point_rows = conn.execute(
+            "SELECT ts, lat, lon FROM solar_survey_raw ORDER BY ts ASC"
+        ).fetchall()
+        total_distance_m = 0.0
+        moving_time_s = 0.0
+        daily_distance_m = {}
+        prev = None
+        for ts, lat, lon in point_rows:
+            if prev is not None:
+                dt = ts - prev[0]
+                if 0 < dt <= STATS_MAX_POINT_GAP_S:
+                    d = haversine_distance_m(prev[1], prev[2], lat, lon)
+                    total_distance_m += d
+                    moving_time_s += dt
+                    day = time.strftime("%Y-%m-%d", time.gmtime(ts))
+                    daily_distance_m[day] = daily_distance_m.get(day, 0.0) + d
+            prev = (ts, lat, lon)
+        avg_speed_moving_mps = (
+            total_distance_m / moving_time_s if moving_time_s > 0 else 0.0
+        )
+        best_daily_distance_m = max(daily_distance_m.values()) if daily_distance_m else 0.0
+
+        energy_rows = conn.execute(
+            "SELECT ts, pv_power, load_power FROM power_log ORDER BY ts ASC"
+        ).fetchall()
+        harvested_wh = 0.0
+        consumed_wh = 0.0
+        daily_harvested_wh = {}
+        prev_e = None
+        for ts, pv_power, load_power in energy_rows:
+            if prev_e is not None:
+                dt = ts - prev_e[0]
+                if 0 < dt <= STATS_MAX_ENERGY_GAP_S:
+                    avg_pv = ((pv_power or 0.0) + (prev_e[1] or 0.0)) / 2.0
+                    avg_load = ((load_power or 0.0) + (prev_e[2] or 0.0)) / 2.0
+                    wh = avg_pv * dt / 3600.0
+                    harvested_wh += wh
+                    consumed_wh += avg_load * dt / 3600.0
+                    day = time.strftime("%Y-%m-%d", time.gmtime(ts))
+                    daily_harvested_wh[day] = daily_harvested_wh.get(day, 0.0) + wh
+            prev_e = (ts, pv_power, load_power)
+        best_solar_day_kwh = (max(daily_harvested_wh.values()) / 1000.0) if daily_harvested_wh else 0.0
+        worst_solar_day_kwh = (min(daily_harvested_wh.values()) / 1000.0) if daily_harvested_wh else 0.0
+
+        obstacle_cutoff = int(time.time()) - int(OBSTACLE_RETENTION_DAYS * 24 * 3600)
+        obstacle_counts = dict(conn.execute(
+            "SELECT side, COUNT(*) FROM obstacle_log WHERE ts >= ? GROUP BY side",
+            (obstacle_cutoff,),
+        ).fetchall())
+
+    return {
+        "total_distance_m": total_distance_m,
+        "avg_speed_moving_mps": avg_speed_moving_mps,
+        "best_daily_distance_m": best_daily_distance_m,
+        "solar_harvested_kwh": harvested_wh / 1000.0,
+        "energy_consumed_kwh": consumed_wh / 1000.0,
+        "best_solar_day_kwh": best_solar_day_kwh,
+        "worst_solar_day_kwh": worst_solar_day_kwh,
+        "obstacle_front_count": int(obstacle_counts.get("front", 0)),
+        "obstacle_rear_count": int(obstacle_counts.get("rear", 0)),
+    }
 
 
 class PowerHistoryLogger:
@@ -312,16 +788,58 @@ class PowerHistoryLogger:
             time.sleep(self.log_interval)
 
     def _log_once(self):
+        status = self.state.status()
+
+        # Clock-plausibility gate (2026-10-10, explicit user request): if
+        # Pi #1's system clock still looks unset (see
+        # system_clock_is_plausible()'s own docstring above), this whole
+        # tick is skipped -- nothing gets written to the history DB (not
+        # power_log, not the solar-survey raw table) rather than
+        # permanently burning in rows keyed on a `ts` that's about to be
+        # wrong by months once NTP corrects the clock. The solar-map
+        # recompute below is skipped too, but harmlessly so: with no new
+        # raw rows landing while this gate is closed, there's nothing new
+        # for it to aggregate anyway. The tmp buffer is deliberately NOT
+        # drained here: the already-buffered points (gated at capture
+        # time in RobotState.update_gps_fix(), same reasoning) simply
+        # wait for a later tick once the clock has recovered, rather than
+        # being lost.
+        if not system_clock_is_plausible():
+            return
+
+        # Solar-exposure survey (2026-10-07, explicit user request) --
+        # unconditional (beyond the clock gate just above): each buffered
+        # line was already individually gated (valid GPS fix + Tracer
+        # available) at write time by RobotState.update_gps_fix(), so
+        # there's nothing left to re-check here. An empty buffer (nothing
+        # moved >=5m since the last tick, or the Tracer's been down the
+        # whole time) is the common case, and drain_points() is a cheap
+        # no-op then -- see link.solar_map.
+        points = solar_map.drain_points(solar_map.resolve_tmp_path())
+        if points:
+            log_solar_survey_batch(self.db_path, points)
+            prune_old_solar_survey_rows(self.db_path, self.retention_days)
+
+        # Solar-map grid recompute -- "lors des temps de moindre
+        # activité CPU" (explicit user request), approximated here as
+        # mode == "IDLE" (no driving/navigation work competing for the
+        # CPU right now). Deliberately independent of the Tracer's
+        # CURRENT availability below: a cable that happens to be
+        # unplugged right now shouldn't stop the map from reflecting
+        # whatever valid samples were already gathered earlier.
+        if status.get("mode") == "IDLE":
+            recompute_solar_map(self.db_path)
+
         power = self.state.power_status()
         if power.get("available") is not True:
             # The RS485/Tracer link isn't returning data right now --
-            # per this module's docstring, skip the tick entirely rather
-            # than logging a row of placeholder zeros. cpu_temp is
-            # deliberately not logged on its own here either: a sample
-            # without any Tracer context isn't useful for these charts
-            # and the gating rule was explicit about the whole row.
+            # per this module's docstring, skip the power_log row
+            # entirely rather than logging a row of placeholder zeros.
+            # cpu_temp is deliberately not logged on its own here
+            # either: a sample without any Tracer context isn't useful
+            # for these charts and the gating rule was explicit about
+            # the whole row.
             return
-        status = self.state.status()
         sample = {
             "ts": int(time.time()),
             "lat": status.get("current_lat"),
